@@ -1,0 +1,50 @@
+[Unit]
+Description=EK-Protection — Terminal Antivirus Daemon
+Documentation=https://github.com/Eviry-Studios/ek-protection
+After=network.target local-fs.target
+Wants=network.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+# Segurança
+User=root
+Group=root
+UMask=0027
+
+# Executável
+# NOTA: Se o caminho do venv tiver espaços ou estiver em filesystem montado
+# (NTFS/exFAT sem suporte a bit de execução, comum em /var/mnt/...),
+# use o wrapper /usr/local/bin/ekp-daemon-wrapper.sh em vez de chamar
+# o binário do venv diretamente.
+ExecStart=/usr/local/bin/ekp-daemon-wrapper.sh
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart automático em caso de falha
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+# Watchdog systemd (daemon deve enviar sd_notify keepalive)
+WatchdogSec=60s
+
+# Limites de recursos
+LimitNOFILE=65536
+LimitNPROC=512
+
+# Isolamento de segurança
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/ek-protection /var/log/ek-protection /run/ek-protection
+NoNewPrivileges=false
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ek-protection
+
+[Install]
+WantedBy=multi-user.target
