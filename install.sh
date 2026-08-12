@@ -114,11 +114,16 @@ chmod +x /usr/local/bin/ekp-daemon-wrapper.sh
 ok "Comando 'ekp' disponível globalmente (via wrapper)"
 
 # ---------------------------------------------------------------------------
-# Inicializa configuração e diretórios
+# Inicializa configuração e diretórios (só na primeira instalação)
 # ---------------------------------------------------------------------------
-info "Inicializando configuração..."
-ekp init
-ok "Configuração criada em /etc/ek-protection/config.yaml"
+if [ -f "/etc/ek-protection/config.yaml" ]; then
+  info "Configuração existente encontrada em /etc/ek-protection/config.yaml"
+  ok "Mantendo configuração e senha atuais (nada foi sobrescrito)"
+else
+  info "Inicializando configuração..."
+  ekp init
+  ok "Configuração criada em /etc/ek-protection/config.yaml"
+fi
 
 # ---------------------------------------------------------------------------
 # Cria grupo 'ek-protection' e adiciona quem instalou
@@ -159,16 +164,16 @@ echo ""
 echo "  Próximos passos:"
 echo ""
 echo "    1. Configure sua senha:"
-echo "       ${CYAN}sudo ekp auth setup${NC}"
+echo -e "       ${CYAN}sudo ekp auth setup${NC}"
 echo ""
 echo "    2. Inicie o serviço (roda em segundo plano, sobrevive a reboot):"
-echo "       ${CYAN}sudo systemctl enable --now ek-protection${NC}"
+echo -e "       ${CYAN}sudo systemctl enable --now ek-protection${NC}"
 echo ""
 echo "    3. Verifique se está rodando:"
-echo "       ${CYAN}ekp status${NC}"
+echo -e "       ${CYAN}ekp status${NC}"
 echo ""
 echo "    4. Veja todos os comandos disponíveis:"
-echo "       ${CYAN}ekp --help${NC}"
+echo -e "       ${CYAN}ekp --help${NC}"
 echo ""
 if [ "${GROUP_NOTICE:-0}" = "1" ]; then
   echo -e "${YELLOW}  ⚠  Faça logout e login novamente (ou reinicie) para usar${NC}"

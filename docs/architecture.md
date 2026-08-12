@@ -137,3 +137,52 @@ Engine.stop() (reverse order):
 | 8  | 0.8.0 | Advanced heuristics (22 rules, weighted score) |
 | 9  | 0.9.0 | Daemon IPC (Unix socket), systemd, signature updater |
 | 10 | 1.0.0 | Reports, plugins, ClamAV integration, stable release |
+
+## Roadmap — Próximos Patches (pós-v1.0)
+
+### 🐛 Bug conhecido: comandos CLI ignoram o daemon e abrem o SQLite direto
+
+**Sintoma:** `ekp logs tail`, `ekp quarantine list`, `ekp scan file`, `ekp exceptions list`
+e outros comandos de leitura falham com `sqlite3.OperationalError: unable to open
+database file` quando rodados **sem sudo**, mesmo com o daemon ativo e respondendo
+normalmente a `ekp status`.
+
+**Causa raiz:** Só o `ekp status` e `ekp stop` foram migrados para conversar com o
+daemon via `IPCClient` (socket Unix, Patch 9). Todos os outros comandos (`logs`,
+`quarantine`, `scan`, `exceptions`, `heuristics`, `update`) ainda instanciam seus
+próprios `LogStore`/`QuarantineStore`/`SignatureDB` e abrem os arquivos `.db` em
+`/var/lib/ek-protection/` diretamente do processo da CLI. Como esses arquivos
+pertencem a `root` (dono do processo do daemon), qualquer usuário sem sudo recebe
+"unable to open database file" — não é falha de lógica, é falta de permissão de
+disco mesmo.
+
+**Paliativo atual:** prefixar esses comandos com `sudo`.
+
+**Correção planejada (Patch 11):**
+- Adicionar à `IPCServer._dispatch()` os comandos que faltam: `logs_search`,
+  `exceptions_list`, `heuristics_analyze`, `scan_quick`, `scan_full`
+- Migrar cada `cli/*_commands.py` para tentar `IPCClient` primeiro (se o daemon
+  estiver rodando) e só cair para acesso direto ao SQLite como fallback — útil
+  para rodar comandos com o daemon parado, ou em modo standalone/debug
+- Padronizar esse fallback num helper único (`cli/_ipc_or_direct.py`) em vez de
+  duplicar a lógica em cada arquivo de comando
+
+### 📋 Outras melhorias planejadas
+
+- **Banco de assinaturas real** — hoje só existem 3 hashes de demonstração.
+  Popular com feeds públicos de IOCs (ex: MalwareBazaar, URLhaus) ou focar
+  inteiramente na detecção heurística + ClamAV como motor de assinaturas.
+- **Auto-scan no monitor** — hoje o monitor só *observa* eventos de arquivo;
+  ele não dispara `scan_file()` automaticamente em executáveis novos. Ligar
+  `MonitorManager` → `ScanEngine` via callback é trabalho pendente.
+- **Symlink `/opt` → `/var/opt` em sistemas atômicos** — confirmar que paths
+  resolvidos em runtime (`Path(__file__).resolve()`) não geram inconsistência
+  entre `/opt/...` e `/var/opt/...` nos logs e mensagens de erro (cosmético,
+  mas confunde no diagnóstico).
+- **Updater de assinaturas com manifest real** — hoje aponta para uma URL que
+  não existe ainda; criar o `manifest.json` + `signatures.jsonl` no próprio
+  repositório como fonte inicial.
+- **Testes de integração com daemon real** — a suíte atual (525 testes) cobre
+  cada módulo isoladamente com mocks; faltam testes end-to-end que sobem o
+  daemon de verdade e validam o IPC completo, pegando bugs como o acima antes
+  de chegar em produção.
