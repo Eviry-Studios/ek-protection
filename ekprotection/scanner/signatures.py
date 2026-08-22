@@ -56,7 +56,10 @@ INSERT OR IGNORE INTO signature_meta (key, value)
 # Em produção, substituídas por hashes reais via Patch 9
 _DEMO_SIGNATURES = [
     {
-        "sha256":      "eicar_test_hash_do_not_use_in_production_0000000000000000000001",
+        # SHA-256 real do arquivo de teste EICAR padrão da indústria
+        # (string pública, inofensiva, feita especificamente pra ser
+        # detectada por antivírus — não é malware de verdade).
+        "sha256":      "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
         "name":        "EICAR.Test.File",
         "threat_type": "Test.Signature",
         "severity":    "baixo",

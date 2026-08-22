@@ -14,6 +14,7 @@ Comandos CLI para gerenciamento de quarentena.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing  import Optional
 
@@ -24,7 +25,7 @@ from rich       import box
 
 from ekprotection.config.manager          import ConfigManager
 from ekprotection.quarantine.manager      import QuarantineManager, QuarantineError
-from ekprotection.quarantine.models       import QuarantineStatus
+from ekprotection.quarantine.models       import QuarantineEntry, QuarantineReason, QuarantineStatus
 from ekprotection.auth.manager            import AuthManager
 from .display import console, print_success, print_error, print_warning, print_info
 
@@ -49,6 +50,41 @@ def _open_mgr(config_path: str | None = None) -> tuple[ConfigManager, Quarantine
     mgr = QuarantineManager(cfg)
     mgr.open()
     return cfg, mgr
+
+
+def _ipc_client(cfg: ConfigManager):
+    """
+    Cliente IPC pro daemon, se estiver rodando. Retorna None se não
+    estiver (chamador cai pro acesso direto ao SQLite).
+    """
+    socket_path = cfg.get("daemon.socket_path", "/run/ek-protection/daemon.sock")
+    data_dir = os.environ.get("EKP_DATA_DIR", "")
+    if data_dir:
+        socket_path = socket_path.replace("/run/ek-protection", data_dir + "/run")
+
+    from ekprotection.daemon import IPCClient
+    client = IPCClient(socket_path)
+    return client if client.is_alive() else None
+
+
+def _entry_from_ipc_dict(d: dict) -> QuarantineEntry:
+    """Reconstrói um QuarantineEntry a partir do dict retornado pelo daemon via IPC."""
+    return QuarantineEntry(
+        entry_id=d.get("id"),
+        quarantine_id=d["quarantine_id"],
+        original_path=d["original_path"],
+        sha256=d["sha256"],
+        reason=QuarantineReason(d["reason"]),
+        status=QuarantineStatus(d["status"]),
+        file_size=d.get("file_size"),
+        threat_type=d.get("threat_type"),
+        risk_level=d.get("risk_level"),
+        process_name=d.get("process_name"),
+        quarantined_at=datetime.fromisoformat(d["quarantined_at"]),
+        restored_at=datetime.fromisoformat(d["restored_at"]) if d.get("restored_at") else None,
+        restored_to=d.get("restored_to"),
+        comment=d.get("comment", ""),
+    )
 
 
 def _authenticate(cfg: ConfigManager) -> str:
@@ -80,11 +116,28 @@ def cmd_list(
     json_output: bool          = typer.Option(False, "--json"),
 ) -> None:
     """Lista arquivos em quarentena."""
-    cfg, mgr = _open_mgr(config)
-    try:
-        entries = mgr.list_all(limit=500) if all_items else mgr.list_active()
-    finally:
-        mgr.close()
+    entries = None
+
+    # "--all" precisa do acesso direto (IPC só expõe os ativos). Sem
+    # "--all", tenta o daemon primeiro pra funcionar sem sudo.
+    if not all_items:
+        cfg = ConfigManager(config)
+        cfg.load()
+        client = _ipc_client(cfg)
+        if client is not None:
+            try:
+                resp = client.send("quarantine_list")
+                if resp.get("ok"):
+                    entries = [_entry_from_ipc_dict(d) for d in resp["data"]]
+            except ConnectionError:
+                pass  # cai pro acesso direto abaixo
+
+    if entries is None:
+        cfg, mgr = _open_mgr(config)
+        try:
+            entries = mgr.list_all(limit=500) if all_items else mgr.list_active()
+        finally:
+            mgr.close()
 
     if json_output:
         import json

@@ -299,8 +299,14 @@ class LogManager:
         return entry
 
     def _resolve(self, key: str, default: str) -> Path:
-        raw = self.config.get(key, default)
+        raw = str(self.config.get(key, default))
         data_dir = os.environ.get("EKP_DATA_DIR", "")
         if data_dir:
-            raw = str(raw).replace("/var/lib/ek-protection", data_dir)
+            # "logs.db_path"/"quarantine.dir" etc. vivem sob /var/lib; "logs.dir"
+            # (arquivo de log rotacionado + espelho JSONL) vive sob /var/log — os
+            # dois prefixos precisam ser realocados, senão o mkdir() de logs.dir
+            # continua mirando o caminho real do sistema (falha sem root) mesmo
+            # com EKP_DATA_DIR configurado, e o LogManager inteiro nunca abre.
+            raw = raw.replace("/var/lib/ek-protection", data_dir)
+            raw = raw.replace("/var/log/ek-protection", data_dir + "/log")
         return Path(raw)

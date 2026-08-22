@@ -23,7 +23,7 @@ from rich.table import Table
 from rich import box
 
 from ekprotection.config.manager import ConfigManager
-from ekprotection.logs.models import EventType, LogLevel, QueryFilter
+from ekprotection.logs.models import EventType, LogEntry, LogLevel, QueryFilter
 from ekprotection.logs.store import LogStore
 from .display import console, print_success, print_error, print_warning, print_info
 
@@ -48,11 +48,7 @@ _LEVEL_ICON = {
 }
 
 
-def _open_store(config_path: str | None = None) -> tuple[ConfigManager, LogStore]:
-    cfg = ConfigManager(config_path)
-    cfg.load()
-
-    import os
+def _open_store_from_cfg(cfg: ConfigManager) -> LogStore:
     db_raw = cfg.get("logs.db_path", "/var/lib/ek-protection/ek-protection.db")
     data_dir = os.environ.get("EKP_DATA_DIR", "")
     if data_dir:
@@ -60,7 +56,45 @@ def _open_store(config_path: str | None = None) -> tuple[ConfigManager, LogStore
 
     store = LogStore(db_raw)
     store.open()
-    return cfg, store
+    return store
+
+
+def _open_store(config_path: str | None = None) -> tuple[ConfigManager, LogStore]:
+    cfg = ConfigManager(config_path)
+    cfg.load()
+    return cfg, _open_store_from_cfg(cfg)
+
+
+def _ipc_client(cfg: ConfigManager):
+    """
+    Cliente IPC pro daemon, se estiver rodando. Retorna None se não
+    estiver (chamador cai pro acesso direto ao SQLite).
+    """
+    socket_path = cfg.get("daemon.socket_path", "/run/ek-protection/daemon.sock")
+    data_dir = os.environ.get("EKP_DATA_DIR", "")
+    if data_dir:
+        socket_path = socket_path.replace("/run/ek-protection", data_dir + "/run")
+
+    from ekprotection.daemon import IPCClient
+    client = IPCClient(socket_path)
+    return client if client.is_alive() else None
+
+
+def _entry_from_ipc_dict(d: dict):
+    """Reconstrói um LogEntry a partir do dict retornado pelo daemon via IPC."""
+    return LogEntry(
+        entry_id=d.get("id"),
+        timestamp=datetime.fromisoformat(d["timestamp"]),
+        level=LogLevel(d["level"]),
+        event_type=EventType(d["event_type"]),
+        message=d["message"],
+        source=d.get("source", "core"),
+        pid=d.get("pid", 0),
+        file_path=d.get("file_path"),
+        sha256=d.get("sha256"),
+        process=d.get("process"),
+        extra=d.get("extra") or {},
+    )
 
 
 def _render_entries_table(entries: list, title: str = "Logs") -> None:
@@ -113,8 +147,25 @@ def cmd_logs_tail(
     config: Optional[str]  = typer.Option(None, "--config", "-c"),
 ) -> None:
     """Exibe as últimas N entradas de log."""
-    cfg, store = _open_store(config)
+    cfg = ConfigManager(config)
+    cfg.load()
 
+    # Sem filtro de nível, tenta o daemon via IPC primeiro (funciona sem
+    # sudo mesmo com o banco pertencendo a root). Com filtro, ou se o
+    # daemon não estiver rodando, cai pro acesso direto ao SQLite.
+    if not level:
+        client = _ipc_client(cfg)
+        if client is not None:
+            try:
+                resp = client.send("log_tail", n=n)
+                if resp.get("ok"):
+                    entries = [_entry_from_ipc_dict(d) for d in resp["data"]]
+                    _render_entries_table(list(reversed(entries)), f"Últimos {n} registros")
+                    return
+            except ConnectionError:
+                pass  # cai pro acesso direto abaixo
+
+    store = _open_store_from_cfg(cfg)
     f = QueryFilter(
         level      = LogLevel.from_str(level) if level else None,
         limit      = n,
