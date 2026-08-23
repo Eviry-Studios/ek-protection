@@ -27,6 +27,7 @@ from ekprotection.config.manager          import ConfigManager
 from ekprotection.quarantine.manager      import QuarantineManager, QuarantineError
 from ekprotection.quarantine.models       import QuarantineEntry, QuarantineReason, QuarantineStatus
 from ekprotection.auth.manager            import AuthManager
+from ._ipc_or_direct import ipc_client
 from .display import console, print_success, print_error, print_warning, print_info
 
 quar_app = typer.Typer(help="Gerenciar quarentena de arquivos suspeitos")
@@ -50,21 +51,6 @@ def _open_mgr(config_path: str | None = None) -> tuple[ConfigManager, Quarantine
     mgr = QuarantineManager(cfg)
     mgr.open()
     return cfg, mgr
-
-
-def _ipc_client(cfg: ConfigManager):
-    """
-    Cliente IPC pro daemon, se estiver rodando. Retorna None se não
-    estiver (chamador cai pro acesso direto ao SQLite).
-    """
-    socket_path = cfg.get("daemon.socket_path", "/run/ek-protection/daemon.sock")
-    data_dir = os.environ.get("EKP_DATA_DIR", "")
-    if data_dir:
-        socket_path = socket_path.replace("/run/ek-protection", data_dir + "/run")
-
-    from ekprotection.daemon import IPCClient
-    client = IPCClient(socket_path)
-    return client if client.is_alive() else None
 
 
 def _entry_from_ipc_dict(d: dict) -> QuarantineEntry:
@@ -123,7 +109,7 @@ def cmd_list(
     if not all_items:
         cfg = ConfigManager(config)
         cfg.load()
-        client = _ipc_client(cfg)
+        client = ipc_client(cfg)
         if client is not None:
             try:
                 resp = client.send("quarantine_list")

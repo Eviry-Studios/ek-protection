@@ -147,3 +147,50 @@ class QueryFilter:
     limit:      int                   = 100
     offset:     int                   = 0
     order_desc: bool                  = True    # mais recente primeiro
+
+
+def _parse_dt_str(s: str) -> datetime:
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Formato de data inválido: {s}. Use YYYY-MM-DD ou YYYY-MM-DDTHH:MM:SS")
+
+
+def build_query_filter(
+    *,
+    query:  Optional[str] = None,
+    level:  Optional[str] = None,
+    event:  Optional[str] = None,
+    since:  Optional[str] = None,
+    until:  Optional[str] = None,
+    path:   Optional[str] = None,
+    limit:  int           = 100,
+    max_limit: int         = 200,
+) -> QueryFilter:
+    """
+    Constrói um QueryFilter a partir de strings brutas (CLI args ou payload
+    IPC) — usado tanto pelo comando direto quanto pelo IPCServer, pra manter
+    a mesma lógica de parsing/validação nos dois caminhos.
+    Levanta ValueError com mensagem pronta pra exibir se algum campo for
+    inválido.
+    """
+    et = None
+    if event:
+        try:
+            et = EventType(event)
+        except ValueError:
+            valid = ", ".join(e.value for e in EventType)
+            raise ValueError(f"Tipo de evento inválido: {event}. Válidos: {valid}")
+
+    return QueryFilter(
+        search     = query,
+        level      = LogLevel.from_str(level) if level else None,
+        event_type = et,
+        since      = _parse_dt_str(since) if since else None,
+        until      = _parse_dt_str(until) if until else None,
+        file_path  = path,
+        limit      = min(limit, max_limit),
+        order_desc = True,
+    )

@@ -23,8 +23,9 @@ from rich.table import Table
 from rich import box
 
 from ekprotection.config.manager import ConfigManager
-from ekprotection.logs.models import EventType, LogEntry, LogLevel, QueryFilter
+from ekprotection.logs.models import EventType, LogEntry, LogLevel, QueryFilter, build_query_filter
 from ekprotection.logs.store import LogStore
+from ._ipc_or_direct import ipc_client
 from .display import console, print_success, print_error, print_warning, print_info
 
 logs_app = typer.Typer(help="Visualizar e gerenciar logs do EK-Protection")
@@ -63,21 +64,6 @@ def _open_store(config_path: str | None = None) -> tuple[ConfigManager, LogStore
     cfg = ConfigManager(config_path)
     cfg.load()
     return cfg, _open_store_from_cfg(cfg)
-
-
-def _ipc_client(cfg: ConfigManager):
-    """
-    Cliente IPC pro daemon, se estiver rodando. Retorna None se não
-    estiver (chamador cai pro acesso direto ao SQLite).
-    """
-    socket_path = cfg.get("daemon.socket_path", "/run/ek-protection/daemon.sock")
-    data_dir = os.environ.get("EKP_DATA_DIR", "")
-    if data_dir:
-        socket_path = socket_path.replace("/run/ek-protection", data_dir + "/run")
-
-    from ekprotection.daemon import IPCClient
-    client = IPCClient(socket_path)
-    return client if client.is_alive() else None
 
 
 def _entry_from_ipc_dict(d: dict):
@@ -154,7 +140,7 @@ def cmd_logs_tail(
     # sudo mesmo com o banco pertencendo a root). Com filtro, ou se o
     # daemon não estiver rodando, cai pro acesso direto ao SQLite.
     if not level:
-        client = _ipc_client(cfg)
+        client = ipc_client(cfg)
         if client is not None:
             try:
                 resp = client.send("log_tail", n=n)
@@ -197,37 +183,43 @@ def cmd_logs_search(
 ) -> None:
     """Busca nos logs com filtros combinados."""
 
-    def _parse_dt(s: str) -> datetime:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(s, fmt)
-            except ValueError:
-                continue
-        raise ValueError(f"Formato de data inválido: {s}. Use YYYY-MM-DD ou YYYY-MM-DDTHH:MM:SS")
+    def _fail(exc: ValueError) -> None:
+        print_error(str(exc))
+        raise typer.Exit(1)
 
-    cfg, store = _open_store(config)
+    cfg = ConfigManager(config)
+    cfg.load()
 
+    # Tenta o daemon via IPC primeiro (funciona sem sudo mesmo com o banco
+    # pertencendo a root); mesmo padrão já usado em `ekp logs tail`.
+    client = ipc_client(cfg)
+    if client is not None:
+        try:
+            resp = client.send(
+                "log_search", query=query, level=level, event=event,
+                since=since, until=until, path=path, limit=limit,
+            )
+            if resp.get("ok"):
+                data    = resp["data"]
+                entries = [_entry_from_ipc_dict(d) for d in data["entries"]]
+                _render_entries_table(
+                    list(reversed(entries)),
+                    f"Resultados: {len(entries)} de {data['total']} registros",
+                )
+                return
+            _fail(ValueError(resp.get("error", "Erro desconhecido no daemon.")))
+        except ConnectionError:
+            pass  # cai pro acesso direto abaixo
+
+    store = _open_store_from_cfg(cfg)
     try:
-        et = None
-        if event:
-            try:
-                et = EventType(event)
-            except ValueError:
-                print_error(f"Tipo de evento inválido: {event}")
-                valid = [e.value for e in EventType]
-                print_info("Tipos válidos: " + ", ".join(valid[:10]) + "...")
-                raise typer.Exit(1)
-
-        f = QueryFilter(
-            search     = query,
-            level      = LogLevel.from_str(level) if level else None,
-            event_type = et,
-            since      = _parse_dt(since) if since else None,
-            until      = _parse_dt(until) if until else None,
-            file_path  = path,
-            limit      = limit,
-            order_desc = True,
-        )
+        try:
+            f = build_query_filter(
+                query=query, level=level, event=event,
+                since=since, until=until, path=path, limit=limit,
+            )
+        except ValueError as exc:
+            _fail(exc)
 
         total = store.count(f)
         entries = store.query(f)

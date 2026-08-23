@@ -187,6 +187,9 @@ class IPCServer:
         if cmd == "log_tail":
             return self._cmd_log_tail(req)
 
+        if cmd == "log_search":
+            return self._cmd_log_search(req)
+
         return _err(f"Comando desconhecido: {cmd}")
 
     # ------------------------------------------------------------------
@@ -236,6 +239,28 @@ class IPCServer:
         n       = min(req.get("n", 20), 200)
         entries = logs.query(QueryFilter(limit=n, order_desc=True))
         return _ok([e.to_dict() for e in entries])
+
+    def _cmd_log_search(self, req: dict) -> bytes:
+        logs = self._engine.logs
+        if not logs:
+            return _err("Logs não disponíveis.")
+        from ekprotection.logs.models import build_query_filter
+        try:
+            f = build_query_filter(
+                query = req.get("query"),
+                level = req.get("level"),
+                event = req.get("event"),
+                since = req.get("since"),
+                until = req.get("until"),
+                path  = req.get("path"),
+                limit = req.get("limit", 50),
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+
+        total   = logs.count(f)
+        entries = logs.query(f)
+        return _ok({"entries": [e.to_dict() for e in entries], "total": total})
 
     async def _delayed_stop(self) -> None:
         await asyncio.sleep(0.1)
