@@ -25,8 +25,9 @@ from rich.table import Table
 from rich       import box
 
 from ekprotection.config.manager      import ConfigManager
-from ekprotection.exceptions.models   import ExceptionKind, ExceptionTarget
+from ekprotection.exceptions.models   import ExceptionEntry, ExceptionKind, ExceptionTarget
 from ekprotection.exceptions.manager  import ExceptionManager
+from ._ipc_or_direct import ipc_client
 from .display import console, print_success, print_error, print_warning, print_info
 
 exc_app = typer.Typer(help="Gerenciar exceções (whitelist / blacklist)")
@@ -53,6 +54,20 @@ def _open_mgr(config_path: str | None = None) -> tuple[ConfigManager, ExceptionM
     return cfg, mgr
 
 
+def _entry_from_ipc_dict(d: dict) -> ExceptionEntry:
+    """Reconstrói uma ExceptionEntry a partir do dict retornado pelo daemon via IPC."""
+    from datetime import datetime
+    return ExceptionEntry(
+        entry_id=d.get("id"),
+        kind=ExceptionKind(d["kind"]),
+        target=ExceptionTarget(d["target"]),
+        value=d["value"],
+        comment=d.get("comment", ""),
+        added_at=datetime.fromisoformat(d["added_at"]),
+        added_by=d.get("added_by", "user"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # ekp exceptions list
 # ---------------------------------------------------------------------------
@@ -65,16 +80,36 @@ def cmd_list(
     json_output: bool          = typer.Option(False, "--json"),
 ) -> None:
     """Lista todas as exceções cadastradas."""
-    cfg, mgr = _open_mgr(config)
+    cfg = ConfigManager(config)
+    cfg.load()
 
+    # Tenta o daemon via IPC primeiro (funciona sem sudo mesmo com o banco
+    # pertencendo a root) — mesmo padrão já usado em `ekp logs tail/search`.
+    client = ipc_client(cfg)
+    if client is not None:
+        try:
+            resp = client.send("exceptions_list", kind=kind, target=target)
+            if resp.get("ok"):
+                entries = [_entry_from_ipc_dict(d) for d in resp["data"]]
+                _render_list(entries, json_output)
+                return
+            print_error(resp.get("error", "Erro desconhecido no daemon."))
+            raise typer.Exit(1)
+        except ConnectionError:
+            pass  # cai pro acesso direto abaixo
+
+    cfg, mgr = _open_mgr(config)
     k = ExceptionKind(kind)     if kind   else None
     t = ExceptionTarget(target) if target else None
-
     try:
         entries = mgr.list_all(kind=k, target=t)
     finally:
         mgr.close()
 
+    _render_list(entries, json_output)
+
+
+def _render_list(entries: list[ExceptionEntry], json_output: bool) -> None:
     if json_output:
         import json
         console.print_json(json.dumps([e.to_dict() for e in entries]))

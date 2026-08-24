@@ -25,8 +25,9 @@ from rich          import box
 
 from ekprotection.config.manager   import ConfigManager
 from ekprotection.scanner.engine   import ScanEngine
-from ekprotection.scanner.result   import ScanVerdict, ScanReport
+from ekprotection.scanner.result   import FileScanResult, ScanVerdict, ScanReport
 from ekprotection.scanner.signatures import SignatureDB
+from ._ipc_or_direct import ipc_client
 from .display import console, print_success, print_error, print_warning, print_info
 
 scan_app = typer.Typer(help="Scanner de arquivos sob demanda")
@@ -136,6 +137,27 @@ def _print_report(report: ScanReport, verbose: bool = False) -> None:
 # ekp scan file
 # ---------------------------------------------------------------------------
 
+def _result_from_ipc_dict(d: dict) -> FileScanResult:
+    """Reconstrói um FileScanResult a partir do dict retornado pelo daemon via IPC."""
+    from datetime import datetime
+    return FileScanResult(
+        path=d["path"],
+        verdict=ScanVerdict(d["verdict"]),
+        sha256=d.get("sha256"),
+        file_size=d.get("file_size"),
+        threat_name=d.get("threat_name"),
+        threat_type=d.get("threat_type"),
+        risk_level=d.get("risk_level"),
+        reason=d.get("reason"),
+        entropy=d.get("entropy"),
+        is_elf=d.get("is_elf", False),
+        is_script=d.get("is_script", False),
+        scanned_at=datetime.fromisoformat(d["scanned_at"]),
+        scan_ms=d.get("scan_ms"),
+        error_msg=d.get("error_msg"),
+    )
+
+
 @scan_app.command("file")
 def cmd_scan_file(
     path:        str           = typer.Argument(..., help="Arquivo a escanear"),
@@ -144,18 +166,52 @@ def cmd_scan_file(
     config:      Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
     """Escaneia um arquivo específico e exibe relatório detalhado."""
-    cfg, engine, sig_db = _build_engine(config)
-
     p = Path(path)
     if not p.exists():
         print_error(f"Arquivo não encontrado: {path}")
         raise typer.Exit(1)
+
+    # Tenta o daemon via IPC primeiro (funciona sem sudo mesmo com o banco
+    # de assinaturas/exceções pertencendo a root) — mesmo padrão já usado
+    # em `ekp logs`/`ekp exceptions list`.
+    cfg = ConfigManager(config)
+    cfg.load()
+    client = ipc_client(cfg)
+    if client is not None:
+        try:
+            resp = client.send("scan_file", path=str(p))
+            if resp.get("ok"):
+                result = _result_from_ipc_dict(resp["data"])
+                _render_scan_file_result(result, json_output)
+                if result.is_critical:
+                    console.print()
+                    print_warning("Ameaça crítica detectada! Considere quarentenar:")
+                    console.print(f"  [cyan]ekp quarantine list[/cyan]")
+                raise typer.Exit(1 if result.is_threat else 0)
+            print_error(resp.get("error", "Erro desconhecido no daemon."))
+            raise typer.Exit(1)
+        except ConnectionError:
+            pass  # cai pro acesso direto abaixo
+
+    cfg, engine, sig_db = _build_engine(config)
 
     with console.status(f"[dim]Escaneando {p.name}...[/dim]"):
         result = engine.scan_file(path)
 
     sig_db.close()
 
+    _render_scan_file_result(result, json_output)
+
+    if result.is_critical:
+        console.print()
+        print_warning("Ameaça crítica detectada! Considere quarentenar:")
+        console.print(f"  [cyan]ekp quarantine list[/cyan]")
+
+    raise typer.Exit(1 if result.is_threat else 0)
+
+
+def _render_scan_file_result(result, json_output: bool) -> None:
+    fname = Path(result.path).name
     if json_output:
         import json
         console.print_json(json.dumps(result.to_dict()))
@@ -191,16 +247,9 @@ def cmd_scan_file(
 
     console.print(Panel(
         table,
-        title=f"[{color}]Scan — {p.name}[/{color}]",
+        title=f"[{color}]Scan — {fname}[/{color}]",
         border_style=color if result.is_threat else "cyan",
     ))
-
-    if result.is_critical:
-        console.print()
-        print_warning("Ameaça crítica detectada! Considere quarentenar:")
-        console.print(f"  [cyan]ekp quarantine list[/cyan]")
-
-    raise typer.Exit(1 if result.is_threat else 0)
 
 
 # ---------------------------------------------------------------------------

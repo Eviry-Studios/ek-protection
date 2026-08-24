@@ -190,6 +190,9 @@ class IPCServer:
         if cmd == "log_search":
             return self._cmd_log_search(req)
 
+        if cmd == "exceptions_list":
+            return self._cmd_exceptions_list(req)
+
         return _err(f"Comando desconhecido: {cmd}")
 
     # ------------------------------------------------------------------
@@ -261,6 +264,19 @@ class IPCServer:
         total   = logs.count(f)
         entries = logs.query(f)
         return _ok({"entries": [e.to_dict() for e in entries], "total": total})
+
+    def _cmd_exceptions_list(self, req: dict) -> bytes:
+        exceptions = self._engine.exceptions
+        if not exceptions:
+            return _err("Exceções não disponíveis.")
+        from ekprotection.exceptions.models import ExceptionKind, ExceptionTarget
+        try:
+            kind   = ExceptionKind(req["kind"])   if req.get("kind")   else None
+            target = ExceptionTarget(req["target"]) if req.get("target") else None
+        except ValueError as exc:
+            return _err(str(exc))
+        entries = exceptions.list_all(kind=kind, target=target)
+        return _ok([e.to_dict() for e in entries])
 
     async def _delayed_stop(self) -> None:
         await asyncio.sleep(0.1)
