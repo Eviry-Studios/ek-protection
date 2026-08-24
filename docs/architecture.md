@@ -158,14 +158,22 @@ disco mesmo.
 
 **Paliativo atual:** prefixar esses comandos com `sudo`.
 
-**Correção planejada (Patch 11):**
-- Adicionar à `IPCServer._dispatch()` os comandos que faltam: `logs_search`,
-  `exceptions_list`, `heuristics_analyze`, `scan_quick`, `scan_full`
-- Migrar cada `cli/*_commands.py` para tentar `IPCClient` primeiro (se o daemon
-  estiver rodando) e só cair para acesso direto ao SQLite como fallback — útil
-  para rodar comandos com o daemon parado, ou em modo standalone/debug
-- Padronizar esse fallback num helper único (`cli/_ipc_or_direct.py`) em vez de
-  duplicar a lógica em cada arquivo de comando
+**Progresso (Patch 11):**
+- ✅ `logs_search` — feito (`ekp logs tail`/`search`, 2026-08-23)
+- ✅ `exceptions_list` — feito (`ekp exceptions list`, 2026-08-24)
+- ✅ `scan_file` — o daemon já implementava desde o Patch 9, só a CLI nunca
+  usava; migrado (`ekp scan file`, 2026-08-24)
+- ❌ `heuristics_analyze` — **verificado e removido desta lista** (2026-08-24):
+  `ekp heuristics analyze` não instancia `LogStore`/`QuarantineStore`/
+  `SignatureDB`, roda `HeuristicEngine(cfg)` sem `exc_manager`/`log_manager`,
+  nunca toca um arquivo `.db` root-owned — não tem o bug de sudo descrito
+  acima, não precisa de IPC.
+- 📋 `scan_quick`/`scan_full` ainda pendentes — mesmo bug de sudo dos outros
+  (`_build_engine()` em `scan_commands.py` abre `SignatureDB`+`ExceptionManager`
+  direto), mas scan longo via IPC precisa de progresso/streaming pelo socket,
+  não é só trocar por `client.send()` — fica pra uma rodada futura.
+- Fallback já padronizado num helper único (`cli/_ipc_or_direct.py`, 2026-08-23)
+  em vez de duplicar a lógica em cada arquivo de comando
 
 ### 📋 Outras melhorias planejadas
 
