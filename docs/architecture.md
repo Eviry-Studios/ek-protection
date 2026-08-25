@@ -190,7 +190,10 @@ disco mesmo.
 - **Updater de assinaturas com manifest real** — hoje aponta para uma URL que
   não existe ainda; criar o `manifest.json` + `signatures.jsonl` no próprio
   repositório como fonte inicial.
-- **Testes de integração com daemon real** — a suíte atual (525 testes) cobre
-  cada módulo isoladamente com mocks; faltam testes end-to-end que sobem o
-  daemon de verdade e validam o IPC completo, pegando bugs como o acima antes
-  de chegar em produção.
+- ✅ **Testes de integração com daemon real** — feito (2026-08-25,
+  `tests/test_cli_ipc.py`): sobe `ekp start` como subprocesso de verdade
+  num ambiente isolado, valida `ekp logs tail`, `ekp exceptions list` e
+  `ekp scan file` via socket IPC real (não mock), inclusive o fallback
+  pro SQLite direto quando o daemon é derrubado. `scan_quick`/`scan_full`
+  continuam sem essa cobertura — dependem do streaming de progresso pelo
+  IPC que ainda não foi implementado (ver item logo acima).

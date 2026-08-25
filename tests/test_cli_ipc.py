@@ -1,0 +1,197 @@
+"""
+tests/test_cli_ipc.py
+======================
+Testes de integração end-to-end: sobe o daemon real (subprocess, socket
+Unix de verdade) e valida contra ele os comandos CLI migrados pro padrão
+"IPC primeiro, cai pro SQLite direto se o daemon não estiver rodando"
+(Patch 11 — ver docs/architecture.md).
+
+Gap que este arquivo fecha (registrado em EK-Protection.md, rodadas
+2026-08-23/08-24): a suite unitária cobre cada módulo isolado com mocks,
+mas nunca sobe um daemon real nem invoca a CLI como processo — os bugs
+de "exige sudo" corrigidos no Patch 11 só tinham validação manual, sem
+teste automatizado que pegasse uma regressão futura.
+
+Cada teste roda em ambiente isolado (EKP_DATA_DIR por tmp_path do
+pytest), nunca toca configuração ou dados reais do sistema.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Iterator
+
+import pytest
+
+# Arquivo EICAR padrão da indústria (inofensivo, feito pra ser detectado)
+# e o SHA-256 real correspondente, já corrigido na assinatura demo do
+# scanner (ver ekprotection/scanner/signatures.py).
+EICAR_CONTENT = (
+    r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+)
+EICAR_SHA256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+
+_BIN_DIR = Path(sys.executable).parent
+
+
+def _run_cli(*args: str, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(_BIN_DIR / "ekp"), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+@pytest.fixture
+def lab_env(tmp_path: Path) -> dict:
+    """Ambiente isolado: EKP_DATA_DIR próprio + config.yaml próprio, nunca
+    toca /var/lib, /var/log, /run ou /etc reais."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"monitor:\n  paths:\n    - {watch_dir}\n"
+        "signatures:\n  auto_update: false\n"
+    )
+
+    env = dict(os.environ)
+    env["EKP_DATA_DIR"] = str(tmp_path)
+    env["EKP_CONFIG_PATH_FOR_TEST"] = str(config_path)  # só uso interno do teste
+    return env
+
+
+@pytest.fixture
+def running_daemon(lab_env: dict) -> Iterator[dict]:
+    """Sobe `ekp start` (foreground) como subprocesso real, aguarda o
+    socket IPC responder, e garante encerramento limpo no teardown."""
+    config_path = lab_env["EKP_CONFIG_PATH_FOR_TEST"]
+    proc = subprocess.Popen(
+        [str(_BIN_DIR / "ekp"), "start", "--config", config_path],
+        env=lab_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    socket_path = f"{lab_env['EKP_DATA_DIR']}/run/daemon.sock"
+    from ekprotection.daemon import IPCClient
+    client = IPCClient(socket_path)
+
+    deadline = time.monotonic() + 10
+    alive = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            out = proc.stdout.read() if proc.stdout else ""
+            pytest.fail(f"Daemon morreu ao subir (ambiente isolado):\n{out}")
+        if client.is_alive():
+            alive = True
+            break
+        time.sleep(0.2)
+
+    if not alive:
+        proc.terminate()
+        proc.wait(timeout=5)
+        pytest.fail("Daemon não respondeu via IPC dentro do timeout (10s).")
+
+    try:
+        yield lab_env
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# ekp logs tail — via daemon (IPC) e fallback direto ao SQLite
+# ---------------------------------------------------------------------------
+
+class TestLogsTail:
+    def test_tail_via_daemon_ipc(self, running_daemon: dict) -> None:
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+        result = _run_cli("logs", "tail", "-n", "10", "--config", config_path, env=running_daemon)
+        assert result.returncode == 0, result.stdout + result.stderr
+        # O próprio start do engine grava um evento "system.start" nos logs
+        # estruturados — se aparece aqui, o round-trip via IPC funcionou.
+        assert "system.start" in result.stdout
+
+    def test_tail_fallback_direct_sqlite_after_daemon_stopped(
+        self, running_daemon: dict
+    ) -> None:
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+        # Confirma via IPC primeiro...
+        result_ipc = _run_cli("logs", "tail", "-n", "10", "--config", config_path, env=running_daemon)
+        assert result_ipc.returncode == 0
+
+        # ...depois derruba o daemon e confirma que o mesmo comando ainda
+        # funciona lendo o SQLite direto (fallback do padrão Patch 11).
+        stop = _run_cli("stop", "--config", config_path, env=running_daemon)
+        assert stop.returncode == 0, stop.stdout + stop.stderr
+        time.sleep(0.5)
+
+        result_direct = _run_cli("logs", "tail", "-n", "10", "--config", config_path, env=running_daemon)
+        assert result_direct.returncode == 0, result_direct.stdout + result_direct.stderr
+        assert "system.start" in result_direct.stdout
+
+
+# ---------------------------------------------------------------------------
+# ekp exceptions list — via daemon (IPC)
+# ---------------------------------------------------------------------------
+
+class TestExceptionsListViaIPC:
+    def test_list_reflects_entry_added_directly(self, running_daemon: dict) -> None:
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+
+        add = _run_cli(
+            "exceptions", "add", "whitelist", "path", "/tmp/algum-caminho-confiavel",
+            "--comment", "teste-integracao", "--config", config_path,
+            env=running_daemon,
+        )
+        assert add.returncode == 0, add.stdout + add.stderr
+
+        result = _run_cli(
+            "exceptions", "list", "--json", "--config", config_path, env=running_daemon
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        import json
+        entries = json.loads(result.stdout)
+        assert any(e["value"] == "/tmp/algum-caminho-confiavel" for e in entries)
+
+
+# ---------------------------------------------------------------------------
+# ekp scan file — via daemon (IPC), detecção real do EICAR
+# ---------------------------------------------------------------------------
+
+class TestScanFileViaIPC:
+    def test_scan_eicar_via_daemon_detects_threat(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> None:
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+        eicar_path = tmp_path / "eicar_test_file.com"
+        eicar_path.write_text(EICAR_CONTENT)
+
+        import hashlib
+        assert hashlib.sha256(eicar_path.read_bytes()).hexdigest() == EICAR_SHA256
+
+        result = _run_cli(
+            "scan", "file", str(eicar_path), "--json", "--config", config_path,
+            env=running_daemon,
+        )
+        # Exit code 1 é o comportamento esperado quando uma ameaça é
+        # detectada (convenção estilo grep/clamscan) — não é um erro do CLI.
+        assert result.returncode == 1, result.stdout + result.stderr
+
+        import json
+        data = json.loads(result.stdout)
+        assert data["verdict"].lower() in ("threat", "ameaça", "ameaca")
+        assert data["threat_name"] == "EICAR.Test.File"
