@@ -168,10 +168,14 @@ disco mesmo.
   `SignatureDB`, roda `HeuristicEngine(cfg)` sem `exc_manager`/`log_manager`,
   nunca toca um arquivo `.db` root-owned — não tem o bug de sudo descrito
   acima, não precisa de IPC.
-- 📋 `scan_quick`/`scan_full` ainda pendentes — mesmo bug de sudo dos outros
-  (`_build_engine()` em `scan_commands.py` abre `SignatureDB`+`ExceptionManager`
-  direto), mas scan longo via IPC precisa de progresso/streaming pelo socket,
-  não é só trocar por `client.send()` — fica pra uma rodada futura.
+- ✅ `scan_quick`/`scan_full`/`scan_paths` — feito (2026-08-26). Protocolo IPC
+  ganhou um segundo modo (`_STREAMING_COMMANDS` em `daemon.py`): a conexão
+  recebe várias linhas JSON (evento `progress` por arquivo + 1 evento `result`
+  final com o `ScanReport` completo) em vez do request/response de 1 linha só.
+  `IPCClient.send_stream()` consome isso com um callback de progresso.
+  `ekp scan quick/full/paths` tentam o daemon primeiro (mesmo padrão dos
+  outros comandos Patch 11), caem pro `_build_engine()` local se ele não
+  estiver rodando.
 - Fallback já padronizado num helper único (`cli/_ipc_or_direct.py`, 2026-08-23)
   em vez de duplicar a lógica em cada arquivo de comando
 
@@ -194,6 +198,6 @@ disco mesmo.
   `tests/test_cli_ipc.py`): sobe `ekp start` como subprocesso de verdade
   num ambiente isolado, valida `ekp logs tail`, `ekp exceptions list` e
   `ekp scan file` via socket IPC real (não mock), inclusive o fallback
-  pro SQLite direto quando o daemon é derrubado. `scan_quick`/`scan_full`
-  continuam sem essa cobertura — dependem do streaming de progresso pelo
-  IPC que ainda não foi implementado (ver item logo acima).
+  pro SQLite direto quando o daemon é derrubado. **Ampliado em 2026-08-26**
+  (`TestScanStreamingViaIPC`): mesma cobertura agora pra `ekp scan full`
+  (detecção real do EICAR) e `ekp scan paths` (IPC + fallback direto).

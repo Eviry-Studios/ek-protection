@@ -256,19 +256,28 @@ def _render_scan_file_result(result, json_output: bool) -> None:
 # ekp scan quick / full / paths
 # ---------------------------------------------------------------------------
 
-def _run_scan(
-    report_fn,
-    scan_label:  str,
-    verbose:     bool,
-    json_output: bool,
-    config:      Optional[str],
-    paths:       Optional[list[str]] = None,
-) -> None:
-    cfg, engine, sig_db = _build_engine(config)
+# Nome do comando IPC (streaming, Patch 11) por scan_label da CLI.
+_STREAM_CMD = {"quick": "scan_quick", "full": "scan_full", "paths": "scan_paths"}
 
-    scanned_count = 0
 
-    with Progress(
+def _report_from_ipc_dict(d: dict) -> ScanReport:
+    """Reconstrói um ScanReport a partir do evento 'result' final do daemon."""
+    from datetime import datetime
+    return ScanReport(
+        scan_type    = d["scan_type"],
+        started_at   = datetime.fromisoformat(d["started_at"]),
+        finished_at  = datetime.fromisoformat(d["finished_at"]) if d.get("finished_at") else None,
+        results      = [_result_from_ipc_dict(r) for r in d.get("results", [])],
+        total_files  = d.get("total_files", 0),
+        scanned_files= d.get("scanned_files", 0),
+        skipped_files= d.get("skipped_files", 0),
+        threats_found= d.get("threats_found", 0),
+        errors       = d.get("errors", 0),
+    )
+
+
+def _scan_progress() -> Progress:
+    return Progress(
         SpinnerColumn(),
         TextColumn("[ekp.brand]Escaneando[/ekp.brand]"),
         BarColumn(),
@@ -276,26 +285,76 @@ def _run_scan(
         TextColumn("[dim]{task.description}[/dim]"),
         console=console,
         transient=True,
-    ) as progress:
+    )
+
+
+def _run_scan_via_ipc(client, scan_label: str, paths: Optional[list[str]]) -> ScanReport:
+    """Pede o scan pro daemon via IPC (streaming), atualizando a barra de
+    progresso a cada evento 'progress'. Lança ConnectionError se o daemon
+    cair no meio (chamador cai pro scan local direto)."""
+    ipc_cmd = _STREAM_CMD[scan_label]
+    kwargs  = {"paths": paths} if scan_label == "paths" else {}
+
+    with _scan_progress() as progress:
         task = progress.add_task("", total=None)
 
         def on_progress(fpath: str) -> None:
-            nonlocal scanned_count
-            scanned_count += 1
             progress.update(task, description=Path(fpath).name[:50])
 
-        if paths:
-            report = engine.scan_paths(paths, recursive=True, progress_cb=on_progress)
-            report.scan_type = scan_label
-        else:
-            report = report_fn(progress_cb=on_progress)
+        data = client.send_stream(ipc_cmd, on_progress=on_progress, **kwargs)
 
-    sig_db.close()
+    return _report_from_ipc_dict(data)
+
+
+def _run_scan(
+    scan_label:  str,
+    verbose:     bool,
+    json_output: bool,
+    config:      Optional[str],
+    paths:       Optional[list[str]] = None,
+) -> None:
+    # Tenta o daemon via IPC primeiro (mesmo padrão de `ekp scan file`,
+    # `ekp logs`, `ekp exceptions list`) — evita abrir SignatureDB/
+    # ExceptionManager local, que exigem sudo. Timeout maior que o padrão
+    # porque scans longos passam mais tempo entre um arquivo grande e outro.
+    cfg = ConfigManager(config)
+    cfg.load()
+    client = ipc_client(cfg, timeout=300.0)
+
+    report = None
+    if client is not None:
+        try:
+            report = _run_scan_via_ipc(client, scan_label, paths)
+        except ConnectionError:
+            report = None  # cai pro acesso direto abaixo
+
+    if report is None:
+        _, engine, sig_db = _build_engine(config)
+
+        with _scan_progress() as progress:
+            task = progress.add_task("", total=None)
+
+            def on_progress(fpath: str) -> None:
+                progress.update(task, description=Path(fpath).name[:50])
+
+            if scan_label == "quick":
+                report = engine.scan_quick(progress_cb=on_progress)
+            elif scan_label == "full":
+                report = engine.scan_full(progress_cb=on_progress)
+            else:
+                report = engine.scan_paths(paths, recursive=True, progress_cb=on_progress)
+                report.scan_type = scan_label
+
+        sig_db.close()
 
     if json_output:
         import json
         console.print_json(json.dumps(report.summary()))
-        return
+        # Mesma convenção de `ekp scan file` (grep/clamscan: exit 1 = achou
+        # ameaça) — achado real ao escrever o teste de streaming: o `return`
+        # aqui saía antes do `if report.threats_found: raise typer.Exit(1)`
+        # abaixo, então `--json` sempre retornava 0 mesmo com ameaça achada.
+        raise typer.Exit(1 if report.threats_found else 0)
 
     console.print()
 
@@ -323,8 +382,7 @@ def cmd_scan_quick(
     config:      Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
     """Scan rápido dos paths configurados (scanner.quick_scan_paths)."""
-    _, engine, _ = _build_engine(config)
-    _run_scan(engine.scan_quick, "quick", verbose, json_output, config)
+    _run_scan("quick", verbose, json_output, config)
 
 
 @scan_app.command("full")
@@ -334,8 +392,7 @@ def cmd_scan_full(
     config:      Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
     """Scan completo de todos os paths monitorados."""
-    _, engine, _ = _build_engine(config)
-    _run_scan(engine.scan_full, "full", verbose, json_output, config)
+    _run_scan("full", verbose, json_output, config)
 
 
 @scan_app.command("paths")
@@ -346,7 +403,7 @@ def cmd_scan_paths(
     config:      Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
     """Escaneia paths específicos (arquivos ou diretórios)."""
-    _run_scan(None, "paths", verbose, json_output, config, paths=list(paths))
+    _run_scan("paths", verbose, json_output, config, paths=list(paths))
 
 
 # ---------------------------------------------------------------------------

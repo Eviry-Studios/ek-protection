@@ -17,10 +17,15 @@ import os
 from ekprotection.config.manager import ConfigManager
 
 
-def ipc_client(cfg: ConfigManager):
+def ipc_client(cfg: ConfigManager, timeout: float = 10.0):
     """
     Cliente IPC pro daemon, se estiver rodando e responder. Retorna None
     se não estiver (chamador cai pro acesso direto ao SQLite).
+
+    `timeout` maior que o padrão é útil pros comandos de streaming
+    (scan_quick/scan_full/scan_paths) — o timeout do socket reseta a cada
+    linha recebida, então cobre "tempo entre um arquivo e outro", não o
+    scan inteiro, mas arquivos muito grandes ainda se beneficiam de folga.
     """
     socket_path = cfg.get("daemon.socket_path", "/run/ek-protection/daemon.sock")
     data_dir = os.environ.get("EKP_DATA_DIR", "")
@@ -28,5 +33,5 @@ def ipc_client(cfg: ConfigManager):
         socket_path = socket_path.replace("/run/ek-protection", data_dir + "/run")
 
     from ekprotection.daemon import IPCClient
-    client = IPCClient(socket_path)
+    client = IPCClient(socket_path, timeout=timeout)
     return client if client.is_alive() else None

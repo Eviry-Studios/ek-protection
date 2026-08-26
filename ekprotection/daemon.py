@@ -21,6 +21,17 @@ Protocolo IPC (linha por mensagem):
 
   Request:  {"cmd": "stop"}\n
   Response: {"ok": true, "data": "stopping"}\n
+
+Protocolo de streaming (Patch 11) — scan_quick/scan_full/scan_paths:
+  A conexão recebe várias linhas JSON em vez de uma resposta só, pra dar
+  progresso em tempo real de scans longos:
+  Request:  {"cmd": "scan_full"}\n
+  Response: {"ok": true, "event": "progress", "data": {"path": "/tmp/x"}}\n
+            {"ok": true, "event": "progress", "data": {"path": "/tmp/y"}}\n
+            ... (1 por arquivo escaneado)
+            {"ok": true, "event": "result", "data": {...summary(), "results": [...]}}\n
+  Erro no meio do scan: {"ok": false, "error": "..."}\n (última linha, sem
+  "result" depois).
 """
 
 from __future__ import annotations
@@ -32,7 +43,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing  import Any, Optional
+from typing  import Any, Callable, Optional
 
 from ekprotection.config.manager import ConfigManager
 from ekprotection.core.engine    import EKEngine, EngineState
@@ -53,6 +64,16 @@ def _ok(data: Any) -> bytes:
 
 def _err(msg: str) -> bytes:
     return (json.dumps({"ok": False, "error": msg}, ensure_ascii=False) + "\n").encode()
+
+
+def _stream(event: str, data: Any) -> bytes:
+    return (json.dumps({"ok": True, "event": event, "data": data}, ensure_ascii=False) + "\n").encode()
+
+
+# Comandos de scan longo: streaming de progresso, múltiplas linhas JSON por
+# conexão (evento "progress" repetido + 1 evento "result" final), em vez do
+# request/response de 1 linha só do resto do protocolo.
+_STREAMING_COMMANDS = {"scan_quick", "scan_full", "scan_paths"}
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +159,12 @@ class IPCServer:
                 await writer.drain()
                 return
 
-            response = await self._dispatch(request)
-            writer.write(response)
-            await writer.drain()
+            if request.get("cmd", "") in _STREAMING_COMMANDS:
+                await self._dispatch_stream(request, writer)
+            else:
+                response = await self._dispatch(request)
+                writer.write(response)
+                await writer.drain()
 
         except asyncio.TimeoutError:
             writer.write(_err("timeout"))
@@ -278,6 +302,63 @@ class IPCServer:
         entries = exceptions.list_all(kind=kind, target=target)
         return _ok([e.to_dict() for e in entries])
 
+    async def _dispatch_stream(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """
+        Dispatcher dos comandos de scan longo (scan_quick/scan_full/scan_paths).
+        Roda o scan numa thread (ScanEngine já usa ThreadPoolExecutor interno),
+        repassando cada progress_cb como evento "progress" pro socket assim que
+        chega, e o relatório final como evento "result" ao terminar.
+        """
+        cmd     = req.get("cmd", "")
+        scanner = self._engine.get_subsystem("scanner")
+        if not scanner:
+            writer.write(_err("Scanner não disponível."))
+            await writer.drain()
+            return
+
+        loop  = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def progress_cb(fpath: str) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, ("progress", fpath))
+
+        def run_scan() -> None:
+            try:
+                if cmd == "scan_quick":
+                    report = scanner.scan_quick(progress_cb=progress_cb)
+                elif cmd == "scan_full":
+                    report = scanner.scan_full(progress_cb=progress_cb)
+                else:  # scan_paths
+                    paths = req.get("paths") or []
+                    if not paths:
+                        raise ValueError("Campo 'paths' obrigatório para scan_paths.")
+                    report = scanner.scan_paths(paths, recursive=True, progress_cb=progress_cb)
+                    report.scan_type = "paths"
+                loop.call_soon_threadsafe(queue.put_nowait, ("result", report))
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+
+        scan_future = loop.run_in_executor(None, run_scan)
+
+        while True:
+            kind, payload = await queue.get()
+            if kind == "progress":
+                writer.write(_stream("progress", {"path": payload}))
+                await writer.drain()
+                continue
+            if kind == "error":
+                writer.write(_err(payload))
+                await writer.drain()
+                break
+            # kind == "result"
+            data = payload.summary()
+            data["results"] = [r.to_dict() for r in payload.results]
+            writer.write(_stream("result", data))
+            await writer.drain()
+            break
+
+        await scan_future
+
     async def _delayed_stop(self) -> None:
         await asyncio.sleep(0.1)
         if self._engine._stop_event:
@@ -339,6 +420,61 @@ class IPCClient:
             return json.loads(response.decode("utf-8").strip())
         except json.JSONDecodeError:
             raise ConnectionError(f"Resposta inválida do daemon: {response[:100]}")
+
+    def send_stream(
+        self,
+        cmd: str,
+        on_progress: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> dict:
+        """
+        Envia um comando de streaming (scan_quick/scan_full/scan_paths) e
+        consome os eventos "progress" via callback até chegar o evento final
+        "result", que é retornado. Lança ConnectionError se o daemon não
+        estiver rodando ou a conexão cair antes do resultado final.
+        """
+        import socket as _socket
+
+        request = json.dumps({"cmd": cmd, **kwargs}) + "\n"
+        sock    = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(self._timeout)
+
+        try:
+            sock.connect(self._socket_path)
+            sock.sendall(request.encode("utf-8"))
+            sock_file = sock.makefile("rb")
+
+            while True:
+                line = sock_file.readline()
+                if not line:
+                    raise ConnectionError(
+                        "Conexão encerrada pelo daemon antes do resultado final."
+                    )
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    raise ConnectionError(f"Resposta inválida do daemon: {line[:100]!r}")
+
+                if not msg.get("ok", False):
+                    raise ConnectionError(msg.get("error", "Erro desconhecido no daemon."))
+                if msg.get("event") == "progress":
+                    if on_progress:
+                        on_progress(msg.get("data", {}).get("path", ""))
+                    continue
+                return msg.get("data", {})
+        except _socket.timeout:
+            raise ConnectionError(f"Timeout ao conectar ao daemon ({self._socket_path}).")
+        except FileNotFoundError:
+            raise ConnectionError(
+                f"Daemon não encontrado em {self._socket_path}. "
+                "Execute: sudo ekp start"
+            )
+        except ConnectionRefusedError:
+            raise ConnectionError(
+                "Daemon não está respondendo. Tente reiniciar: sudo ekp restart"
+            )
+        finally:
+            sock.close()
 
     def is_alive(self) -> bool:
         """Verifica se o daemon está rodando."""

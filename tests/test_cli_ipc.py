@@ -195,3 +195,70 @@ class TestScanFileViaIPC:
         data = json.loads(result.stdout)
         assert data["verdict"].lower() in ("threat", "ameaça", "ameaca")
         assert data["threat_name"] == "EICAR.Test.File"
+
+
+# ---------------------------------------------------------------------------
+# ekp scan full / paths — via daemon (IPC streaming, Patch 11)
+# ---------------------------------------------------------------------------
+
+class TestScanStreamingViaIPC:
+    """Cobre o item que ficou pendente 3 rodadas seguidas (08-23/08-24/08-25)
+    no roadmap Patch 11: scan_quick/scan_full/scan_paths via IPC exigem
+    progresso streamado pelo socket, diferente do request/response de 1
+    linha só usado pelos outros comandos — ver protocolo em daemon.py."""
+
+    def test_scan_full_via_daemon_detects_eicar(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> None:
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+        # lab_env aponta monitor.paths pro mesmo watch_dir usado aqui —
+        # `ekp scan full` sem args escaneia exatamente essa pasta.
+        watch_dir = tmp_path / "watch"
+        eicar_path = watch_dir / "eicar_test_file.com"
+        eicar_path.write_text(EICAR_CONTENT)
+
+        result = _run_cli(
+            "scan", "full", "--json", "--config", config_path, env=running_daemon
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+
+        import json
+        data = json.loads(result.stdout)
+        assert data["scan_type"] == "full"
+        assert data["threats_found"] == 1
+        assert data["errors"] == 0
+
+    def test_scan_paths_via_daemon_streams_progress_and_falls_back(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> None:
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+        watch_dir = tmp_path / "watch"
+        clean_path = watch_dir / "arquivo_limpo.txt"
+        clean_path.write_text("nada de suspeito aqui")
+
+        # Via IPC (daemon rodando)...
+        result_ipc = _run_cli(
+            "scan", "paths", str(watch_dir), "--json", "--config", config_path,
+            env=running_daemon,
+        )
+        assert result_ipc.returncode == 0, result_ipc.stdout + result_ipc.stderr
+        import json
+        data_ipc = json.loads(result_ipc.stdout)
+        assert data_ipc["scan_type"] == "paths"
+        assert data_ipc["scanned_files"] == 1
+        assert data_ipc["threats_found"] == 0
+
+        # ...depois derruba o daemon e confirma o fallback pro scan local
+        # direto (sem IPC) chega no mesmo resultado.
+        stop = _run_cli("stop", "--config", config_path, env=running_daemon)
+        assert stop.returncode == 0, stop.stdout + stop.stderr
+        time.sleep(0.5)
+
+        result_direct = _run_cli(
+            "scan", "paths", str(watch_dir), "--json", "--config", config_path,
+            env=running_daemon,
+        )
+        assert result_direct.returncode == 0, result_direct.stdout + result_direct.stderr
+        data_direct = json.loads(result_direct.stdout)
+        assert data_direct["scanned_files"] == 1
+        assert data_direct["threats_found"] == 0
