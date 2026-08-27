@@ -70,3 +70,151 @@ class TestEngineState:
     def test_get_missing_subsystem_returns_none(self, cfg: ConfigManager) -> None:
         engine = EKEngine(cfg)
         assert engine.get_subsystem("nonexistent") is None
+
+
+class TestAutoScanWiring:
+    """Monitor -> scanner: executáveis novos são escaneados sem scan manual."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_data_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # scanner/quarantine/exceptions/logs só abrem de verdade (sem sudo)
+        # com EKP_DATA_DIR setado — sem isso caem em /var/lib/ek-protection
+        # (root-owned) e o subsistema fica None.
+        monkeypatch.setenv("EKP_DATA_DIR", str(tmp_path / "data"))
+
+    @pytest.mark.asyncio
+    async def test_callback_registered_by_default(self, cfg: ConfigManager) -> None:
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            assert engine._on_monitor_event_auto_scan in engine.monitor._callbacks
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_created_executable_triggers_scan_file(
+        self, cfg: ConfigManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            calls: list[str] = []
+            monkeypatch.setattr(engine.scanner, "scan_file", lambda p: calls.append(str(p)))
+
+            target = str(tmp_path / "dropped.sh")
+            event = FileEvent(kind=FileEventKind.CREATED, path=target)
+            await engine._on_monitor_event_auto_scan(event)
+
+            assert calls == [target]
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_non_executable_extension_is_skipped(
+        self, cfg: ConfigManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            calls: list[str] = []
+            monkeypatch.setattr(engine.scanner, "scan_file", lambda p: calls.append(str(p)))
+
+            event = FileEvent(kind=FileEventKind.CREATED, path=str(tmp_path / "photo.jpg"))
+            await engine._on_monitor_event_auto_scan(event)
+
+            assert calls == []
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_deleted_and_modified_are_ignored(
+        self, cfg: ConfigManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            calls: list[str] = []
+            monkeypatch.setattr(engine.scanner, "scan_file", lambda p: calls.append(str(p)))
+
+            target = str(tmp_path / "app.bin")
+            for kind in (FileEventKind.DELETED, FileEventKind.MODIFIED):
+                await engine._on_monitor_event_auto_scan(FileEvent(kind=kind, path=target))
+
+            assert calls == []
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_directory_events_are_skipped(
+        self, cfg: ConfigManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            calls: list[str] = []
+            monkeypatch.setattr(engine.scanner, "scan_file", lambda p: calls.append(str(p)))
+
+            event = FileEvent(kind=FileEventKind.CREATED, path=str(tmp_path / "somedir"), is_dir=True)
+            await engine._on_monitor_event_auto_scan(event)
+
+            assert calls == []
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_disabled_via_config_never_registers_callback(
+        self, tmp_path: Path
+    ) -> None:
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.auto_scan_new_executables", False)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            assert engine._on_monitor_event_auto_scan not in engine.monitor._callbacks
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_real_eicar_via_fs_watcher(
+        self, tmp_path: Path
+    ) -> None:
+        """Dropa o EICAR real num path monitorado e espera o auto-scan
+        detectar via inotify de verdade, sem chamar scan_file manualmente."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            eicar = watched / "eicar_test.sh"
+            eicar.write_bytes(
+                b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+            )
+
+            detected = False
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                if any(e.file_path == str(eicar) for e in entries):
+                    detected = True
+                    break
+
+            assert detected, "auto-scan não detectou o EICAR via monitor em tempo real"
+        finally:
+            await engine.stop()

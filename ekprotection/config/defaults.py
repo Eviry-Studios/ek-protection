@@ -52,6 +52,7 @@ DEFAULT_CONFIG: dict = {
             ".git/*",
         ],
         "poll_interval_ms": 500,       # Intervalo de polling como fallback (ms)
+        "auto_scan_new_executables": True,  # dispara scan_file() em CREATED/MOVED/EXECUTED de executáveis
     },
 
     # -- Scanner --------------------------------------------------------------

@@ -201,6 +201,7 @@ class EKEngine:
             self.register("scanner", engine)
             self.register("sig_db",  sig_db)
             logger.info("ScanEngine iniciado. Assinaturas: %d", sig_db.count())
+            self._wire_auto_scan()
         except Exception as exc:
             logger.error("Erro ao iniciar scanner: %s", exc)
 
@@ -224,6 +225,46 @@ class EKEngine:
             await mon.start()
         except Exception as exc:
             logger.error("Erro ao iniciar monitor: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Auto-scan (monitor → scanner)
+    # ------------------------------------------------------------------
+
+    def _wire_auto_scan(self) -> None:
+        """
+        Liga o monitor ao scanner: executáveis novos detectados em tempo
+        real são escaneados automaticamente, sem esperar um scan sob
+        demanda. Antes desta ligação o monitor só observava e logava
+        eventos de arquivo, nunca chamava scan_file().
+        """
+        if not self.monitor or not self.scanner:
+            return
+        if not self.config.get("monitor.auto_scan_new_executables", True):
+            return
+        self.monitor.add_callback(self._on_monitor_event_auto_scan)
+
+    async def _on_monitor_event_auto_scan(self, event: Any) -> None:
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        if not isinstance(event, FileEvent) or event.is_dir:
+            return
+        # DELETED/MODIFIED de propósito fora: MODIFIED dispararia várias
+        # vezes durante uma escrita em partes (download), gerando scans
+        # duplicados do mesmo arquivo já coberto no CREATED inicial.
+        if event.kind not in (
+            FileEventKind.CREATED,
+            FileEventKind.MOVED,
+            FileEventKind.EXECUTED,
+        ):
+            return
+        if not event.is_executable_extension:
+            return
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self.scanner.scan_file, event.path)
+        except Exception as exc:
+            logger.error("Erro no auto-scan de %s: %s", event.path, exc)
 
     # ------------------------------------------------------------------
     # Utilitários

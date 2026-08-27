@@ -184,9 +184,18 @@ disco mesmo.
 - **Banco de assinaturas real** — hoje só existem 3 hashes de demonstração.
   Popular com feeds públicos de IOCs (ex: MalwareBazaar, URLhaus) ou focar
   inteiramente na detecção heurística + ClamAV como motor de assinaturas.
-- **Auto-scan no monitor** — hoje o monitor só *observa* eventos de arquivo;
-  ele não dispara `scan_file()` automaticamente em executáveis novos. Ligar
-  `MonitorManager` → `ScanEngine` via callback é trabalho pendente.
+- ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
+  registra um callback no `MonitorManager` assim que o `ScanEngine` termina
+  de iniciar (ordem de boot: monitor primeiro, scanner depois — callback
+  precisa ser ligado depois dos dois existirem). Eventos `CREATED`/`MOVED`/
+  `EXECUTED` de arquivo com extensão executável (`FileEvent.
+  is_executable_extension`) disparam `scan_file()` de verdade via
+  `loop.run_in_executor()` (não bloqueia o dispatch loop do monitor).
+  `MODIFIED` fica de fora de propósito (evita rescanear o mesmo arquivo
+  várias vezes durante uma escrita em partes/download). Controlável via
+  `monitor.auto_scan_new_executables` (default `true`). Validado com EICAR
+  real via inotify de verdade (não mock) em `tests/test_engine.py::
+  TestAutoScanWiring::test_end_to_end_real_eicar_via_fs_watcher`.
 - **Symlink `/opt` → `/var/opt` em sistemas atômicos** — confirmar que paths
   resolvidos em runtime (`Path(__file__).resolve()`) não geram inconsistência
   entre `/opt/...` e `/var/opt/...` nos logs e mensagens de erro (cosmético,
