@@ -261,6 +261,89 @@ class TestSignatureFetcherUpdate:
 
 
 # ---------------------------------------------------------------------------
+# Testes: manifest/signatures reais do repositório, via HTTP local de verdade
+# (nenhum mock — valida que signatures/manifest.json + signatures/
+# signatures.jsonl publicados no repo são consumíveis pelo fetcher real,
+# o mesmo caminho que `raw.githubusercontent.com/.../main/signatures/`
+# serve em produção).
+# ---------------------------------------------------------------------------
+
+REPO_ROOT     = Path(__file__).parent.parent
+SIGNATURES_DIR = REPO_ROOT / "signatures"
+
+
+@pytest.fixture
+def real_signatures_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[str, None, None]:
+    """
+    Sobe um servidor HTTP local servindo uma cópia de signatures/ do
+    próprio repo. `signatures.jsonl` é servido byte-a-byte igual ao real;
+    `manifest.json` é uma cópia do real com `signatures_url` reapontado
+    pro servidor local (em produção aponta pro raw.githubusercontent.com
+    absoluto, que este teste não pode/deve chamar de verdade) — versão e
+    sha256 continuam os mesmos publicados no repo.
+    """
+    import functools
+    import shutil
+    from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+
+    mirror = tmp_path_factory.mktemp("signatures_mirror")
+    shutil.copy(SIGNATURES_DIR / "signatures.jsonl", mirror / "signatures.jsonl")
+    manifest = json.loads((SIGNATURES_DIR / "manifest.json").read_bytes())
+
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(mirror))
+    server  = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    manifest["signatures_url"] = f"http://127.0.0.1:{server.server_port}/signatures.jsonl"
+    (mirror / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+class TestSignatureFetcherRealManifest:
+    def test_manifest_and_signatures_files_exist(self) -> None:
+        assert (SIGNATURES_DIR / "manifest.json").is_file()
+        assert (SIGNATURES_DIR / "signatures.jsonl").is_file()
+
+    def test_manifest_sha256_matches_signatures_file(self) -> None:
+        manifest = json.loads((SIGNATURES_DIR / "manifest.json").read_bytes())
+        actual   = _sha256((SIGNATURES_DIR / "signatures.jsonl").read_bytes())
+        assert manifest["sha256"] == actual
+
+    def test_update_pulls_real_manifest_over_http(
+        self, sig_db: SignatureDB, tmp_dir: Path, real_signatures_server: str,
+    ) -> None:
+        """Fim a fim, sem mock: HTTP real -> checksum real -> import real."""
+        fetcher = SignatureFetcher(
+            manifest_url = f"{real_signatures_server}/manifest.json",
+            sig_db       = sig_db,
+            cache_dir    = tmp_dir,
+            timeout      = 5,
+        )
+        result = fetcher.update()
+
+        assert result.updated is True
+        # sig_db já vem com o EICAR via _seed_demo() (SignatureDB.open());
+        # o import real do JSONL baixado bate nele e conta como duplicata
+        # -- confirma que o parse/checksum/import de verdade rodou mesmo
+        # assim (added=0 só quando o import falha silenciosamente).
+        assert result.added + result.duplicates == 1
+        entry = sig_db.lookup(
+            "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+        )
+        assert entry is not None
+        assert entry["name"] == "EICAR.Test.File"
+
+        # Segunda chamada, mesma versão local == remota -> não reimporta.
+        result2 = fetcher.update()
+        assert result2.updated is False
+
+
+# ---------------------------------------------------------------------------
 # Testes: UpdateManager
 # ---------------------------------------------------------------------------
 

@@ -200,9 +200,23 @@ disco mesmo.
   resolvidos em runtime (`Path(__file__).resolve()`) não geram inconsistência
   entre `/opt/...` e `/var/opt/...` nos logs e mensagens de erro (cosmético,
   mas confunde no diagnóstico).
-- **Updater de assinaturas com manifest real** — hoje aponta para uma URL que
-  não existe ainda; criar o `manifest.json` + `signatures.jsonl` no próprio
-  repositório como fonte inicial.
+- ✅ **Updater de assinaturas com manifest real** — feito (2026-08-28).
+  `signatures/manifest.json` + `signatures/signatures.jsonl` criados no
+  próprio repositório (fonte inicial self-hosted via
+  `raw.githubusercontent.com/Eviry-Studios/ek-protection/main/signatures/`,
+  a mesma URL que `UpdateManager` já montava por padrão desde o Patch 9 —
+  só nunca existiu do lado do servidor). Conteúdo inicial: só o hash real
+  do EICAR (`source: ekp-official`) — os 2 hashes fictícios de
+  `_DEMO_SIGNATURES` (`demo_trojan_downloader_...`/`demo_coinminer_...`)
+  ficam de fora de propósito, são placeholders de pipeline documentados
+  como tal no próprio código, não assinaturas reais publicáveis. Item
+  maior "banco de assinaturas real via feed de IOCs" (MalwareBazaar/
+  URLhaus) continua em aberto, é escopo maior — populariam este mesmo
+  `signatures.jsonl`. Validado com teste novo (sem mock nenhum):
+  `tests/test_updater.py::TestSignatureFetcherRealManifest` sobe um
+  `http.server` local servindo uma cópia de `signatures/`, roda
+  `SignatureFetcher.update()` real (HTTP → checksum SHA-256 → import
+  JSONL) e confirma o EICAR importado no `SignatureDB`.
 - ✅ **Testes de integração com daemon real** — feito (2026-08-25,
   `tests/test_cli_ipc.py`): sobe `ekp start` como subprocesso de verdade
   num ambiente isolado, valida `ekp logs tail`, `ekp exceptions list` e
