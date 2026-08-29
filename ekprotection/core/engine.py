@@ -74,8 +74,18 @@ class EKEngine:
         await self._init_monitor()     # Patch 4
 
         await self._init_quarantine()     # Patch 6
-        await self._init_scanner()     # Patch 7
+        # Heuristics (Patch 8) precisa iniciar antes do Scanner (Patch 7) —
+        # ordem de boot diferente da ordem dos patches de propósito.
+        # _init_scanner() lê `self.heuristics` na hora de construir o
+        # ScanEngine (`heuristic_engine=self.heuristics`); se rodar antes,
+        # captura `None` permanentemente e o motor heurístico de 22 regras
+        # nunca é consultado pelo scanner real em nenhum scan depois disso
+        # (achado real, tarefa diária 03:00 2026-08-29 — só apareceu ao
+        # validar ponta a ponta via monitor real, os testes unitários do
+        # scanner sempre injetam heuristic_engine manualmente e não pegavam
+        # isso).
         await self._init_heuristics()  # Patch 8
+        await self._init_scanner()     # Patch 7
         await self._init_updater()     # Patch 9
 
         self.state = EngineState.RUNNING

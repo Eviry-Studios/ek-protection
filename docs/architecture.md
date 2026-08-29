@@ -181,6 +181,51 @@ disco mesmo.
 
 ### 📋 Outras melhorias planejadas
 
+- ✅ **Motor heurístico avançado nunca era consultado pelo scanner real —
+  corrigido (2026-08-29)**. Achado em 3 camadas na mesma rodada, do sintoma
+  até a causa raiz:
+  1. `HeuristicEngine._calculate_score` só somava `weight` — o `severity`
+     de cada regra (usado até então só pra colorir a listagem da CLI) nunca
+     influenciava o `risk_level` agregado. Resultado: uma regra "crítico"
+     isolada (H006 reverse shell, H011 fork bomb, H015 fileless...) sempre
+     saía como "baixo" (peso 10 = 20 pontos, longe do threshold 80).
+     Corrigido com um piso de severidade: o `risk_level` final nunca fica
+     abaixo da maior severidade entre as regras que dispararam (o score
+     numérico continua igual, só o mapeamento pra `risk_level` mudou).
+  2. Mesmo com "crítico" correto, `ScanEngine._scan_file_inner` sempre
+     forçava `verdict=SUSPICIOUS` pra detecção heurística — `is_critical`
+     exige `verdict==THREAT`, então a auto-quarentena (`quarantine.
+     auto_quarantine_critical`) nunca disparava pra nenhuma ameaça vinda
+     de heurística, só de assinatura conhecida. Corrigido: heurística
+     "crítico" agora vira `verdict=THREAT`. `_auto_quarantine` também
+     usava sempre `QuarantineReason.SIGNATURE_MATCH` mesmo pra detecção
+     heurística — corrigido pra usar `QuarantineReason.HEURISTIC` quando
+     `threat_type=="Heuristic"`.
+  3. **Causa raiz real, só apareceu ao validar ponta a ponta via monitor
+     real** (os 2 achados acima pareciam resolvidos nos testes unitários,
+     que sempre injetam `heuristic_engine=` manualmente na construção do
+     `ScanEngine`): `EKEngine.start()` chamava `_init_scanner()` **antes**
+     de `_init_heuristics()` — `ScanEngine.__init__` recebe
+     `heuristic_engine=self.heuristics`, e nesse instante `self.heuristics`
+     ainda era `None`. O scanner captura esse `None` permanentemente; o
+     motor de 22 regras nunca era consultado por nenhum scan real
+     (manual, agendado ou auto-scan) em nenhuma instalação rodando —
+     só a checagem base crua (localização/entropia/ELF) importava de
+     verdade. Corrigido invertendo a ordem de boot (heuristics antes de
+     scanner), com comentário no código explicando por que a ordem
+     difere da numeração dos patches.
+  **Efeito prático do achado**: até esta rodada, um reverse shell/fork
+  bomb/técnica fileless literal dropado num diretório monitorado era
+  detectado (aparecia nos logs como SUSPICIOUS) mas **nunca era
+  quarentenado automaticamente**, mesmo com `auto_quarantine_critical:
+  true` (default). Validado end-to-end com teste novo, sem mock nenhum
+  (`tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_simulated_reverse_shell_auto_quarantined`): dropa um
+  script com reverse shell literal (inofensivo, nunca executado) num
+  diretório monitorado de verdade e confirma, via inotify real, que ele
+  é detectado E removido/quarentenado sozinho. Testes novos também em
+  `tests/test_heuristics.py::TestSeverityFloor` (5 casos) e
+  `tests/test_scanner.py::test_auto_quarantine_reason_is_heuristic_for_heuristic_threat`.
 - **Banco de assinaturas real** — hoje só existem 3 hashes de demonstração.
   Popular com feeds públicos de IOCs (ex: MalwareBazaar, URLhaus) ou focar
   inteiramente na detecção heurística + ClamAV como motor de assinaturas.

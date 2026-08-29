@@ -228,7 +228,15 @@ class ScanEngine:
                     if h_result.risk_level in ("crítico", "alto") or not risk:
                         risk   = h_result.risk_level
                         reason = h_result.primary_reason or reason
-                        verdict = ScanVerdict.SUSPICIOUS
+                        # "crítico" vira THREAT (não só SUSPICIOUS) pra
+                        # que is_critical/auto-quarentena disparem de
+                        # verdade — antes disso, nenhuma detecção
+                        # heurística nunca era quarentenada automaticamente
+                        # mesmo com quarantine.auto_quarantine_critical=true,
+                        # porque is_critical exige verdict==THREAT e este
+                        # caminho sempre forçava SUSPICIOUS.
+                        verdict = (ScanVerdict.THREAT if h_result.risk_level == "crítico"
+                                   else ScanVerdict.SUSPICIOUS)
             except Exception:
                 pass
 
@@ -351,10 +359,12 @@ class ScanEngine:
             return
         try:
             from ekprotection.quarantine.models import QuarantineReason
+            reason_kind = (QuarantineReason.HEURISTIC if result.threat_type == "Heuristic"
+                           else QuarantineReason.SIGNATURE_MATCH)
             self._quar.quarantine_file(
                 path         = result.path,
                 sha256       = result.sha256,
-                reason       = QuarantineReason.SIGNATURE_MATCH,
+                reason       = reason_kind,
                 threat_type  = result.threat_type,
                 risk_level   = result.risk_level,
                 comment      = f"Auto-quarentena: {result.threat_name}",

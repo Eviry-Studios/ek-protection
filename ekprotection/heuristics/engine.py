@@ -57,6 +57,9 @@ _SCORE_THRESHOLDS = [
     (0,  None),      # limpo
 ]
 
+# Ordem de severidade, pro piso de severidade (ver _calculate_score)
+_SEVERITY_RANK = {None: 0, "baixo": 1, "médio": 2, "alto": 3, "crítico": 4}
+
 
 @dataclass(frozen=True)
 class HeuristicResult:
@@ -320,6 +323,25 @@ class HeuristicEngine:
             if score >= threshold:
                 risk = level
                 break
+
+        # Piso de severidade: o campo `severity` de cada regra (usado até
+        # agora só como metadado de exibição na CLI) precisa valer pra
+        # alguma coisa real. Sem isso, uma única regra "crítico" isolada
+        # (ex. H006 reverse shell, H011 fork bomb, H015 fileless) sempre
+        # ficava diluída em "baixo" pela fórmula agregada — peso 10 = só
+        # 20 pontos, longe do threshold 80 de "crítico" — mesmo sendo um
+        # indicador inequívoco por si só. O piso garante que o risk_level
+        # final nunca fique abaixo da maior severidade entre as regras que
+        # dispararam, sem alterar o score numérico (ainda útil pra
+        # diagnóstico) nem a lógica de combinação de sinais fracos.
+        severity_floor = max(
+            (RULES_BY_ID[m.rule_id].severity
+             for m in matches if m.rule_id in RULES_BY_ID),
+            key=lambda s: _SEVERITY_RANK.get(s, 0),
+            default=None,
+        )
+        if _SEVERITY_RANK.get(severity_floor, 0) > _SEVERITY_RANK.get(risk, 0):
+            risk = severity_floor
 
         return score, risk
 
