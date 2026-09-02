@@ -59,14 +59,18 @@ class _EKPEventHandler(FileSystemEventHandler):
 
     def __init__(
         self,
-        queue:   asyncio.Queue,
-        loop:    asyncio.AbstractEventLoop,
-        ignores: list[str],
+        queue:      asyncio.Queue,
+        loop:       asyncio.AbstractEventLoop,
+        ignores:    list[str],
+        path_remap: Optional[dict[str, str]] = None,
     ) -> None:
         super().__init__()
-        self._queue   = queue
-        self._loop    = loop
-        self._ignores = ignores   # padrões glob
+        self._queue      = queue
+        self._loop       = loop
+        self._ignores    = ignores   # padrões glob
+        # resolved (real) prefix -> prefixo configurado originalmente
+        # (ver FSWatcher.start() para o porquê)
+        self._path_remap = path_remap or {}
 
     # ------------------------------------------------------------------
     # Handlers watchdog
@@ -89,6 +93,23 @@ class _EKPEventHandler(FileSystemEventHandler):
             src_path=event.src_path,
         )
 
+    def _unresolve(self, path: str) -> str:
+        """
+        Reescreve um path resolvido (real) de volta pro prefixo configurado
+        originalmente pelo usuário em ``monitor.paths``.
+
+        Necessário porque ``FSWatcher.start()`` agenda o watch usando o path
+        *resolvido* (senão o inotify nunca vê nada dentro de um diretório
+        raiz que seja symlink — ver comentário lá). Sem isso, todo o resto do
+        sistema (heurística ``std_dirs``, logs, exceptions) passaria a
+        enxergar o path real (ex: ``/var/opt/...``) em vez do configurado
+        (ex: ``/opt/...``), quebrando comparações de prefixo silenciosamente.
+        """
+        for resolved_prefix, original_prefix in self._path_remap.items():
+            if path == resolved_prefix or path.startswith(resolved_prefix + os.sep):
+                return original_prefix + path[len(resolved_prefix):]
+        return path
+
     # ------------------------------------------------------------------
     # Lógica interna
     # ------------------------------------------------------------------
@@ -103,6 +124,11 @@ class _EKPEventHandler(FileSystemEventHandler):
         """Filtra e enfileira o evento de forma thread-safe."""
         if is_dir:
             return   # diretórios: só eventos de arquivo nos interessam
+
+        path = self._unresolve(path)
+        if src_path is not None:
+            src_path = self._unresolve(src_path)
+
         if self._should_ignore(path):
             return
 
@@ -178,15 +204,41 @@ class FSWatcher:
     def start(self) -> None:
         """Inicia o Observer e agenda todos os paths configurados."""
         self._observer = self._create_observer()
-        handler = _EKPEventHandler(self._queue, self._loop, self._ignores)
+
+        # inotify (watchdog usa IN_DONT_FOLLOW por padrão) não segue symlink
+        # na *raiz* watcheada — se o path configurado for (ou passar por) um
+        # symlink de diretório (ex: /opt -> /var/opt em sistemas atômicos),
+        # o watch "ativa" sem erro mas nunca recebe nenhum evento de dentro
+        # dele, silenciosamente. Por isso agendamos o watch no path
+        # *resolvido*, e guardamos o mapeamento resolvido->configurado pra
+        # reescrever os paths dos eventos de volta (ver
+        # _EKPEventHandler._unresolve) — assim o resto do sistema (heurística
+        # std_dirs, logs, exceptions) continua vendo o path que o usuário
+        # configurou, não o real.
+        path_remap: dict[str, str] = {}
+        for raw_path in self._paths:
+            path = Path(raw_path)
+            if not path.exists():
+                continue
+            resolved = path.resolve()
+            if str(resolved) != str(path):
+                path_remap[str(resolved)] = str(path)
+
+        handler = _EKPEventHandler(self._queue, self._loop, self._ignores, path_remap)
 
         for raw_path in self._paths:
             path = Path(raw_path)
             if not path.exists():
                 logger.warning("Path de monitoramento não existe (ignorado): %s", path)
                 continue
+            watch_path = path.resolve()
+            if str(watch_path) != str(path):
+                logger.info(
+                    "Path de monitoramento %s é/contém symlink, watch real em %s",
+                    path, watch_path,
+                )
             try:
-                self._observer.schedule(handler, str(path), recursive=self._recursive)
+                self._observer.schedule(handler, str(watch_path), recursive=self._recursive)
                 self._active_paths.append(str(path))
                 logger.info("Monitorando: %s (recursivo=%s)", path, self._recursive)
             except (OSError, PermissionError) as exc:

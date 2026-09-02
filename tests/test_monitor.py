@@ -314,6 +314,58 @@ class TestFSWatcher:
             for ev in events
         )
 
+    def test_symlinked_root_still_produces_events_with_original_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """
+        Regressão (2026-09-02): se o path de `monitor.paths` é (ou contém)
+        um symlink de diretório — caso real em sistemas atômicos, onde
+        `/opt` é symlink pra `/var/opt` — o watchdog agenda o watch de
+        inotify com IN_DONT_FOLLOW por padrão. Sem tratamento, isso faz o
+        watch "ativar" sem erro nenhum mas nunca disparar evento algum pra
+        conteúdo dentro do diretório: falha silenciosa de monitoramento.
+
+        `FSWatcher.start()` agora resolve o path real pra agendar o watch
+        (inotify precisa disso pra enxergar dentro do diretório), e reescreve
+        o path de cada evento de volta pro prefixo configurado — o resto do
+        sistema (heurística `std_dirs`, logs) nunca vê o path resolvido.
+        """
+        real_dir = tmp_path / "var_opt_target"
+        real_dir.mkdir()
+        link_dir = tmp_path / "opt_link"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+
+        async def _run() -> list:
+            queue: asyncio.Queue = asyncio.Queue()
+            loop  = asyncio.get_running_loop()
+            watcher = FSWatcher([str(link_dir)], queue, loop, recursive=False)
+            watcher.start()
+            await asyncio.sleep(0.3)
+
+            test_file = link_dir / "canary_via_symlink.sh"
+            test_file.write_text("#!/bin/bash\necho hello")
+
+            events: list[FileEvent] = []
+            try:
+                while True:
+                    ev = await asyncio.wait_for(queue.get(), timeout=2.0)
+                    events.append(ev)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                watcher.stop()
+            return events
+
+        events = asyncio.run(_run())
+        assert len(events) >= 1, "nenhum evento recebido: watch de root symlinkado ficou mudo"
+        assert any(ev.path.startswith(str(link_dir)) for ev in events), (
+            "path do evento não usa o prefixo configurado (deveria começar "
+            f"com {link_dir}, não com o path real resolvido)"
+        )
+        assert not any(ev.path.startswith(str(real_dir)) for ev in events), (
+            "path do evento vazou o path real resolvido em vez do configurado"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Testes: ProcWatcher

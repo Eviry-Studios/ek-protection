@@ -241,10 +241,30 @@ disco mesmo.
   `monitor.auto_scan_new_executables` (default `true`). Validado com EICAR
   real via inotify de verdade (não mock) em `tests/test_engine.py::
   TestAutoScanWiring::test_end_to_end_real_eicar_via_fs_watcher`.
-- **Symlink `/opt` → `/var/opt` em sistemas atômicos** — confirmar que paths
-  resolvidos em runtime (`Path(__file__).resolve()`) não geram inconsistência
-  entre `/opt/...` e `/var/opt/...` nos logs e mensagens de erro (cosmético,
-  mas confunde no diagnóstico).
+- ✅ **Symlink `/opt` → `/var/opt` em sistemas atômicos** — feito (2026-09-02).
+  Investigado como suspeita de item cosmético, virou achado real de falha
+  silenciosa: `Path(__file__)` não é usado em nenhum lugar sensível a isso
+  (só `reports/generator.py` pra achar o `assets/logo.png`), mas o
+  `watchdog` (lib usada pelo `FSWatcher`) agenda watches de inotify com a
+  flag `IN_DONT_FOLLOW` por padrão — se o path configurado em
+  `monitor.paths` for (ou passar por) um symlink de diretório, ex.
+  `/opt/ek-protection` num sistema atômico onde `/opt` → `/var/opt`, o
+  watch "ativa" sem erro nenhum (`FSWatcher.active_paths` mostra o path
+  normal) mas **nunca dispara evento nenhum pra conteúdo criado/modificado
+  dentro dele** — monitoramento morto silenciosamente, sem log de aviso.
+  Confirmado empiricamente (symlink real em `/tmp`, sem mock) antes de
+  mexer no código. Corrigido em `ekprotection/monitor/fs_watcher.py`:
+  `FSWatcher.start()` agora agenda o watch no path **resolvido**
+  (`Path.resolve()`, senão o inotify nunca vê dentro do diretório), e
+  `_EKPEventHandler` reescreve o path de cada evento de volta pro prefixo
+  **configurado** originalmente (`_unresolve()`) antes de colocar o
+  `FileEvent` na fila — assim heurística (`std_dirs` em
+  `_r_no_extension_elf`), logs e exceptions continuam vendo
+  `/opt/ek-protection/...` como configurado, nunca o `/var/opt/...` real.
+  Teste novo `tests/test_monitor.py::TestFSWatcher::
+  test_symlinked_root_still_produces_events_with_original_path` (symlink
+  real, sem mock): confirma evento disparado E path reportado com o
+  prefixo configurado, não o resolvido.
 - ✅ **Updater de assinaturas com manifest real** — feito (2026-08-28).
   `signatures/manifest.json` + `signatures/signatures.jsonl` criados no
   próprio repositório (fonte inicial self-hosted via
