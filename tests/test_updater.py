@@ -578,6 +578,69 @@ class TestIPCServerDispatch:
         assert parsed["ok"]        is True
         assert len(parsed["data"]) == 1
 
+    @pytest.mark.asyncio
+    async def test_dispatch_quarantine_info_no_quar(self) -> None:
+        server = self._make_server()
+        server._engine.quarantine = None
+        resp   = await server._dispatch({"cmd": "quarantine_info", "entry_id": 1})
+        parsed = json.loads(resp.decode().strip())
+        assert parsed["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_dispatch_quarantine_info_missing_entry_id(self) -> None:
+        server = self._make_server()
+        server._engine.quarantine = MagicMock()
+        resp   = await server._dispatch({"cmd": "quarantine_info"})
+        parsed = json.loads(resp.decode().strip())
+        assert parsed["ok"] is False
+        assert "entry_id" in parsed["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_quarantine_info_not_found(self) -> None:
+        server    = self._make_server()
+        mock_quar = MagicMock()
+        mock_quar.get_by_id.return_value = None
+        server._engine.quarantine = mock_quar
+
+        resp   = await server._dispatch({"cmd": "quarantine_info", "entry_id": 99})
+        parsed = json.loads(resp.decode().strip())
+        assert parsed["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_dispatch_quarantine_info_success(self) -> None:
+        server     = self._make_server()
+        mock_quar  = MagicMock()
+        mock_entry = MagicMock()
+        mock_entry.to_dict.return_value = {"id": 7, "quarantine_id": "abc", "status": "active"}
+        mock_quar.get_by_id.return_value = mock_entry
+        server._engine.quarantine = mock_quar
+
+        resp   = await server._dispatch({"cmd": "quarantine_info", "entry_id": 7})
+        parsed = json.loads(resp.decode().strip())
+        assert parsed["ok"]             is True
+        assert parsed["data"]["id"]     == 7
+        mock_quar.get_by_id.assert_called_once_with(7)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_quarantine_stats_no_quar(self) -> None:
+        server = self._make_server()
+        server._engine.quarantine = None
+        resp   = await server._dispatch({"cmd": "quarantine_stats"})
+        parsed = json.loads(resp.decode().strip())
+        assert parsed["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_dispatch_quarantine_stats_success(self) -> None:
+        server    = self._make_server()
+        mock_quar = MagicMock()
+        mock_quar.stats.return_value = {"active": 2, "restored": 1, "total": 3}
+        server._engine.quarantine = mock_quar
+
+        resp   = await server._dispatch({"cmd": "quarantine_stats"})
+        parsed = json.loads(resp.decode().strip())
+        assert parsed["ok"]              is True
+        assert parsed["data"]["active"]  == 2
+
 
 # ---------------------------------------------------------------------------
 # Testes: IPCServer start/stop com socket real

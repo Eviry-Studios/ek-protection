@@ -177,11 +177,25 @@ def cmd_info(
     json_output: bool          = typer.Option(False, "--json"),
 ) -> None:
     """Exibe detalhes completos de um item em quarentena."""
-    cfg, mgr = _open_mgr(config)
-    try:
-        entry = mgr.get_by_id(entry_id)
-    finally:
-        mgr.close()
+    entry = None
+
+    cfg = ConfigManager(config)
+    cfg.load()
+    client = ipc_client(cfg)
+    if client is not None:
+        try:
+            resp = client.send("quarantine_info", entry_id=entry_id)
+            if resp.get("ok"):
+                entry = _entry_from_ipc_dict(resp["data"])
+        except ConnectionError:
+            pass  # cai pro acesso direto abaixo
+
+    if entry is None:
+        cfg, mgr = _open_mgr(config)
+        try:
+            entry = mgr.get_by_id(entry_id)
+        finally:
+            mgr.close()
 
     if not entry:
         print_error(f"Item ID {entry_id} não encontrado.")
@@ -323,11 +337,25 @@ def cmd_stats(
     json_output: bool          = typer.Option(False, "--json"),
 ) -> None:
     """Exibe estatísticas do vault de quarentena."""
-    cfg, mgr = _open_mgr(config)
-    try:
-        s = mgr.stats()
-    finally:
-        mgr.close()
+    s = None
+
+    cfg = ConfigManager(config)
+    cfg.load()
+    client = ipc_client(cfg)
+    if client is not None:
+        try:
+            resp = client.send("quarantine_stats")
+            if resp.get("ok"):
+                s = resp["data"]
+        except ConnectionError:
+            pass  # cai pro acesso direto abaixo
+
+    if s is None:
+        cfg, mgr = _open_mgr(config)
+        try:
+            s = mgr.stats()
+        finally:
+            mgr.close()
 
     if json_output:
         import json

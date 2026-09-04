@@ -208,6 +208,12 @@ class IPCServer:
         if cmd == "quarantine_list":
             return self._cmd_quarantine_list()
 
+        if cmd == "quarantine_info":
+            return self._cmd_quarantine_info(req)
+
+        if cmd == "quarantine_stats":
+            return self._cmd_quarantine_stats()
+
         if cmd == "log_tail":
             return self._cmd_log_tail(req)
 
@@ -257,6 +263,24 @@ class IPCServer:
             return _err("Quarentena não disponível.")
         entries = quar.list_active()
         return _ok([e.to_dict() for e in entries])
+
+    def _cmd_quarantine_info(self, req: dict) -> bytes:
+        quar = self._engine.quarantine
+        if not quar:
+            return _err("Quarentena não disponível.")
+        entry_id = req.get("entry_id")
+        if entry_id is None:
+            return _err("Campo 'entry_id' obrigatório.")
+        entry = quar.get_by_id(entry_id)
+        if not entry:
+            return _err(f"Item ID {entry_id} não encontrado.")
+        return _ok(entry.to_dict())
+
+    def _cmd_quarantine_stats(self) -> bytes:
+        quar = self._engine.quarantine
+        if not quar:
+            return _err("Quarentena não disponível.")
+        return _ok(quar.stats())
 
     def _cmd_log_tail(self, req: dict) -> bytes:
         logs = self._engine.logs

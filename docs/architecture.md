@@ -178,6 +178,19 @@ disco mesmo.
   estiver rodando.
 - Fallback já padronizado num helper único (`cli/_ipc_or_direct.py`, 2026-08-23)
   em vez de duplicar a lógica em cada arquivo de comando
+- ✅ `quarantine_info`/`quarantine_stats` — feito (2026-09-03). `ekp
+  quarantine list` (sem `--all`) já tinha sido migrado em 2026-08-22, mas
+  `ekp quarantine info <id>` e `ekp quarantine stats` continuavam abrindo
+  o SQLite root-owned direto (`_open_mgr`), exigindo sudo mesmo com o
+  daemon rodando — último gap real do Patch 11, achado ao revisar
+  `quarantine_commands.py` comando a comando. Comandos novos
+  `quarantine_info`/`quarantine_stats` no `IPCServer._dispatch`
+  (`daemon.py`), CLI migrada pro mesmo padrão "IPC primeiro, cai pro
+  acesso direto se o daemon não responder" já usado por `quarantine
+  list`. `cmd_restore`/`cmd_delete`/`cmd_purge` ficam de fora de propósito
+  — são operações destrutivas/irreversíveis que já exigem autenticação
+  própria (`_authenticate`), não fazem parte do bug "comando de leitura
+  sem sudo".
 
 ### 📋 Outras melhorias planejadas
 
