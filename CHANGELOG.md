@@ -5,6 +5,39 @@ Format: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [Unreleased] — Patch 11 (2026-09-04)
+
+> Not yet tagged as a package version bump — `__version__`/`pyproject.toml`
+> still read `1.0.0`. Bumping that touches a hardcoded value in
+> `reports/generator.py` and an assertion in `tests/test_patch10.py`, left
+> out of this documentation-only fix on purpose.
+
+CLI read commands (`logs`, `quarantine`, `scan`, `exceptions`) migrated to talk
+to the running daemon over IPC first, falling back to direct file access only
+if the daemon isn't up — closes the long-standing bug where these commands
+needed `sudo` to open root-owned SQLite files directly.
+
+#### Added
+- IPC streaming mode: `scan quick`/`scan full`/`scan paths` now emit a
+  `progress` event per file plus a final `result` event, instead of a single
+  request/response.
+- `quarantine info`/`quarantine stats` migrated to IPC (last gap in the
+  sudo-free CLI).
+- Real `manifest.json` + `signatures.jsonl` published for the signature
+  updater (previously pointed at a URL with no real payload).
+
+#### Fixed
+- Heuristic engine: a rule's `severity` never influenced the aggregated
+  `risk_level` — a single "critical" match (reverse shell, fork bomb,
+  fileless malware) could still report "low" risk and skip auto-quarantine.
+- `monitor.paths` entries that were, or contained, a symlinked directory
+  (e.g. `/opt` → `/var/opt`) registered an inotify watch that silently never
+  fired.
+- `EKP_DATA_DIR` didn't relocate `logs.dir`, breaking the logging subsystem
+  when running without root.
+
+---
+
 ## [1.0.0] — 2024-06-15
 
 ### ✅ Stable Release
