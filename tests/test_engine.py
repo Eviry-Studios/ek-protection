@@ -273,3 +273,63 @@ class TestAutoScanWiring:
             assert any(e.original_path == str(evil) for e in active)
         finally:
             await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_crypto_wallet_string_detected_not_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária,
+        2026-09-04): dropa um script tipo dropper de cryptominer (config
+        com endereço de carteira de payout, regra H018 — "Strings de
+        Wallet Crypto", a regra mais diretamente ligada ao foco de proteção
+        de criptoativos desta tarefa) num diretório monitorado de verdade.
+
+        H018 é severidade "alto" (não "crítico") — diferente do reverse
+        shell (08-29), o piso de severidade não deve elevar isso a
+        "crítico" sozinho, então o comportamento correto é: detectado e
+        logado como SUSPICIOUS, mas SEM auto-quarentena (arquivo continua
+        no disco pra revisão manual). Nunca tinha sido validado via
+        pipeline real (monitor->auto-scan->heurística) antes desta rodada
+        — só via HeuristicContext construído manualmente em
+        tests/test_heuristics.py::TestRuleH018CryptoStrings."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "xmrig-update.sh"
+            evil.write_bytes(
+                b"#!/bin/bash\n"
+                b"WALLET=0x0000000000000000000000000000000000dEaD\n"
+                b"echo starting miner with wallet $WALLET\n"
+            )
+
+            match = None
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None:
+                    break
+
+            assert match is not None, (
+                "auto-scan não detectou a string de wallet crypto via "
+                "monitor em tempo real"
+            )
+            assert match.level.value == "WARNING"
+            assert evil.exists(), (
+                "severidade 'alto' isolada não deveria disparar auto-quarentena"
+            )
+            assert not any(
+                e.original_path == str(evil) for e in engine.quarantine.list_active()
+            )
+        finally:
+            await engine.stop()

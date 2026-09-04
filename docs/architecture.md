@@ -239,6 +239,17 @@ disco mesmo.
   é detectado E removido/quarentenado sozinho. Testes novos também em
   `tests/test_heuristics.py::TestSeverityFloor` (5 casos) e
   `tests/test_scanner.py::test_auto_quarantine_reason_is_heuristic_for_heuristic_threat`.
+- ✅ **H018 (Strings de Wallet Crypto) validada via pipeline real —
+  confirmado (2026-09-04)**. Teste intenso da tarefa diária: dropper de
+  cryptominer simulado (config com endereço de payout) num diretório
+  monitorado de verdade. Nunca tinha sido testada fora de unit test com
+  `HeuristicContext` construído manualmente — confirmado agora que o
+  pipeline completo (inotify → auto-scan → heurística → log) detecta de
+  verdade, e que a severidade "alto" isolada corretamente **não** dispara
+  auto-quarentena (só "crítico" dispara, comportamento esperado, arquivo
+  fica no disco pra revisão manual). Teste novo:
+  `tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_crypto_wallet_string_detected_not_quarantined`.
 - **Banco de assinaturas real** — hoje só existem 3 hashes de demonstração.
   Popular com feeds públicos de IOCs (ex: MalwareBazaar, URLhaus) ou focar
   inteiramente na detecção heurística + ClamAV como motor de assinaturas.
