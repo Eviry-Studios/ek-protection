@@ -373,10 +373,37 @@ class AuthManager:
 
     def _read_hash(self) -> bytes:
         """Lê e retorna o hash armazenado."""
+        self._enforce_hash_file_permissions()
         try:
             return self._hash_file.read_bytes().strip()
         except (OSError, IOError) as exc:
             raise AuthError(f"Não foi possível ler o arquivo de autenticação: {exc}") from exc
+
+    def _enforce_hash_file_permissions(self) -> None:
+        """
+        Corrige permissões do arquivo de hash se tiverem se afrouxado desde
+        a criação (ex: restore de backup, reinstalação por cima, extração
+        de tar/zip que não preserva modo de arquivo) — só era garantido
+        0600 no momento do `_write_hash()`, nunca reverificado num load
+        posterior (mesmo achado do vault de quarentena, tarefa diária
+        2026-09-05). Sem isso, o hash bcrypt ficava legível por qualquer
+        usuário local sem aviso, habilitando brute-force offline apesar do
+        work factor alto.
+        """
+        try:
+            mode = stat.S_IMODE(self._hash_file.stat().st_mode)
+            if mode != AUTH_HASH_FILE_PERMISSIONS:
+                os.chmod(self._hash_file, AUTH_HASH_FILE_PERMISSIONS)
+                logger.warning(
+                    "Permissões do arquivo de autenticação estavam %o, "
+                    "corrigidas para %o: %s",
+                    mode, AUTH_HASH_FILE_PERMISSIONS, self._hash_file,
+                )
+        except OSError as exc:
+            logger.warning(
+                "Não foi possível verificar/corrigir permissões de %s: %s",
+                self._hash_file, exc,
+            )
 
     # ------------------------------------------------------------------
     # Utilitários

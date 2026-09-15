@@ -16,6 +16,8 @@ Cobre:
 
 from __future__ import annotations
 
+import os
+import stat
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -133,6 +135,24 @@ class TestSetup:
         content = auth._hash_file.read_bytes()
         assert STRONG_PASSWORD.encode() not in content
         assert content.startswith(b"$2b$")   # prefixo bcrypt
+
+    def test_setup_sets_restrictive_permissions(self, auth: AuthManager) -> None:
+        auth.setup(STRONG_PASSWORD)
+        assert stat.S_IMODE(auth._hash_file.stat().st_mode) == 0o600
+
+    def test_authenticate_reenforces_loosened_permissions(
+        self, configured_auth: AuthManager
+    ) -> None:
+        """Achado real (2026-09-05): permissão do hash bcrypt só era
+        garantida no `setup()`, nunca reverificada num load posterior (ex:
+        restore de backup, reinstalação) — arquivo podia ficar legível por
+        qualquer usuário local, habilitando brute-force offline apesar do
+        work factor 14."""
+        os.chmod(configured_auth._hash_file, 0o644)
+        assert stat.S_IMODE(configured_auth._hash_file.stat().st_mode) == 0o644
+
+        configured_auth.authenticate(STRONG_PASSWORD)
+        assert stat.S_IMODE(configured_auth._hash_file.stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------

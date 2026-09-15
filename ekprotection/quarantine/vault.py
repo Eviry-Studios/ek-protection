@@ -97,11 +97,37 @@ class QuarantineVault:
         """Carrega a chave Fernet do arquivo."""
         if not self._key_path.exists():
             raise VaultKeyError(f"Chave do vault não encontrada: {self._key_path}")
+        self._enforce_key_permissions()
         try:
             key = self._key_path.read_bytes().strip()
             self._fernet = Fernet(key)
         except Exception as exc:
             raise VaultKeyError(f"Chave do vault inválida: {exc}") from exc
+
+    def _enforce_key_permissions(self) -> None:
+        """
+        Corrige permissões da chave mestra se tiverem se afrouxado desde a
+        criação (ex: restore de backup, reinstalação por cima, extração de
+        tar/zip que não preserva modo de arquivo) — só era garantido 0600 no
+        momento da criação, nunca reverificado num load posterior (achado
+        real da tarefa diária, 2026-09-05). Sem isso, a chave que decifra
+        todo o conteúdo em quarentena (que pode incluir wallets/credenciais
+        capturadas por um scan) podia ficar legível por qualquer usuário
+        local sem nenhum aviso.
+        """
+        try:
+            mode = stat.S_IMODE(self._key_path.stat().st_mode)
+            if mode != 0o600:
+                os.chmod(self._key_path, 0o600)
+                logger.warning(
+                    "Permissões da chave do vault de quarentena estavam %o, "
+                    "corrigidas para 600: %s", mode, self._key_path,
+                )
+        except OSError as exc:
+            logger.warning(
+                "Não foi possível verificar/corrigir permissões de %s: %s",
+                self._key_path, exc,
+            )
 
     # ------------------------------------------------------------------
     # Operações principais

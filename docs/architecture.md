@@ -253,6 +253,26 @@ disco mesmo.
 - **Banco de assinaturas real** — hoje só existem 3 hashes de demonstração.
   Popular com feeds públicos de IOCs (ex: MalwareBazaar, URLhaus) ou focar
   inteiramente na detecção heurística + ClamAV como motor de assinaturas.
+- ✅ **Permissões de chave/hash não eram reforçadas num load posterior —
+  corrigido (2026-09-05)**. Tanto `QuarantineVault` (`quarantine.key`,
+  decifra todo o conteúdo em quarentena) quanto `AuthManager`
+  (`auth.hash`, hash bcrypt da senha) só garantiam `chmod 600` no
+  **momento da criação** — se a permissão fosse afrouxada depois por
+  qualquer motivo (restore de backup, reinstalação por cima, extração de
+  tar/zip sem preservar modo de arquivo), o daemon continuava carregando
+  o arquivo normalmente, sem aviso nenhum, deixando a chave mestra do
+  vault (ou o hash bcrypt, habilitando brute-force offline apesar do work
+  factor 14) legível por qualquer usuário local. Confirmado ao vivo antes
+  de corrigir: `chmod 644` manual seguido de `initialize()`/
+  `authenticate()` mantinha 644, não reforçava 600. Corrigido com
+  `_enforce_key_permissions()`/`_enforce_hash_file_permissions()`,
+  chamados a cada load (`_load_key()`/`_read_hash()`), que corrigem o
+  modo de volta pra 600 e logam warning se precisaram agir — auto-cura
+  de permissão em vez de só confiar no estado inicial. Testes novos sem
+  mock: `tests/test_quarantine.py::TestQuarantineVaultInit::
+  test_reinitialize_reenforces_loosened_key_permissions` +
+  `test_load_key_reenforces_loosened_permissions`,
+  `tests/test_auth.py::TestSetup::test_authenticate_reenforces_loosened_permissions`.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

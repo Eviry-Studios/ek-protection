@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import stat
 from datetime import datetime, timedelta
 from pathlib  import Path
 from typing   import Generator
@@ -188,6 +189,29 @@ class TestQuarantineVaultInit:
         v = QuarantineVault(tmp_path / "v", tmp_path / "k")
         with pytest.raises(VaultKeyError):
             v._load_key()
+
+    def test_reinitialize_reenforces_loosened_key_permissions(self, tmp_path: Path) -> None:
+        """Achado real (2026-09-05): permissão só era garantida na criação
+        da chave, nunca reverificada num load posterior (ex: restore de
+        backup, reinstalação, extração de tar deixando a chave legível por
+        qualquer usuário local)."""
+        v = QuarantineVault(tmp_path / "v", tmp_path / "k")
+        v.initialize()
+        key_file = tmp_path / "k" / "quarantine.key"
+        os.chmod(key_file, 0o644)
+        assert stat.S_IMODE(key_file.stat().st_mode) == 0o644
+
+        QuarantineVault(tmp_path / "v", tmp_path / "k").initialize()
+        assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+
+    def test_load_key_reenforces_loosened_permissions(self, tmp_path: Path) -> None:
+        v = QuarantineVault(tmp_path / "v", tmp_path / "k")
+        v.initialize()
+        key_file = tmp_path / "k" / "quarantine.key"
+        os.chmod(key_file, 0o640)
+
+        v._load_key()
+        assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
 
 
 class TestQuarantineVaultOperations:
