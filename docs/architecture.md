@@ -273,6 +273,25 @@ disco mesmo.
   test_reinitialize_reenforces_loosened_key_permissions` +
   `test_load_key_reenforces_loosened_permissions`,
   `tests/test_auth.py::TestSetup::test_authenticate_reenforces_loosened_permissions`.
+- ✅ **H023 (Exfiltração de Segredo/Wallet) — regra nova (2026-09-15)**.
+  Teste intenso da tarefa diária: revisão das 22 regras existentes contra
+  um cenário de dropper que lê um segredo (chave do vault de quarentena,
+  hash de auth, wallet.dat/keystore/id_rsa/mnemonic) e manda pra um host
+  externo via `curl -F`/`-d`/`-T`/`wget --post-data` — nenhuma cobria
+  isso: H009 ("Acesso a Arquivos Sensíveis") só olha `/etc/shadow` e cia
+  (credenciais do SO, não segredos do próprio app nem de wallet), H019
+  ("Beacon C2") exige padrão de loop `sleep`+`curl`, não um upload único.
+  Nova regra `H023`, severidade "crítico" (mesmo grupo do reverse
+  shell/fork bomb — exfiltração da chave mestra do vault ou de uma wallet
+  é perda de fundos irreversível, não menos grave que RCE), dispara em
+  path sensível + primitivo de upload de rede juntos (nenhum dos dois
+  isolado). Validado end-to-end sem mock via inotify real —
+  `tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_secret_exfiltration_auto_quarantined`: script dropado
+  detectado E quarentenado sozinho. Unit tests em
+  `tests/test_heuristics.py::TestRuleH023SecretExfiltration` (5 casos,
+  incluindo falso-positivo negativo pra download simples e upload sem
+  segredo). Suite completa 569/569 sem regressão (23 regras agora, era 22).
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

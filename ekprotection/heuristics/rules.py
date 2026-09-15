@@ -99,6 +99,16 @@ _RE_OBFUSC_SH    = re.compile(rb'\$\{[^}]{40,}\}|\$\([^)]{40,}\)|\\x[0-9a-f]{2}(
 _RE_PTRACE       = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH|LD_PRELOAD', re.I)
 _RE_MEMFD        = re.compile(rb'memfd_create|/proc/self/mem|/proc/[0-9]+/mem', re.I)
 _RE_PACKED_UPX   = re.compile(rb'UPX!|This file is packed')
+_RE_SECRET_PATHS = re.compile(
+    rb'quarantine\.key|auth\.hash|wallet\.dat|id_rsa|id_ed25519|\.ssh/id_|'
+    rb'UTC--|keystore|seed\s*phrase|mnemonic|private[_ ]?key',
+    re.I,
+)
+_RE_EXFIL_NET    = re.compile(
+    rb'curl\s+[^\n]*(-d\s|--data|-F\s|--upload-file|-T\s)|'
+    rb'wget\s+[^\n]*--post-data',
+    re.I,
+)
 
 
 def _r_high_entropy(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
@@ -322,6 +332,24 @@ def _r_hidden_executable(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]
     return None
 
 
+def _r_secret_exfiltration(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
+    """Leitura de segredo/chave (própria do EK-Protection ou de wallet)
+    combinada com upload de rede (curl -d/-F/-T, wget --post-data) —
+    padrão de exfiltração, não coberto por H009 (só /etc/shadow&cia) nem
+    por H019 (exige sleep+loop de beacon, não upload único)."""
+    if not ctx.content_sample:
+        return None
+    m = _RE_SECRET_PATHS.search(ctx.content_sample)
+    if not m:
+        return None
+    if not _RE_EXFIL_NET.search(ctx.content_sample):
+        return None
+    return RuleMatch(
+        rid,
+        f"leitura de segredo ({m.group().decode('utf-8', errors='replace')}) + upload de rede (exfiltração)",
+    )
+
+
 def _r_no_extension_elf(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Binário ELF sem extensão em local não-padrão."""
     std_dirs = ("/usr/", "/bin/", "/sbin/", "/lib/", "/opt/")
@@ -448,6 +476,11 @@ ALL_RULES: list[HeuristicRule] = [
                   "Binário ELF sem extensão em diretório não-padrão",
                   "médio", 4, ("binary", "evasion"),
                   _match_fn=_r_no_extension_elf),
+
+    HeuristicRule("H023", "Exfiltração de Segredo/Wallet",
+                  "Leitura de chave/segredo (própria ou de wallet) + upload de rede",
+                  "crítico", 9, ("crypto", "exfiltration", "credential"),
+                  _match_fn=_r_secret_exfiltration),
 ]
 
 # Indexado por rule_id para lookup rápido
