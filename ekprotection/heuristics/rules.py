@@ -90,7 +90,8 @@ _RE_PRIVESC      = re.compile(rb'sudo\s+-[isSu]|su\s+-[lc]|pkexec\b', re.I)
 _RE_CRON_INSTALL = re.compile(rb'crontab\s+-[lu]|/etc/cron|/var/spool/cron', re.I)
 _RE_SHADOW_ETC   = re.compile(rb'/etc/shadow|/etc/passwd|/etc/sudoers', re.I)
 _RE_RM_RF        = re.compile(rb'rm\s+-[rf]{1,2}\s+/', re.I)
-_RE_C2_BEACON    = re.compile(rb'(sleep|usleep)\s+[0-9]+.*?(curl|wget|nc)', re.I | re.S)
+_RE_C2_SLEEP     = re.compile(rb'\b(?:sleep|usleep)\s+[0-9]+', re.I)
+_RE_C2_NET       = re.compile(rb'\b(?:curl|wget|nc)\b', re.I)
 _RE_CRYPTO_ADDR  = re.compile(rb'[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[0-9a-fA-F]{40}')
 _RE_IP_HARDCODED = re.compile(rb'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b')
 _RE_FORK_BOMB    = re.compile(rb':\(\)\s*\{|:\|\s*:&|forkbomb', re.I | re.S)
@@ -302,10 +303,16 @@ def _r_crypto_strings(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
 
 
 def _r_c2_beacon(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """Padrão de beacon C2: sleep() + requisição de rede em loop."""
+    """Padrão de beacon C2: sleep() + requisição de rede, em qualquer ordem
+    (loops reais de beacon tanto fazem "sleep depois request" quanto
+    "request depois sleep" — a versão anterior só cobria a 1a ordem).
+    Word-boundary em curl/wget/nc: sem isso "nc" batia como substring de
+    qualquer palavra comum (function, sync, balance, announce...),
+    gerando falso-positivo crítico (auto-quarentena) em script benigno
+    que só por acaso tinha um "sleep N" antes."""
     if not ctx.content_sample:
         return None
-    if _RE_C2_BEACON.search(ctx.content_sample):
+    if _RE_C2_SLEEP.search(ctx.content_sample) and _RE_C2_NET.search(ctx.content_sample):
         return RuleMatch(rid, "padrão de beacon C2: sleep + requisição de rede")
     return None
 

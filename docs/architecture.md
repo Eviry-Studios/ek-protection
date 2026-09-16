@@ -292,6 +292,32 @@ disco mesmo.
   `tests/test_heuristics.py::TestRuleH023SecretExfiltration` (5 casos,
   incluindo falso-positivo negativo pra download simples e upload sem
   segredo). Suite completa 569/569 sem regressão (23 regras agora, era 22).
+- ✅ **H019 (Beacon C2) tinha falso-negativo e falso-positivo reais —
+  corrigido (2026-09-16)**. Teste intenso da tarefa diária: revisão do
+  regex `_RE_C2_BEACON` (`ekprotection/heuristics/rules.py`) contra
+  cenários de beacon reais. 2 bugs achados na mesma regra:
+  1. **Falso-negativo** — o regex único exigia a ordem exata
+     `sleep/usleep ... curl/wget/nc`; o padrão de beacon igualmente comum
+     (faz o check-in de rede primeiro, dorme depois, repete em loop —
+     ex. `while true; do curl ...; sleep 60; done`) nunca disparava a
+     regra, mesmo sendo severidade "crítico" (deveria auto-quarentenar).
+  2. **Falso-positivo mais sério** — `nc` no regex não tinha
+     word-boundary, então batia como substring de qualquer palavra comum
+     (`function`, `sync`, `rsync`, `balance`, `announce`...). Qualquer
+     script benigno com um `sleep N` em algum ponto e qualquer uma dessas
+     palavras depois disparava H019 como "crítico" e era auto-quarentenado
+     de verdade — risco real de falso-positivo destrutivo numa regra de
+     severidade máxima.
+  Corrigido: `_RE_C2_SLEEP`/`_RE_C2_NET` viraram 2 regexes independentes
+  (mesmo padrão de combo já usado em H020/H023), checados sem exigir
+  ordem entre si, e `\b` adicionado em `curl|wget|nc` pra não casar
+  substring. Testes novos em `tests/test_heuristics.py::
+  TestRuleH019C2Beacon` (ordem invertida dispara, `nc`/`sync`/`rsync`
+  perto de sleep não dispara mais) e end-to-end sem mock em
+  `tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_c2_beacon_request_then_sleep_auto_quarantined` (inotify
+  real, script com loop "request depois sleep" detectado E quarentenado
+  sozinho). Suite completa 574/574 sem regressão (569 + 5 novos).
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

