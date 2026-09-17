@@ -201,12 +201,21 @@ def _r_cron_persistence(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
 
 
 def _r_sensitive_files(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """/etc/shadow, /etc/passwd, /etc/sudoers no conteúdo."""
+    """/etc/shadow, /etc/passwd, /etc/sudoers no conteúdo, ou acesso local a
+    credencial/wallet (mesma lista de paths de H023, mas sem exigir upload de
+    rede — cobre stager/coletor local que só lê/copia pra outro lugar do
+    disco antes de uma 2ª etapa, achado real de 2026-09-17: acesso local a
+    wallet.dat/id_rsa/keystore/mnemonic/quarantine.key/auth.hash não disparava
+    nenhuma das 23 regras se não viesse acompanhado de curl/wget no mesmo
+    arquivo (H023 exige o combo, isso aqui cobre o acesso isolado)."""
     if not ctx.content_sample:
         return None
     m = _RE_SHADOW_ETC.search(ctx.content_sample)
     if m:
         return RuleMatch(rid, f"acesso a arquivo sensível: {m.group().decode('utf-8', errors='replace')}")
+    m = _RE_SECRET_PATHS.search(ctx.content_sample)
+    if m:
+        return RuleMatch(rid, f"acesso local a credencial/wallet: {m.group().decode('utf-8', errors='replace')}")
     return None
 
 
@@ -415,8 +424,10 @@ ALL_RULES: list[HeuristicRule] = [
                   _match_fn=_r_cron_persistence),
 
     HeuristicRule("H009", "Acesso a Arquivos Sensíveis",
-                  "/etc/shadow, /etc/passwd, /etc/sudoers",
-                  "alto", 8, ("sensitive", "credential"),
+                  "/etc/shadow, /etc/passwd, /etc/sudoers, ou credencial/wallet "
+                  "local (wallet.dat, id_rsa, keystore, mnemonic, quarantine.key, "
+                  "auth.hash) sem exigir upload de rede",
+                  "alto", 8, ("sensitive", "credential", "wallet"),
                   _match_fn=_r_sensitive_files),
 
     HeuristicRule("H010", "Comando Destrutivo",

@@ -335,6 +335,65 @@ class TestAutoScanWiring:
             await engine.stop()
 
     @pytest.mark.asyncio
+    async def test_end_to_end_local_wallet_credential_access_detected_not_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária,
+        2026-09-17): achado real ao revisar H009/H023 — um script que só
+        *lê/copia localmente* uma credencial/wallet (sem nenhum primitivo de
+        rede no mesmo arquivo) não disparava nenhuma das 23 regras: H009
+        só olhava /etc/shadow&cia (credenciais de SO), e H023 (exfiltração)
+        exige o combo com curl/wget. Um stager/coletor que só junta os
+        arquivos num diretório pra retirada manual/2ª etapa passava batido.
+
+        H009 é severidade "alto" (mesmo piso de H018) — comportamento
+        esperado é detectar e logar como SUSPICIOUS, sem auto-quarentena
+        (H023 continua sendo o caminho "crítico" quando o upload de rede
+        está presente no mesmo arquivo)."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "collect.sh"
+            evil.write_bytes(
+                b"#!/bin/bash\n"
+                b"mkdir -p /tmp/.cache-x\n"
+                b"cp ~/.ethereum/keystore/* /tmp/.cache-x/\n"
+                b"cp ~/.ssh/id_rsa /tmp/.cache-x/\n"
+            )
+
+            match = None
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None:
+                    break
+
+            assert match is not None, (
+                "auto-scan não detectou o acesso local a credencial/wallet "
+                "via monitor em tempo real"
+            )
+            assert match.level.value == "WARNING"
+            assert evil.exists(), (
+                "severidade 'alto' isolada não deveria disparar auto-quarentena"
+            )
+            assert not any(
+                e.original_path == str(evil) for e in engine.quarantine.list_active()
+            )
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
     async def test_end_to_end_secret_exfiltration_auto_quarantined(
         self, tmp_path: Path
     ) -> None:

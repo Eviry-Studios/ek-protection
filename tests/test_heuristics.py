@@ -276,6 +276,33 @@ class TestRuleH009SensitiveFiles:
         ctx = _ctx(content=b"echo 'listing files'")
         assert _r_sensitive_files(ctx, "H009") is None
 
+    # Achado 2026-09-17: acesso local (sem upload de rede) a credencial/wallet
+    # não disparava H009 nem nenhuma outra regra — só H023, que exige o combo
+    # com curl/wget. Estes casos cobrem o acesso isolado.
+    def test_wallet_dat_local_copy_triggers(self) -> None:
+        ctx = _ctx(content=b"cp ~/.bitcoin/wallet.dat /tmp/staged/w.bak")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_id_rsa_local_read_triggers(self) -> None:
+        ctx = _ctx(content=b"cat ~/.ssh/id_rsa >> /tmp/collected")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_keystore_local_read_triggers(self) -> None:
+        ctx = _ctx(content=b"tar czf /tmp/loot.tgz ~/.ethereum/keystore")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_mnemonic_local_read_triggers(self) -> None:
+        ctx = _ctx(content=b"grep -r 'mnemonic' /home/*/wallet-backup/")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_ekp_own_secrets_local_read_triggers(self) -> None:
+        ctx = _ctx(content=b"cp /var/lib/ek-protection/quarantine.key /tmp/x")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_unrelated_word_no_trigger(self) -> None:
+        ctx = _ctx(content=b"key lime pie recipe, private beach access")
+        assert _r_sensitive_files(ctx, "H009") is None
+
 
 class TestRuleH010RmRf:
     def test_rm_rf_root_triggers(self) -> None:

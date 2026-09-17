@@ -318,6 +318,31 @@ disco mesmo.
   test_end_to_end_c2_beacon_request_then_sleep_auto_quarantined` (inotify
   real, script com loop "request depois sleep" detectado E quarentenado
   sozinho). Suite completa 574/574 sem regressão (569 + 5 novos).
+- ✅ **H009 (Acesso a Arquivos Sensíveis) não cobria acesso local a
+  credencial/wallet — corrigido (2026-09-17)**. Teste intenso da tarefa
+  diária: revisão do gap deixado pela introdução de H023 (09-15) — H023
+  só dispara na combinação path-sensível + upload de rede no mesmo
+  arquivo; um stager/coletor que só *lê ou copia localmente*
+  `wallet.dat`/`id_rsa`/`keystore`/`mnemonic`/`quarantine.key`/`auth.hash`
+  (ex. `cp ~/.ssh/id_rsa /tmp/.cache-x/`, sem nenhum `curl`/`wget` no
+  mesmo arquivo) não disparava nenhuma das 23 regras — H009 só olhava
+  `/etc/shadow`/`/etc/passwd`/`/etc/sudoers` (credenciais de SO). Um
+  atacante que separa coleta local de exfiltração em 2 etapas (ex. junta
+  tudo num diretório de staging pra retirada manual depois) passava
+  batido na 1ª etapa. Corrigido: `_r_sensitive_files` (H009) agora também
+  checa `_RE_SECRET_PATHS` (mesma lista de paths já usada por H023),
+  sem exigir o primitivo de rede — mantém severidade "alto" (mesmo piso
+  de H018), não eleva a "crítico"/auto-quarentena sozinho (H023 continua
+  sendo o caminho crítico quando o upload de rede está presente). Unit
+  tests novos em `tests/test_heuristics.py::TestRuleH009SensitiveFiles`
+  (6 casos: wallet.dat, id_rsa, keystore, mnemonic, quarantine.key, +
+  negativo pra "private beach"/"key lime" não casar `private_key`
+  por engano). End-to-end sem mock via inotify real:
+  `tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_local_wallet_credential_access_detected_not_quarantined`
+  — script de coleta local dropado num diretório monitorado, detectado
+  como SUSPICIOUS, sem auto-quarentena. Suite completa 581/581 sem
+  regressão (574 + 7 novos).
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback
