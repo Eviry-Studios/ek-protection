@@ -513,3 +513,62 @@ class TestAutoScanWiring:
             assert any(e.original_path == str(evil) for e in active)
         finally:
             await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_ld_preload_shell_hijack_auto_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária,
+        2026-09-18): dropa um script shell que seta LD_PRELOAD pra
+        sequestrar as libs de um processo alvo (ex.: wallet CLI, bot da
+        Exchange) num diretório monitorado de verdade.
+
+        Achado desta rodada: H014 ("ptrace / LD_PRELOAD") exigia
+        `is_elf=True` pra QUALQUER sinal, inclusive LD_PRELOAD — mas
+        LD_PRELOAD é técnica de env var/config, não syscall nativa, o
+        vetor real mais comum é justamente um dropper em shell (não um
+        binário compilado) setando a variável antes de lançar o alvo, ou
+        escrevendo direto em /etc/ld.so.preload pra sequestro persistente
+        de todo processo do sistema. Esse script passava batido pelas 23
+        regras antes do fix. Corrigido separando os 2 sinais: ptrace()
+        continua exigindo ELF (é syscall nativa, sem sentido em script),
+        LD_PRELOAD/ld.so.preload agora dispara em ELF OU script."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "launcher.sh"
+            evil.write_bytes(
+                b"#!/bin/bash\n"
+                b"export LD_PRELOAD=/tmp/.hook.so\n"
+                b"exec /usr/local/bin/wallet-cli \"$@\"\n"
+            )
+
+            quarantined = False
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None and not evil.exists():
+                    quarantined = True
+                    break
+
+            assert quarantined, (
+                "auto-scan detectou mas não quarentenou automaticamente o "
+                "dropper LD_PRELOAD (shell, não ELF) via monitor em tempo real"
+            )
+            assert match.level.value == "CRITICAL"
+
+            active = engine.quarantine.list_active()
+            assert any(e.original_path == str(evil) for e in active)
+        finally:
+            await engine.stop()

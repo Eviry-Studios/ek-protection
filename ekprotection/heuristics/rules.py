@@ -97,7 +97,8 @@ _RE_IP_HARDCODED = re.compile(rb'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25
 _RE_FORK_BOMB    = re.compile(rb':\(\)\s*\{|:\|\s*:&|forkbomb', re.I | re.S)
 _RE_HISTORY_DEL  = re.compile(rb'history\s+-[cw]|HISTFILE\s*=\s*/dev/null|unset\s+HIST', re.I)
 _RE_OBFUSC_SH    = re.compile(rb'\$\{[^}]{40,}\}|\$\([^)]{40,}\)|\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){5,}', re.I)
-_RE_PTRACE       = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH|LD_PRELOAD', re.I)
+_RE_PTRACE_CALL  = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH', re.I)
+_RE_LD_PRELOAD   = re.compile(rb'LD_PRELOAD\s*=|/etc/ld\.so\.preload', re.I)
 _RE_MEMFD        = re.compile(rb'memfd_create|/proc/self/mem|/proc/[0-9]+/mem', re.I)
 _RE_PACKED_UPX   = re.compile(rb'UPX!|This file is packed')
 _RE_SECRET_PATHS = re.compile(
@@ -258,11 +259,18 @@ def _r_obfuscation(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
 
 
 def _r_ptrace_ld_preload(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """ptrace() ou LD_PRELOAD → possível rootkit/injector."""
-    if not ctx.content_sample or not ctx.is_elf:
+    """ptrace() (só ELF, é syscall nativa) ou LD_PRELOAD/ld.so.preload
+    (ELF OU script — é técnica de env var/config, não exige binário
+    compilado; dropper em shell setando LD_PRELOAD pra sequestrar libs
+    de um processo alvo, ex. wallet CLI/bot, é o vetor mais comum)
+    → possível rootkit/injector."""
+    if not ctx.content_sample:
         return None
-    if _RE_PTRACE.search(ctx.content_sample):
-        return RuleMatch(rid, "uso de ptrace/LD_PRELOAD detectado (possível injector)")
+    if ctx.is_elf and _RE_PTRACE_CALL.search(ctx.content_sample):
+        return RuleMatch(rid, "uso de ptrace() detectado (possível debugger/injector malicioso)")
+    is_script_like = ctx.is_script or ctx.extension in (".sh", ".bash", ".zsh")
+    if (ctx.is_elf or is_script_like) and _RE_LD_PRELOAD.search(ctx.content_sample):
+        return RuleMatch(rid, "LD_PRELOAD/ld.so.preload detectado (possível hijack de biblioteca dinâmica)")
     return None
 
 
@@ -451,8 +459,9 @@ ALL_RULES: list[HeuristicRule] = [
                   _match_fn=_r_obfuscation),
 
     HeuristicRule("H014", "ptrace / LD_PRELOAD",
-                  "Uso de ptrace ou LD_PRELOAD (injeção/rootkit)",
-                  "crítico", 9, ("binary", "rootkit", "injection"),
+                  "ptrace() em binário ELF, ou LD_PRELOAD/ld.so.preload em "
+                  "ELF ou script (injeção/rootkit/hijack de biblioteca)",
+                  "crítico", 9, ("binary", "script", "rootkit", "injection"),
                   _match_fn=_r_ptrace_ld_preload),
 
     HeuristicRule("H015", "Técnica Fileless",

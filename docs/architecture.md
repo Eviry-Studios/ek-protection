@@ -343,6 +343,42 @@ disco mesmo.
   — script de coleta local dropado num diretório monitorado, detectado
   como SUSPICIOUS, sem auto-quarentena. Suite completa 581/581 sem
   regressão (574 + 7 novos).
+- ✅ **H014 (ptrace / LD_PRELOAD) exigia binário ELF pra QUALQUER sinal,
+  inclusive LD_PRELOAD — corrigido (2026-09-18)**. Teste intenso da
+  tarefa diária: revisão de regra crítica nunca validada via pipeline
+  real desde que foi escrita. `ptrace()` é syscall nativa (faz sentido
+  exigir ELF), mas `LD_PRELOAD` é técnica de env var/config — o vetor
+  real mais comum é um **dropper em shell** setando a variável antes de
+  lançar um processo alvo (ex. `export LD_PRELOAD=/tmp/.hook.so; exec
+  wallet-cli`, hijack de libs pra interceptar chave/senha de uma wallet
+  CLI ou bot em memória) ou escrevendo direto em `/etc/ld.so.preload`
+  (sequestro persistente de todo processo do sistema, nem precisa
+  relançar nada) — nenhum dos dois exige um binário compilado. A regra
+  antiga (`if not ctx.is_elf: return None` antes de checar qualquer
+  coisa) deixava esse script inteiro passar batido pelas 23 regras,
+  justamente o cenário mais ligado ao foco desta tarefa diária
+  (proteção de credenciais/criptoativos em memória de processo).
+  Corrigido (`ekprotection/heuristics/rules.py`): sinal de `ptrace()`
+  continua exigindo ELF; sinal de `LD_PRELOAD`/`ld.so.preload` virou
+  independente, dispara em ELF OU script (mesmo padrão de combo
+  independente já usado em H019/H023), com regex própria em vez de
+  compartilhar `_RE_PTRACE` genérico. Testes novos em
+  `tests/test_heuristics.py::TestRuleH014PtracePreload` (+4 casos:
+  export em script dispara, escrita em `/etc/ld.so.preload` em script
+  dispara, menção solta em texto/log sem ser ELF/script não dispara,
+  `ptrace()` como string em script sem LD_PRELOAD não dispara — sinal
+  nativo continua isolado do sinal de script). End-to-end sem mock via
+  inotify real: `tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_ld_preload_shell_hijack_auto_quarantined` — launcher
+  shell com `export LD_PRELOAD=...` dropado num diretório monitorado de
+  verdade, detectado E quarentenado sozinho (severidade "crítico", piso
+  de severidade de 08-29 continua valendo). Suite completa **586/586**
+  sem regressão (581 + 5 novos: 4 unit + 1 end-to-end). Achado à parte,
+  não relacionado a este fix: 1ª rodada da suite completa teve
+  `test_created_executable_triggers_scan_file` falhando sob carga
+  (passou isolado em 3.26s); reexecução completa confirmou 586/586 —
+  flakiness de timing pré-existente sob concorrência de vários testes
+  async/inotify reais na mesma suite, não regressão introduzida aqui.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

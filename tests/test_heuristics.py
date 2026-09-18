@@ -366,12 +366,52 @@ class TestRuleH014PtracePreload:
         ctx = _ctx(content=b"int r = ptrace(PTRACE_ATTACH, pid)", is_elf=True)
         assert _r_ptrace_ld_preload(ctx, "H014") is not None
 
-    def test_ld_preload_triggers(self) -> None:
+    def test_ld_preload_in_elf_triggers(self) -> None:
         ctx = _ctx(content=b"LD_PRELOAD=/tmp/evil.so", is_elf=True)
         assert _r_ptrace_ld_preload(ctx, "H014") is not None
 
-    def test_not_elf_no_trigger(self) -> None:
+    def test_ptrace_string_without_elf_no_trigger(self) -> None:
+        """ptrace() é syscall nativa — string crua sem ser binário ELF
+        não é evidência de nada (ex.: texto/doc mencionando a palavra)."""
         ctx = _ctx(content=b"ptrace stuff", is_elf=False)
+        assert _r_ptrace_ld_preload(ctx, "H014") is None
+
+    def test_ld_preload_export_in_shell_script_triggers(self) -> None:
+        """Achado real (2026-09-18): dropper em shell setando LD_PRELOAD
+        pra sequestrar libs de um processo alvo (wallet CLI, bot) nunca
+        precisa ser um binário ELF — a regra exigia is_elf=True pra
+        QUALQUER sinal, inclusive esse, e passava batido."""
+        ctx = _ctx(
+            content=b"#!/bin/bash\nexport LD_PRELOAD=/tmp/.hook.so\n./wallet-cli\n",
+            is_script=True, is_elf=False, extension=".sh",
+        )
+        assert _r_ptrace_ld_preload(ctx, "H014") is not None
+
+    def test_ld_so_preload_file_write_in_script_triggers(self) -> None:
+        """Variante persistente: escrever direto em /etc/ld.so.preload
+        sequestra TODO processo do sistema, sem precisar relançar nada."""
+        ctx = _ctx(
+            content=b"#!/bin/bash\necho /tmp/.hook.so >> /etc/ld.so.preload\n",
+            is_script=True, is_elf=False, extension=".sh",
+        )
+        assert _r_ptrace_ld_preload(ctx, "H014") is not None
+
+    def test_ld_preload_in_plain_non_script_no_trigger(self) -> None:
+        """Sem ser ELF nem script (ex.: log/texto solto citando a env var),
+        não deve disparar — evita falso-positivo em documentação/log."""
+        ctx = _ctx(
+            content=b"saw LD_PRELOAD=/tmp/x.so in a log line",
+            is_script=False, is_elf=False, extension=".txt",
+        )
+        assert _r_ptrace_ld_preload(ctx, "H014") is None
+
+    def test_ptrace_syscall_string_in_script_does_not_trigger_ptrace_signal(self) -> None:
+        """ptrace() continua exigindo ELF (não é técnica de shell) — um
+        script mencionando a palavra sem LD_PRELOAD não deve disparar."""
+        ctx = _ctx(
+            content=b"#!/bin/bash\necho 'debugging via ptrace(2) syscall'\n",
+            is_script=True, is_elf=False, extension=".sh",
+        )
         assert _r_ptrace_ld_preload(ctx, "H014") is None
 
 
