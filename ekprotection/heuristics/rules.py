@@ -99,7 +99,17 @@ _RE_HISTORY_DEL  = re.compile(rb'history\s+-[cw]|HISTFILE\s*=\s*/dev/null|unset\
 _RE_OBFUSC_SH    = re.compile(rb'\$\{[^}]{40,}\}|\$\([^)]{40,}\)|\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){5,}', re.I)
 _RE_PTRACE_CALL  = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH', re.I)
 _RE_LD_PRELOAD   = re.compile(rb'LD_PRELOAD\s*=|/etc/ld\.so\.preload', re.I)
-_RE_MEMFD        = re.compile(rb'memfd_create|/proc/self/mem|/proc/[0-9]+/mem', re.I)
+# /proc/<pid>/mem em todas as formas em que um scraper/injetor real escreve o
+# PID: literal, self/thread-self, variável de shell ($PID, ${pid}, $$, $(pgrep
+# x)), placeholder de format string do Python (f"{pid}", %d/%s) ou
+# concatenação ('/proc/' + str(pid) + '/mem'). "mem" não pode ser prefixo de
+# outra palavra (/proc/<pid>/memory_stats não é a técnica).
+_RE_MEMFD        = re.compile(
+    rb'memfd_create|'
+    rb'/proc/(?:self|thread-self|[0-9]+|\$\$|\$\{?\w+\}?|\{[^{}/\s]*\}|%[sd]|\$\([^)]*\))/mem(?!\w)|'
+    rb"""/proc/['"]\s*\+[^\n]{0,80}?\+\s*['"]/mem(?!\w)""",
+    re.I,
+)
 _RE_PACKED_UPX   = re.compile(rb'UPX!|This file is packed')
 _RE_SECRET_PATHS = re.compile(
     rb'quarantine\.key|auth\.hash|wallet\.dat|id_rsa|id_ed25519|\.ssh/id_|'

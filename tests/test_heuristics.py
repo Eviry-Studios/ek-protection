@@ -428,6 +428,31 @@ class TestRuleH015Fileless:
         ctx = _ctx(content=b"open('/tmp/normal', 'rb')")
         assert _r_memfd_proc(ctx, "H015") is None
 
+    @pytest.mark.parametrize("content", [
+        b"dd if=/proc/$PID/mem bs=1 skip=$ADDR count=64",
+        b"cat /proc/${wallet_pid}/mem",
+        b"cat /proc/$$/mem",
+        b"dd if=/proc/$(pgrep wallet-cli)/mem of=/dev/null",
+        b"open(f'/proc/{pid}/mem', 'rb')",
+        b"open('/proc/%d/mem' % pid, 'rb')",
+        b"open('/proc/' + str(pid) + '/mem', 'rb')",
+        b"open('/proc/thread-self/mem', 'r+b')",
+    ])
+    def test_proc_pid_mem_variable_forms_trigger(self, content: bytes) -> None:
+        # Achado 2026-09-19: só PID literal ([0-9]+) e "self" disparavam;
+        # scraper real de memória de wallet/bot escreve o PID como variável.
+        assert _r_memfd_proc(_ctx(content=content), "H015") is not None
+
+    @pytest.mark.parametrize("content", [
+        b"cat /proc/meminfo",
+        b"cat /proc/1234/memory_stats",
+        b"cat /proc/$PID/status",
+        b"open('/proc/' + name + '/cmdline')",
+    ])
+    def test_proc_lookalikes_no_trigger(self, content: bytes) -> None:
+        # "mem" como prefixo de outra palavra (memory_stats) não é a técnica.
+        assert _r_memfd_proc(_ctx(content=content), "H015") is None
+
 
 class TestRuleH016PackedUPX:
     def test_upx_magic_triggers(self) -> None:

@@ -572,3 +572,55 @@ class TestAutoScanWiring:
             assert any(e.original_path == str(evil) for e in active)
         finally:
             await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_proc_pid_mem_scraper_auto_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária,
+        2026-09-19): dropa um scraper que lê /proc/$PID/mem do processo de
+        uma wallet CLI pra extrair chave da memória, num diretório
+        monitorado de verdade.
+
+        Achado desta rodada: a regex de H015 só casava /proc/self/mem e
+        /proc/<PID literal>/mem — o scraper real usa PID como variável
+        ($PID, ${pid}, f-string), então passava batido pelas 23 regras."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "scrape.sh"
+            evil.write_bytes(
+                b"#!/bin/bash\n"
+                b"PID=$(pgrep wallet-cli)\n"
+                b"dd if=/proc/$PID/mem bs=1M count=64 2>/dev/null > /dev/null\n"
+            )
+
+            quarantined = False
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None and not evil.exists():
+                    quarantined = True
+                    break
+
+            assert quarantined, (
+                "auto-scan detectou mas não quarentenou automaticamente o "
+                "scraper de /proc/$PID/mem via monitor em tempo real"
+            )
+            assert match.level.value == "CRITICAL"
+
+            active = engine.quarantine.list_active()
+            assert any(e.original_path == str(evil) for e in active)
+        finally:
+            await engine.stop()

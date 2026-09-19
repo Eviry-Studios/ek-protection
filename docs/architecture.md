@@ -379,6 +379,36 @@ disco mesmo.
   (passou isolado em 3.26s); reexecução completa confirmou 586/586 —
   flakiness de timing pré-existente sob concorrência de vários testes
   async/inotify reais na mesma suite, não regressão introduzida aqui.
+- ✅ **H015 (técnica fileless) só casava `/proc/self/mem` e PID literal —
+  corrigido (2026-09-19)**. Teste intenso da tarefa diária: revisão
+  linha a linha da regra crítica, nunca validada via pipeline real. A
+  regex antiga (`/proc/self/mem|/proc/[0-9]+/mem`) só disparava com o PID
+  escrito como número literal, mas um scraper real de memória (ler a
+  chave de uma wallet CLI/bot da Exchange rodando na VPS direto de
+  `/proc/<pid>/mem`) escreve o PID como **variável** — `dd if=/proc/$PID/mem`,
+  `cat /proc/${pid}/mem`, `/proc/$$/mem`, `/proc/$(pgrep wallet-cli)/mem`,
+  `open(f"/proc/{pid}/mem")`, `'/proc/%d/mem' % pid`,
+  `'/proc/' + str(pid) + '/mem'`, `/proc/thread-self/mem` — e nenhuma
+  dessas formas disparava nenhuma das 23 regras (H009 só cobre path de
+  credencial, não leitura de memória de processo). Também tinha falso
+  positivo por prefixo: `/proc/1234/memory_stats` casava (sem limite de
+  palavra depois de `mem`). Corrigido (`ekprotection/heuristics/rules.py`,
+  `_RE_MEMFD`): aceita as formas acima e exige que `mem` não seja prefixo
+  de outra palavra. Limite conhecido: concatenação só cobre `+` (não
+  `os.path.join`/`"".join`) — ficou de fora por ser mais frágil de
+  reconhecer por regex sem falso-positivo. Testes novos em
+  `tests/test_heuristics.py::TestRuleH015Fileless` (+12 casos: 8 formas de
+  PID variável disparam, 4 lookalikes — `/proc/meminfo`,
+  `/proc/1234/memory_stats`, `/proc/$PID/status`, `cmdline` — não
+  disparam). End-to-end sem mock via inotify real:
+  `tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_proc_pid_mem_scraper_auto_quarantined` — script
+  `dd if=/proc/$PID/mem` dropado num diretório monitorado, detectado E
+  quarentenado sozinho (severidade "crítico"). Confirmado que os testes
+  novos **falham sem o fix** (10 falhas com a regex antiga) e passam com
+  ele. Suite completa **599/599** sem regressão (586 + 13 novos: 12 unit
+  + 1 end-to-end); a flakiness de timing sinalizada em 09-18
+  (`test_created_executable_triggers_scan_file`) não reapareceu.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback
