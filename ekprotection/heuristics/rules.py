@@ -89,7 +89,22 @@ _RE_REVERSE_SH   = re.compile(rb'bash\s+-i|nc\s+-[el]|ncat\s+|socat\s+', re.I)
 _RE_PRIVESC      = re.compile(rb'sudo\s+-[isSu]|su\s+-[lc]|pkexec\b', re.I)
 _RE_CRON_INSTALL = re.compile(rb'crontab\s+-[lu]|/etc/cron|/var/spool/cron', re.I)
 _RE_SHADOW_ETC   = re.compile(rb'/etc/shadow|/etc/passwd|/etc/sudoers', re.I)
-_RE_RM_RF        = re.compile(rb'rm\s+-[rf]{1,2}\s+/', re.I)
+# H010: acha o comando `rm` (word-boundary: `confirm`/`perform` não contam;
+# `/bin/rm`, `sudo rm`, `xargs rm` contam) e captura os argumentos até o fim
+# do comando. Flags e alvos são analisados em _r_rm_rf, não na regex.
+_RE_RM_CMD       = re.compile(rb'(?<![\w.\-])rm\s+([^;&|\n`<>()]*)', re.I)
+_RM_SYSTEM_DIRS  = frozenset({
+    "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64",
+    "/media", "/mnt", "/opt", "/proc", "/root", "/sbin", "/srv", "/sys",
+    "/usr", "/var",
+    "/var/lib", "/var/log", "/usr/bin", "/usr/sbin", "/usr/lib",
+    "/usr/local", "/usr/share",
+})
+_HOME_PREFIX     = r'(?:~|\$HOME|\$\{HOME\}|/home/[^/]+|/root)'
+_RE_RM_HOME      = re.compile(r'^(?:~|\$HOME|\$\{HOME\}|/home/[^/]+)$')
+_RE_RM_HOME_KEYS = re.compile(
+    rf'^{_HOME_PREFIX}/\.(?:ssh|gnupg|bitcoin|ethereum|electrum|monero)$'
+)
 _RE_C2_SLEEP     = re.compile(rb'\b(?:sleep|usleep)\s+[0-9]+', re.I)
 _RE_C2_NET       = re.compile(rb'\b(?:curl|wget|nc)\b', re.I)
 _RE_CRYPTO_ADDR  = re.compile(rb'[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[0-9a-fA-F]{40}')
@@ -230,12 +245,47 @@ def _r_sensitive_files(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+def _rm_target_is_critical(target: str) -> bool:
+    """True se o alvo do rm é raiz, diretório de sistema, $HOME ou chave/wallet."""
+    t = target.strip("'\"")
+    t = re.sub(r'/{2,}', '/', t)
+    # `/etc/`, `/etc/*`, `/etc/.*`, `/etc/.` -> `/etc`; `/` e `/*` -> ''
+    t = re.sub(r'(?:/(?:\.?\*|\.))+$', '', t)
+    t = t.rstrip('/')
+    return (
+        t == ''
+        or t in _RM_SYSTEM_DIRS
+        or bool(_RE_RM_HOME.match(t))
+        or bool(_RE_RM_HOME_KEYS.match(t))
+    )
+
+
 def _r_rm_rf(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """rm -rf / ou rm -rf em paths raiz."""
+    """rm recursivo (ou --no-preserve-root) mirando raiz, diretório de
+    sistema, $HOME ou chave/wallet. `rm -rf /tmp/build` e `rm -f x.pid`
+    são limpeza normal e não disparam."""
     if not ctx.content_sample:
         return None
-    if _RE_RM_RF.search(ctx.content_sample):
-        return RuleMatch(rid, "comando destrutivo: rm -rf /")
+    for m in _RE_RM_CMD.finditer(ctx.content_sample):
+        recursive = no_preserve_root = False
+        targets: list[str] = []
+        end_of_opts = False
+        for tok in m.group(1).decode('utf-8', errors='replace').split():
+            if not end_of_opts and tok == '--':
+                end_of_opts = True
+            elif not end_of_opts and tok.startswith('--'):
+                recursive        |= tok == '--recursive'
+                no_preserve_root |= tok == '--no-preserve-root'
+            elif not end_of_opts and tok.startswith('-') and len(tok) > 1:
+                recursive |= any(c in 'rR' for c in tok[1:])
+            else:
+                targets.append(tok)
+        if no_preserve_root:
+            return RuleMatch(rid, "comando destrutivo: rm --no-preserve-root")
+        if recursive:
+            for t in targets:
+                if _rm_target_is_critical(t):
+                    return RuleMatch(rid, f"comando destrutivo: rm -r em {t}")
     return None
 
 

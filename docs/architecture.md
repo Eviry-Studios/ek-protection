@@ -409,6 +409,45 @@ disco mesmo.
   ele. Suite completa **599/599** sem regressão (586 + 13 novos: 12 unit
   + 1 end-to-end); a flakiness de timing sinalizada em 09-18
   (`test_created_executable_triggers_scan_file`) não reapareceu.
+- ✅ **H010 (comando destrutivo) errava nas duas direções — corrigido
+  (2026-09-20)**. Teste intenso da tarefa diária: revisão linha a linha
+  da regra crítica. A regex antiga (`rm\s+-[rf]{1,2}\s+/`) foi medida
+  contra 48 casos reais antes de mexer: **14 de 28 wipers passavam
+  batido** (`--no-preserve-root`, `~`, `$HOME`, `"$HOME"`, `-rfv`,
+  `-r -f`, `--recursive --force`, alvo entre aspas, flag depois do alvo,
+  `~/.ssh`, `~/.bitcoin`) e **14 de 20 comandos benignos disparavam como
+  crítico** (`rm -rf /tmp/build`, `rm -f /tmp/app.pid`,
+  `rm -rf /var/cache/...`, `rm -rf /home/x/proj/node_modules`) — e como
+  crítico aciona auto-quarentena, o falso-positivo derrubava script de
+  limpeza legítimo. Também não tinha word-boundary: `confirm -f /etc/hosts`,
+  `perform -r /data`, `form -f /x` casavam como `rm`. O teste antigo
+  `test_rm_rf_specific_triggers` afirmava `rm -rf /tmp/safe` como disparo
+  — o próprio teste consagrava o falso-positivo; foi invertido.
+  Corrigido (`ekprotection/heuristics/rules.py`, `_RE_RM_CMD` +
+  `_rm_target_is_critical`): acha `rm` com word-boundary (`/bin/rm`,
+  `sudo rm`, `xargs rm` contam), analisa flags em qualquer posição
+  (`-r`/`-R`/cluster como `-rfv`/`--recursive`; `--no-preserve-root`
+  dispara sozinho) e só dispara se recursivo E o alvo é raiz
+  (`/`, `/*`), diretório de sistema (`/etc`, `/usr`, `/var/lib`...),
+  `$HOME`/`~`/`/home/<user>`/`/root`, ou chave/wallet
+  (`~/.ssh`, `.gnupg`, `.bitcoin`, `.ethereum`, `.electrum`, `.monero`).
+  Limites conhecidos: `rm` não-recursivo de arquivo de sistema
+  (`rm -f /etc/passwd`) deixa de ser H010 (antes casava por acidente) —
+  continua pego por H009 (alto, sem auto-quarentena); variável não
+  resolvida (`rm -rf "$DIR/"*`) e outros wipers (`find / -delete`,
+  `dd of=/dev/sda`, `shred`, `mkfs`) não são cobertos por esta regra.
+  Testes novos: `tests/test_heuristics.py::TestRuleH010RmRf` (26 formas
+  destrutivas disparam, 13 limpezas de rotina e 4 palavras terminadas em
+  `rm` não disparam) e end-to-end sem mock via inotify real:
+  `tests/test_engine.py::TestAutoScanWiring::
+  test_end_to_end_wiper_quarantined_routine_cleanup_left_alone` — wiper
+  (`rm -rfv $HOME`, `rm -r -f ~/.bitcoin`) detectado E quarentenado; script
+  de limpeza benigno no mesmo diretório monitorado não é quarentenado nem
+  citado por H010. Confirmado que os testes novos **falham sem o fix**
+  (28 unit + 1 e2e). Suite completa **644/644** sem regressão.
+  Achado colateral, **não corrigido** (semântica pretendida incerta):
+  H002 (`_r_exec_in_tmp`) usa `f"/{d}" in ctx.path`, substring em vez de
+  fronteira de diretório — `/home/u/tmpfiles/x.sh` casa como "em /tmp".
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

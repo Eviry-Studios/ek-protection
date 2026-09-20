@@ -309,13 +309,53 @@ class TestRuleH010RmRf:
         ctx = _ctx(content=b"rm -rf /etc /var /usr")
         assert _r_rm_rf(ctx, "H010") is not None
 
-    def test_rm_rf_specific_triggers(self) -> None:
+    def test_rm_rf_tmp_subdir_does_not_trigger(self) -> None:
+        """Antes (até 2026-09-20) este caso era afirmado como disparo
+        crítico — falso-positivo: `rm -rf /tmp/...` é limpeza normal de
+        build/cache e disparava auto-quarentena."""
         ctx = _ctx(content=b"rm -rf /tmp/safe")
-        assert _r_rm_rf(ctx, "H010") is not None
+        assert _r_rm_rf(ctx, "H010") is None
 
     def test_no_rm_no_trigger(self) -> None:
         ctx = _ctx(content=b"ls -la /tmp")
         assert _r_rm_rf(ctx, "H010") is None
+
+    @pytest.mark.parametrize("cmd", [
+        b"rm -rf /", b"rm -rf /*", b"rm -fr /home", b"rm -rf //", b"rm -rf /etc/",
+        b"rm -rf --no-preserve-root /", b"rm --no-preserve-root -rf /",
+        b"rm -rfv /etc", b"rm -r -f /usr", b"rm --recursive --force /var/lib",
+        b"rm /etc -rf", b"rm -Rf /usr/local", b"rm -rf '/etc'",
+        b"sudo rm -rf /boot", b"/bin/rm -rf /", b"cd /tmp && rm -rf /etc",
+        b"xargs rm -rf /var/log",
+        b"rm -rf ~", b"rm -rf ~/", b"rm -rf $HOME", b'rm -rf "$HOME"',
+        b"rm -rf ${HOME}/*", b"rm -rf /home/alice", b"rm -rf /root",
+        b"rm -rf ~/.ssh", b"rm -rf ~/.bitcoin",
+    ])
+    def test_destructive_forms_trigger(self, cmd: bytes) -> None:
+        assert _r_rm_rf(_ctx(content=cmd), "H010") is not None
+
+    @pytest.mark.parametrize("cmd", [
+        b"rm -rf /tmp/build", b"rm -rf /tmp/*", b"rm -f /tmp/app.pid",
+        b"rm -f /var/run/app.lock", b"rm -rf /var/cache/apt/archives/partial",
+        b"rm -rf /home/alice/proj/node_modules", b"rm -rf ~/proj/build",
+        b"rm -rf $HOME/.cache/pip", b"rm -rf /opt/myapp/releases/old",
+        b"rm -rf /var/www/html/cache", b"rm -rf ./build", b"rm foo.txt",
+        b"rm -i /tmp/x",
+    ])
+    def test_routine_cleanup_does_not_trigger(self, cmd: bytes) -> None:
+        assert _r_rm_rf(_ctx(content=cmd), "H010") is None
+
+    @pytest.mark.parametrize("cmd", [
+        b"confirm -f /etc/hosts", b"perform -r /data", b"form -f /x",
+        b"echo skirm -r /var",
+    ])
+    def test_word_ending_in_rm_does_not_trigger(self, cmd: bytes) -> None:
+        """Sem word-boundary, `confirm -f /...` casava como `rm -f /...`."""
+        assert _r_rm_rf(_ctx(content=cmd), "H010") is None
+
+    def test_detail_names_the_target(self) -> None:
+        m = _r_rm_rf(_ctx(content=b"rm -rf ~/.bitcoin"), "H010")
+        assert m is not None and "~/.bitcoin" in m.detail
 
 
 class TestRuleH011ForkBomb:

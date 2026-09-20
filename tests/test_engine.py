@@ -574,6 +574,72 @@ class TestAutoScanWiring:
             await engine.stop()
 
     @pytest.mark.asyncio
+    async def test_end_to_end_wiper_quarantined_routine_cleanup_left_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso de invasão simulada (checklist da tarefa diária,
+        2026-09-20): dropa num diretório monitorado de verdade um script de
+        limpeza de build (benigno) e depois um wiper que apaga $HOME e a
+        wallet local.
+
+        Achado desta rodada (H010): a regex antiga era `rm\\s+-[rf]{1,2}\\s+/`
+        — disparava crítico (e auto-quarentena) em `rm -rf /tmp/build` e
+        `rm -f x.pid`, e deixava passar `$HOME`, `~`, `--no-preserve-root`,
+        `-rfv`, `-r -f`."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            cleanup = watched / "cleanup.sh"
+            cleanup.write_bytes(
+                b"#!/bin/bash\n"
+                b"rm -rf /tmp/build /var/cache/myapp\n"
+                b"rm -f /tmp/app.pid\n"
+            )
+            await asyncio.sleep(0.3)
+            wiper = watched / "wipe.sh"
+            wiper.write_bytes(
+                b"#!/bin/bash\n"
+                b"rm -rfv $HOME\n"
+                b"rm -r -f ~/.bitcoin\n"
+            )
+
+            quarantined = False
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(wiper)), None)
+                if match is not None and not wiper.exists():
+                    quarantined = True
+                    break
+
+            assert quarantined, (
+                "wiper (rm -rfv $HOME) não foi detectado e quarentenado via "
+                "monitor em tempo real"
+            )
+            assert match.level.value == "CRITICAL"
+
+            await asyncio.sleep(0.5)
+            assert cleanup.exists(), "script de limpeza benigno foi quarentenado (falso-positivo H010)"
+            # tmp_path fica em /tmp, então H002 (script em dir suspeito,
+            # severidade "alto", sem auto-quarentena) pode legitimamente
+            # marcar o arquivo — o que não pode aparecer é H010 como motivo.
+            entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+            cleanup_msgs = [e.message for e in entries if e.file_path == str(cleanup)]
+            assert not any("destrutivo" in m.lower() for m in cleanup_msgs), cleanup_msgs
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
     async def test_end_to_end_proc_pid_mem_scraper_auto_quarantined(
         self, tmp_path: Path
     ) -> None:
