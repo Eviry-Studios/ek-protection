@@ -445,9 +445,31 @@ disco mesmo.
   de limpeza benigno no mesmo diretório monitorado não é quarentenado nem
   citado por H010. Confirmado que os testes novos **falham sem o fix**
   (28 unit + 1 e2e). Suite completa **644/644** sem regressão.
-  Achado colateral, **não corrigido** (semântica pretendida incerta):
-  H002 (`_r_exec_in_tmp`) usa `f"/{d}" in ctx.path`, substring em vez de
-  fronteira de diretório — `/home/u/tmpfiles/x.sh` casa como "em /tmp".
+  Achado colateral do dia 09-20, **corrigido em 2026-09-21**: H002 (ver
+  entrada própria abaixo).
+- ✅ **H002 (executável em diretório suspeito) casava por substring, não
+  por diretório — corrigido (2026-09-21)**. Achado colateral sinalizado
+  em 09-20 (bloco H010 acima), semântica aprovada pelo Hermes no mesmo
+  dia: os 4 diretórios (`/tmp`, `/dev/shm`, `/var/tmp`, `/run/user`)
+  devem casar como sequência inteira de componentes de path, em qualquer
+  profundidade (`/tmp/x.sh` e `/mnt/x/tmp/y.sh` disparam;
+  `/home/u/tmpfiles/x.sh` e `/tmp-old/x.sh` não). A implementação antiga
+  (`f"/{d.strip('/')}" in ctx.path`) casava por substring, então
+  `tmpfiles`/`tmp-old` disparavam como falso-positivo de "executável em
+  /tmp" só por conter o texto. Corrigido (`ekprotection/heuristics/rules.py`,
+  `_r_exec_in_tmp`): path quebrado em componentes (`ctx.path.split("/")`,
+  vazios descartados) e cada diretório suspeito vira uma sequência de
+  componentes (`("tmp",)`, `("dev","shm")`, `("var","tmp")`,
+  `("run","user")`) buscada como subsequência contígua exata, em qualquer
+  posição — o `startswith` antigo já estava certo e não precisou mudar,
+  só o ramo por substring. Testes novos em `tests/test_heuristics.py::
+  TestRuleH002ExecInTmp` (+6 casos: os 4 diretórios disparando aninhados
+  em profundidade arbitrária, e os 2 lookalikes `tmpfiles`/`tmp-old` não
+  disparando). Confirmado que os 2 testes de lookalike **falham sem o
+  fix** (stash só de `rules.py`). A asserção "H010 não é o motivo" do
+  e2e de 09-20 (`test_end_to_end_wiper_quarantined_routine_cleanup_left_alone`)
+  continua válida — `tmp_path` do pytest sempre inclui o componente
+  exato `tmp`, então H002 segue disparando ali como antes.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

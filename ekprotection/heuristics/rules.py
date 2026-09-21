@@ -147,14 +147,19 @@ def _r_high_entropy(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+_SUSPICIOUS_EXEC_DIR_SEQS = (("tmp",), ("dev", "shm"), ("var", "tmp"), ("run", "user"))
+
+
 def _r_exec_in_tmp(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """Arquivo executável em /tmp, /dev/shm ou /var/tmp."""
-    suspicious = {"/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/"}
+    """Arquivo executável em /tmp, /dev/shm, /var/tmp ou /run/user, em qualquer profundidade."""
     if not (ctx.is_executable or ctx.is_elf or ctx.is_script):
         return None
-    for d in suspicious:
-        if ctx.path.startswith(d) or f"/{d.strip('/')}" in ctx.path:
-            return RuleMatch(rid, f"executável em diretório suspeito: {d.rstrip('/')}")
+    components = [c for c in ctx.path.split("/") if c]
+    for seq in _SUSPICIOUS_EXEC_DIR_SEQS:
+        n = len(seq)
+        for i in range(len(components) - n + 1):
+            if tuple(components[i:i + n]) == seq:
+                return RuleMatch(rid, f"executável em diretório suspeito: /{'/'.join(seq)}")
     return None
 
 

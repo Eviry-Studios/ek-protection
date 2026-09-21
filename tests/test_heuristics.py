@@ -170,6 +170,30 @@ class TestRuleH002ExecInTmp:
         ctx = _ctx(path="/tmp/readme.txt", is_executable=False)
         assert _r_exec_in_tmp(ctx, "H002") is None
 
+    def test_exec_in_nested_tmp_triggers(self) -> None:
+        ctx = _ctx(path="/mnt/x/tmp/y.sh", is_script=True)
+        assert _r_exec_in_tmp(ctx, "H002") is not None
+
+    def test_exec_in_nested_dev_shm_triggers(self) -> None:
+        ctx = _ctx(path="/mnt/x/dev/shm/y.sh", is_script=True)
+        assert _r_exec_in_tmp(ctx, "H002") is not None
+
+    def test_exec_in_nested_var_tmp_triggers(self) -> None:
+        ctx = _ctx(path="/mnt/x/var/tmp/y.sh", is_script=True)
+        assert _r_exec_in_tmp(ctx, "H002") is not None
+
+    def test_exec_in_nested_run_user_triggers(self) -> None:
+        ctx = _ctx(path="/mnt/x/run/user/1000/y.sh", is_script=True)
+        assert _r_exec_in_tmp(ctx, "H002") is not None
+
+    def test_exec_in_tmpfiles_dir_no_trigger(self) -> None:
+        ctx = _ctx(path="/home/u/tmpfiles/x.sh", is_script=True)
+        assert _r_exec_in_tmp(ctx, "H002") is None
+
+    def test_exec_in_tmp_old_dir_no_trigger(self) -> None:
+        ctx = _ctx(path="/tmp-old/x.sh", is_script=True)
+        assert _r_exec_in_tmp(ctx, "H002") is None
+
 
 class TestRuleH003Base64:
     def test_base64_decode_triggers(self) -> None:
