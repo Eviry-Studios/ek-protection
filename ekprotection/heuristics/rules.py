@@ -80,7 +80,21 @@ class HeuristicContext:
 
 # Padrões regex compilados uma vez (performance)
 _RE_B64_DECODE   = re.compile(rb'base64\s*[-]d|base64_decode|atob\(', re.I)
-_RE_EVAL_EXEC    = re.compile(rb'\beval\s*\(|\bexec\s*\(|\bexecve\s*\(', re.I)
+# H004: forma Python/syscall exige parênteses (`eval(`/`exec(`/`execve(`).
+# Mas o builtin `eval` de shell não usa parênteses (`eval $cmd`,
+# `eval "$(curl ... )"`, `` eval `payload` `` — justamente a forma mais comum
+# de dropper que decodifica payload (base64/hex) numa variável e roda via
+# eval dinâmico) — a regex antiga não cobria essa forma. Segunda alternativa
+# cobre `eval` de shell só quando o argumento é claramente dinâmico (`$(...)`,
+# `${...}`, `$VAR` ou crase), não `eval "comando literal"` estático.
+# `exec` de shell foi deixado de fora de propósito: `exec "$@"`/`exec $SHELL`
+# são idiomas benignos e comuns (entrypoint/wrapper scripts), causariam
+# muito falso-positivo sem ganho real de detecção.
+_RE_EVAL_EXEC    = re.compile(
+    rb"\beval\s*\(|\bexec\s*\(|\bexecve\s*\("
+    rb"|\beval\s+['\"]?(?:\$\(|\$\{|\$[A-Za-z_]|`)",
+    re.I,
+)
 _RE_WGET_CURL    = re.compile(rb'wget\s+|curl\s+|fetch\s+http', re.I)
 _RE_CHMOD_X      = re.compile(rb'chmod\s+[+]?[x7][0-9]*|chmod\s+0?[0-7]*[1357]', re.I)
 _RE_PIPE_SH      = re.compile(rb'\|\s*(bash|sh|zsh|ash|dash)\b', re.I)

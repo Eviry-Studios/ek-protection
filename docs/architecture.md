@@ -470,6 +470,32 @@ disco mesmo.
   e2e de 09-20 (`test_end_to_end_wiper_quarantined_routine_cleanup_left_alone`)
   continua válida — `tmp_path` do pytest sempre inclui o componente
   exato `tmp`, então H002 segue disparando ali como antes.
+- ✅ **H004 (eval/exec dinâmico) só cobria a forma Python — corrigido
+  (2026-09-22)**. Achado da rodada diária: a regex antiga
+  (`\beval\s*\(|\bexec\s*\(|\bexecve\s*\(`) exige parênteses logo após a
+  palavra, o que cobre `eval(...)`/`exec(...)` em Python e a syscall
+  `execve()`, mas **não cobre o builtin `eval` de shell**, que não usa
+  parênteses — e essa é justamente a forma mais comum de dropper (payload
+  base64/hex decodificado numa variável, rodado via `eval $cmd`,
+  `eval "$(curl ... )"` ou `` eval `cat payload` ``). Testado ao vivo antes
+  do fix: nenhuma das 4 formas disparava. Corrigido
+  (`ekprotection/heuristics/rules.py`, `_RE_EVAL_EXEC`): segunda alternativa
+  na regex casa `eval` de shell só quando o argumento é claramente dinâmico
+  (`$(...)`, `${...}`, `$VAR` ou crase) — `eval "comando literal"` estático
+  continua sem disparar, não é o padrão de ataque. `exec` de shell foi
+  deixado de fora de propósito: `exec "$@"`/`exec $SHELL` são idiomas
+  benignos e muito comuns em entrypoint/wrapper scripts, incluir geraria
+  falso-positivo em volume sem ganho real (o vetor perigoso de `exec`
+  dinâmico com rede, ex. `/dev/tcp/`, já é coberto por H006). Testes novos
+  em `tests/test_heuristics.py::TestRuleH004EvalExec` (+10 casos: 6 formas
+  de `eval` de shell disparando — var nua, var entre aspas, command
+  substitution com e sem aspas, brace expansion, backtick — e 4 casos que
+  não devem disparar — `eval` de string literal, `exec "$@"`, `exec $SHELL`,
+  `evaluate(...)` como regressão de word-boundary). Confirmado que as 6
+  novas asserções de disparo **falham sem o fix** (stash só de `rules.py`).
+  Suite completa **660/660** sem regressão (650 + 10 novos). Próximas
+  candidatas: H012 (deleção de histórico) e H013 (ofuscação de shell) —
+  ainda não revisadas linha a linha nesta rodada.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

