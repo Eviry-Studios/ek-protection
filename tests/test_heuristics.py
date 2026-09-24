@@ -455,8 +455,60 @@ class TestRuleH012HistoryDeletion:
         ctx = _ctx(content=b"export HISTFILE=/dev/null")
         assert _r_history_deletion(ctx, "H012") is not None
 
+    def test_unset_histfile_triggers(self) -> None:
+        ctx = _ctx(content=b"unset HISTFILE")
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_set_plus_o_history_triggers(self) -> None:
+        ctx = _ctx(content=b"set +o history")
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_histfile_empty_triggers(self) -> None:
+        ctx = _ctx(content=b'export HISTFILE=""')
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_histsize_zero_triggers(self) -> None:
+        ctx = _ctx(content=b"HISTSIZE=0")
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_histfilesize_zero_triggers(self) -> None:
+        ctx = _ctx(content=b"HISTFILESIZE=0")
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_rm_bash_history_triggers(self) -> None:
+        ctx = _ctx(content=b"rm -f ~/.bash_history")
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_shred_bash_history_triggers(self) -> None:
+        ctx = _ctx(content=b"shred -u ~/.bash_history")
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_truncate_redirect_history_triggers(self) -> None:
+        ctx = _ctx(content=b"cat /dev/null > ~/.bash_history")
+        assert _r_history_deletion(ctx, "H012") is not None
+
+    def test_non_bash_history_file_triggers(self) -> None:
+        """Evasão não é exclusiva de bash — psql/mysql/irb etc também
+        mantêm arquivo de histórico próprio."""
+        ctx = _ctx(content=b'rm ~/.psql_history')
+        assert _r_history_deletion(ctx, "H012") is not None
+
     def test_no_history_cmd_no_trigger(self) -> None:
         ctx = _ctx(content=b"echo $HISTSIZE")
+        assert _r_history_deletion(ctx, "H012") is None
+
+    def test_custom_histfile_path_no_trigger(self) -> None:
+        """Redirecionar HISTFILE pra outro arquivo real não é evasão."""
+        ctx = _ctx(content=b"export HISTFILE=/var/log/myhistory.log")
+        assert _r_history_deletion(ctx, "H012") is None
+
+    def test_append_to_history_log_no_trigger(self) -> None:
+        """`>>` é append, não sobrescrita/limpeza."""
+        ctx = _ctx(content=b"echo done >> deploy_history.log")
+        assert _r_history_deletion(ctx, "H012") is None
+
+    def test_reading_history_file_no_trigger(self) -> None:
+        ctx = _ctx(content=b"ls -la ~/.bash_history")
         assert _r_history_deletion(ctx, "H012") is None
 
 

@@ -124,7 +124,23 @@ _RE_C2_NET       = re.compile(rb'\b(?:curl|wget|nc)\b', re.I)
 _RE_CRYPTO_ADDR  = re.compile(rb'[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[0-9a-fA-F]{40}')
 _RE_IP_HARDCODED = re.compile(rb'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b')
 _RE_FORK_BOMB    = re.compile(rb':\(\)\s*\{|:\|\s*:&|forkbomb', re.I | re.S)
-_RE_HISTORY_DEL  = re.compile(rb'history\s+-[cw]|HISTFILE\s*=\s*/dev/null|unset\s+HIST', re.I)
+# history -c/-w e HISTFILE=/dev/null/unset HIST* eram as únicas formas
+# cobertas; malware/dropper real também usa `set +o history` (desliga log
+# de histórico sem tocar em HISTFILE), HISTFILE= vazio ("" ou '' também
+# desabilita), HISTSIZE=0/HISTFILESIZE=0 (zera antes mesmo de escrever), e
+# apagar/truncar o arquivo de histórico direto (rm/shred/truncate ou um
+# único `>` de overwrite — `>>` de append fica de fora, não é evasão) em
+# qualquer *_history (bash/zsh/sh/python/psql/mysql/irb etc, não só bash).
+_RE_HISTORY_DEL  = re.compile(
+    rb'history\s+-[cw]|'
+    rb'unset\s+HIST|'
+    rb'set\s+\+o\s+history|'
+    rb'HISTFILE\s*=\s*(/dev/null|["\x27]{2})?\s*(;|\n|$)|'
+    rb'HIST(SIZE|FILESIZE)\s*=\s*0\b|'
+    rb'(rm|shred|truncate)\s+[^\n;]{0,80}\w*_history\b|'
+    rb'(?<!>)>(?!>)\s*[^\n;]{0,80}\w*_history\b',
+    re.I,
+)
 _RE_OBFUSC_SH    = re.compile(rb'\$\{[^}]{40,}\}|\$\([^)]{40,}\)|\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){5,}', re.I)
 _RE_PTRACE_CALL  = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH', re.I)
 _RE_LD_PRELOAD   = re.compile(rb'LD_PRELOAD\s*=|/etc/ld\.so\.preload', re.I)

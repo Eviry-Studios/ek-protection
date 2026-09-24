@@ -496,6 +496,16 @@ disco mesmo.
   Suite completa **660/660** sem regressão (650 + 10 novos). Próximas
   candidatas: H012 (deleção de histórico) e H013 (ofuscação de shell) —
   ainda não revisadas linha a linha nesta rodada.
+- ✅ **H012 (deleção de histórico) cobria só 3 formas — ampliada
+  (2026-09-24)**. A regex antiga (`history -c/-w`, `HISTFILE=/dev/null`,
+  `unset HIST*`) deixava passar `set +o history`, `HISTFILE=""`,
+  `HISTSIZE=0`/`HISTFILESIZE=0` e apagar/truncar o arquivo direto
+  (`rm`/`shred`/`truncate` ou `>` de overwrite em qualquer `*_history`,
+  não só bash — psql/mysql/irb também). `>>` (append) e `HISTFILE` apontando
+  pra arquivo real continuam sem disparar. +12 testes em
+  `TestRuleH012HistoryDeletion` (9 disparando, 3 não-disparo); os 8
+  disparos de forma nova **falham sem o fix** (stash só de `rules.py`).
+  Suite completa **672/672**. Próxima candidata: H013 (ofuscação de shell).
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback
