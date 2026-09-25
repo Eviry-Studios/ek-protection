@@ -141,7 +141,11 @@ _RE_HISTORY_DEL  = re.compile(
     rb'(?<!>)>(?!>)\s*[^\n;]{0,80}\w*_history\b',
     re.I,
 )
-_RE_OBFUSC_SH    = re.compile(rb'\$\{[^}]{40,}\}|\$\([^)]{40,}\)|\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){5,}', re.I)
+_RE_OBFUSC_SH    = re.compile(
+    rb'\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){5,}'                      # hex escapes em sequência
+    rb'|(\\[0-7]{3}){6,}'                                        # octal escapes em sequência
+    rb'|\b(base64\s+(-d|--decode|-D)|xxd\s+-r|openssl\s+(enc|base64)\s[^|\n]*-d|rev)\b[^|\n]*\|\s*(\S*/)?(ba|z|da|k)?sh\b',  # decoder | shell
+    re.I)
 _RE_PTRACE_CALL  = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH', re.I)
 _RE_LD_PRELOAD   = re.compile(rb'LD_PRELOAD\s*=|/etc/ld\.so\.preload', re.I)
 # /proc/<pid>/mem em todas as formas em que um scraper/injetor real escreve o

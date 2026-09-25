@@ -506,6 +506,18 @@ disco mesmo.
   `TestRuleH012HistoryDeletion` (9 disparando, 3 não-disparo); os 8
   disparos de forma nova **falham sem o fix** (stash só de `rules.py`).
   Suite completa **672/672**. Próxima candidata: H013 (ofuscação de shell).
+- ✅ **H013 (ofuscação de shell) errava nas duas direções — corrigida
+  (2026-09-25)**. Falso negativo: `echo <b64> | base64 -d | sh`, `xxd -r | sh`,
+  `rev | sh`, `openssl enc -d | bash` e `printf '\154\163...'` (octal)
+  passavam batido — só hex `\xNN` x6 disparava. Falso positivo: qualquer
+  `$(...)`/`${...}` com 40+ chars (ex.: `git describe --tags --always ...`)
+  disparava; removido por ser sinal fraco (decisão técnica minha, dentro
+  do escopo delegado). Agora: hex, octal (6+ seguidos) e decoder pipado
+  em shell (`sh`/`bash`/`zsh`/`dash`/`ksh`, com ou sem path). Decode pra
+  arquivo (`base64 -d x > y`) não dispara. +4 testes em
+  `TestRuleH013Obfuscation`; 3 falham sem o fix (stash só de `rules.py`).
+  Suite completa **676/676**. Heurísticas H001–H015 revisadas nas
+  últimas rodadas; próxima frente: H001/H003/H005+ linha a linha.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

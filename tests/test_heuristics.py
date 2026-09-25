@@ -526,6 +526,30 @@ class TestRuleH013Obfuscation:
         ctx = _ctx(content=b"\\x41\\x42" * 10, is_script=False, extension=".bin")
         assert _r_obfuscation(ctx, "H013") is None
 
+    def test_decoder_piped_to_shell_triggers(self) -> None:
+        for cmd in (
+            b"echo cGF5bG9hZA== | base64 -d | sh",
+            b"base64 --decode payload.b64 | bash",
+            b"echo 6c73 | xxd -r -p | sh",
+            b"echo 'hs' | rev | sh",
+            b"cat p | openssl enc -d -aes-256-cbc -k x | /bin/bash",
+        ):
+            ctx = _ctx(content=cmd, is_script=True)
+            assert _r_obfuscation(ctx, "H013") is not None, cmd
+
+    def test_octal_escapes_trigger(self) -> None:
+        ctx = _ctx(content=b"printf '\\154\\163\\040\\055\\154\\141' | sh", is_script=True)
+        assert _r_obfuscation(ctx, "H013") is not None
+
+    def test_long_command_substitution_no_trigger(self) -> None:
+        """$(...) longo e legítimo (git describe etc.) não é ofuscação."""
+        ctx = _ctx(content=b"V=$(git describe --tags --always --dirty --abbrev=12 --match 'v*')", is_script=True)
+        assert _r_obfuscation(ctx, "H013") is None
+
+    def test_decode_to_file_no_trigger(self) -> None:
+        ctx = _ctx(content=b"base64 -d in.b64 > out.bin", is_script=True)
+        assert _r_obfuscation(ctx, "H013") is None
+
 
 class TestRuleH014PtracePreload:
     def test_ptrace_triggers(self) -> None:
