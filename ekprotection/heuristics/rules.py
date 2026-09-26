@@ -96,8 +96,22 @@ _RE_EVAL_EXEC    = re.compile(
     re.I,
 )
 _RE_WGET_CURL    = re.compile(rb'wget\s+|curl\s+|fetch\s+http', re.I)
+# H005: antes exigia curl/wget e `| sh` em QUALQUER ponto do arquivo (sem
+# relação entre eles): um `curl` de health-check + um `| sh -c` não
+# relacionado disparava (falso positivo), e as formas reais de dropper
+# `curl | sudo bash`, `curl | python`, `bash <(curl ...)`, `sh -c "$(curl ...)"`
+# e `source <(curl ...)` passavam batido (falso negativo). Agora o downloader
+# e o executor precisam estar na MESMA linha, ligados por pipe ou por
+# substituição de processo/comando.
+_DL = rb'(?:curl|wget|fetch)\b'
+_INTERP = (rb'(?:sudo\s+(?:-\S+\s+)*)?(?:/[\w./-]*/)?'
+           rb'(?:bash|sh|zsh|ash|dash|python[23]?|perl|ruby|php)\b')
+_RE_DL_PIPE_EXEC = re.compile(
+    _DL + rb'[^\n;&]*?\|\s*' + _INTERP, re.I)
+_RE_DL_SUBST_EXEC = re.compile(
+    rb'(?:^|[\s;&|(])(?:bash|sh|zsh|ash|dash|source|\.)\s+(?:-\w+\s+)*'
+    rb'["\']?(?:<\(|\$\()\s*' + _DL, re.I | re.M)
 _RE_CHMOD_X      = re.compile(rb'chmod\s+[+]?[x7][0-9]*|chmod\s+0?[0-7]*[1357]', re.I)
-_RE_PIPE_SH      = re.compile(rb'\|\s*(bash|sh|zsh|ash|dash)\b', re.I)
 _RE_DEV_TCP      = re.compile(rb'/dev/tcp/', re.I)
 _RE_REVERSE_SH   = re.compile(rb'bash\s+-i|nc\s+-[el]|ncat\s+|socat\s+', re.I)
 _RE_PRIVESC      = re.compile(rb'sudo\s+-[isSu]|su\s+-[lc]|pkexec\b', re.I)
@@ -224,9 +238,8 @@ def _r_download_execute(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Download seguido de execução (wget/curl | sh)."""
     if not ctx.content_sample:
         return None
-    has_download = bool(_RE_WGET_CURL.search(ctx.content_sample))
-    has_pipe_sh  = bool(_RE_PIPE_SH.search(ctx.content_sample))
-    if has_download and has_pipe_sh:
+    if (_RE_DL_PIPE_EXEC.search(ctx.content_sample)
+            or _RE_DL_SUBST_EXEC.search(ctx.content_sample)):
         return RuleMatch(rid, "padrão download+execução (wget/curl | sh)")
     return None
 

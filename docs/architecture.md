@@ -518,6 +518,19 @@ disco mesmo.
   `TestRuleH013Obfuscation`; 3 falham sem o fix (stash só de `rules.py`).
   Suite completa **676/676**. Heurísticas H001–H015 revisadas nas
   últimas rodadas; próxima frente: H001/H003/H005+ linha a linha.
+- ✅ **H005 (download+execução) errava nas duas direções — corrigida
+  (2026-09-26)**. Antes exigia `curl`/`wget` e `| sh` em qualquer ponto do
+  arquivo, sem relação entre eles. Falso positivo: um `curl` de health-check
+  + um `| sh -c` não relacionado disparava. Falso negativo: `curl | sudo bash`,
+  `curl | python3`, `wget | /bin/sh`, `bash <(curl ...)`, `sh -c "$(curl ...)"`
+  e `source <(curl ...)` passavam batido. Agora downloader e executor
+  (bash/sh/zsh/ash/dash/python/perl/ruby/php, com `sudo` e path opcionais)
+  precisam estar na mesma linha, ligados por pipe ou por substituição
+  `<(...)`/`$(...)`. Download pra arquivo + execução em comando separado
+  (`curl -o a; bash a`) continua sem disparar (sem elo local; o `chmod +x`
+  é coberto por H020). `_RE_PIPE_SH` (morta) removida. +12 casos em
+  `TestRuleH005DownloadExecute`; 8 falham sem o fix (stash só de `rules.py`).
+  Suite completa **688/688**. Próxima frente: H001/H003 linha a linha.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback

