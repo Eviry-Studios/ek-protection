@@ -212,6 +212,33 @@ class TestRuleH003Base64:
         ctx = _ctx(content=b"base64 -d", is_script=False, extension=".txt")
         assert _r_base64_decode(ctx, "H003") is None
 
+    @pytest.mark.parametrize("payload", [
+        b"echo x | base64 --decode > f",
+        b"echo x | base64 -w 0 -d > f",
+        b"echo x | base64 -D",
+        b"exec(base64.b64decode(p))",
+        b"from base64 import b64decode\nb64decode(p)",
+        b"base64.urlsafe_b64decode(p)",
+        b"base64.decodebytes(p)",
+        b"use MIME::Base64; decode_base64($x)",
+        b"Base64.strict_decode64(x)",
+        b"eval(window.atob(x))",
+    ])
+    def test_base64_decode_other_forms_trigger(self, payload: bytes) -> None:
+        ctx = _ctx(content=payload, is_script=True)
+        assert _r_base64_decode(ctx, "H003") is not None
+
+    @pytest.mark.parametrize("payload", [
+        b"# see base64-decoder docs",
+        b"x = boatob(1)",
+        b"base64 -w0 file",
+        b"base64.b64encode(data)",
+        b"my_b64decoder = 1",
+    ])
+    def test_base64_lookalikes_no_trigger(self, payload: bytes) -> None:
+        ctx = _ctx(content=payload, is_script=True)
+        assert _r_base64_decode(ctx, "H003") is None
+
 
 class TestRuleH004EvalExec:
     def test_eval_triggers(self) -> None:

@@ -79,7 +79,19 @@ class HeuristicContext:
 # ---------------------------------------------------------------------------
 
 # Padrões regex compilados uma vez (performance)
-_RE_B64_DECODE   = re.compile(rb'base64\s*[-]d|base64_decode|atob\(', re.I)
+# H003: a regex antiga só pegava `base64 -d`, `base64_decode` (PHP) e `atob(`.
+# Passavam batido `base64 --decode`, `b64decode` (Python, a forma mais comum
+# em dropper), `base64.decodebytes`, `decode_base64` (Perl) e `decode64`
+# (Ruby); e casava por substring sem word-boundary (`base64-decoder` em
+# comentário, `boatob(`). Agora: flags do CLI (`-d`/`-D`/cluster/`--decode`,
+# após outras flags opcionais como `-w 0`) e funções de decode com \b.
+_RE_B64_DECODE   = re.compile(
+    rb'\bbase64\s+(?:(?:-\S+|\d+)\s+)*?(?:-[a-z]*d[a-z]*|--decode)(?![\w-])'
+    rb'|\b(?:urlsafe_|standard_)?b64decode\b'
+    rb'|\bbase64\.(?:decodebytes|decodestring)\b'
+    rb'|\bbase64_decode\b|\bdecode_base64\b|\b(?:strict_|urlsafe_)?decode64\b'
+    rb'|\batob\(',
+    re.I)
 # H004: forma Python/syscall exige parênteses (`eval(`/`exec(`/`execve(`).
 # Mas o builtin `eval` de shell não usa parênteses (`eval $cmd`,
 # `eval "$(curl ... )"`, `` eval `payload` `` — justamente a forma mais comum

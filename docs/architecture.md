@@ -530,7 +530,17 @@ disco mesmo.
   (`curl -o a; bash a`) continua sem disparar (sem elo local; o `chmod +x`
   é coberto por H020). `_RE_PIPE_SH` (morta) removida. +12 casos em
   `TestRuleH005DownloadExecute`; 8 falham sem o fix (stash só de `rules.py`).
-  Suite completa **688/688**. Próxima frente: H001/H003 linha a linha.
+  Suite completa **688/688**. Próxima frente: H001 (entropia) e H006+ linha a linha.
+- ✅ **H003 (decode base64) só cobria 3 formas e casava sem word-boundary —
+  corrigida (2026-09-27)**. Falso negativo: `base64 --decode`,
+  `base64 -w 0 -d`, `b64decode` (Python, a forma mais comum em dropper,
+  inclusive `urlsafe_b64decode`/`from base64 import b64decode`),
+  `base64.decodebytes`, `decode_base64` (Perl) e `decode64` (Ruby) passavam
+  batido. Falso positivo: `base64-decoder` em comentário e `boatob(`
+  disparavam por substring. Agora flags do CLI (`-d`/`-D`/cluster/`--decode`,
+  após outras flags opcionais) e funções de decode com `\b`. `base64 -w0`
+  (encode) e `b64encode` não disparam. +15 casos em `TestRuleH003Base64`;
+  10 falham sem o fix (stash só de `rules.py`). Suite completa **703/703**.
 - ✅ **Auto-scan no monitor** — feito (2026-08-27). `EKEngine._wire_auto_scan()`
   registra um callback no `MonitorManager` assim que o `ScanEngine` termina
   de iniciar (ordem de boot: monitor primeiro, scanner depois — callback
