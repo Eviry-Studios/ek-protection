@@ -168,6 +168,50 @@ class TestHasher:
     def test_file_entropy_missing(self) -> None:
         assert file_entropy("/nonexistent") == 0.0
 
+    def test_file_entropy_payload_after_64kb_was_invisible_before_fix(
+        self, tmp_path: Path
+    ) -> None:
+        # Reprodução exata do bug ao vivo: 64KB de padding baixa-entropia +
+        # payload aleatório logo depois. Antes do fix, só os primeiros
+        # 65536 bytes eram lidos -> entropia 0.0, payload nunca visto.
+        # Com amostragem distribuída (início/meio/fim), a janela do meio
+        # cai dentro do payload aleatório e a entropia sobe bem acima do
+        # 0.0 antigo -- deixa de ser um blind spot 100% determinístico.
+        f = tmp_path / "padded_payload.bin"
+        f.write_bytes(b"\x00" * 65536 + secrets.token_bytes(200_000))
+        e = file_entropy(f)
+        assert e > 5.0
+
+    def test_file_entropy_large_file_tail_payload_detected(self, tmp_path: Path) -> None:
+        # Arquivo acima do orçamento de amostragem (64KB): payload de alta
+        # entropia ocupando meio+fim do arquivo (2 das 3 janelas da
+        # amostragem distribuída caem inteiramente dentro do payload) é
+        # detectado. Um payload pequeno isolado numa única janela, diluído
+        # por padding de baixa entropia nas outras duas, pode não ser --
+        # essa é a limitação documentada acima (entropia é média sobre as
+        # janelas, não detecção de sub-região arbitrária).
+        f = tmp_path / "large_tail_payload.bin"
+        header = b"\x00" * 100_000
+        body   = secrets.token_bytes(400_000)
+        f.write_bytes(header + body)
+        e = file_entropy(f)
+        assert e > 5.0
+
+    def test_file_entropy_no_new_false_positive_on_moderate_entropy_binary(
+        self, tmp_path: Path
+    ) -> None:
+        # Regressão: dados de entropia moderada (não uniforme, típico de
+        # código compilado real) espalhados por um arquivo maior que o
+        # orçamento de amostragem não devem disparar o limiar de 7.2 só
+        # por passar a olhar meio/fim além do início -- verificado ao vivo
+        # contra ~3900 binários/libs reais do sistema (zero falsos
+        # positivos novos, 15 já existentes corrigidos).
+        f = tmp_path / "moderate_large.bin"
+        size = 300_000
+        f.write_bytes(bytes((i % 97) for i in range(size)))
+        e = file_entropy(f)
+        assert e < 7.2
+
 
 # ---------------------------------------------------------------------------
 # Testes: SignatureDB

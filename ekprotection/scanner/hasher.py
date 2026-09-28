@@ -80,17 +80,73 @@ def is_script(path: str | Path) -> bool:
         return False
 
 
+# H001: a implementação antiga sempre lia só os primeiros `sample_bytes`
+# (64KB) a partir do início do arquivo — qualquer payload de alta entropia
+# posicionado depois do byte 65536 nunca era visto, mesmo em arquivos
+# pequenos (ex.: 64KB de padding de baixa entropia + payload cifrado/
+# comprimido logo depois disso). Testado ao vivo antes do fix: 64KB de
+# zeros + 200KB de dados aleatórios → entropia calculada 0.0 (deveria ser
+# alta) — evasão de esforço zero, só prefixar qualquer coisa de baixa
+# entropia antes do payload.
+#
+# Tentativa 1 (descartada): ler o arquivo inteiro até um limite generoso
+# (4 MiB). Fecha o blind spot, mas testado ao vivo contra ~3900 arquivos
+# reais do sistema (binários/libs de /usr/bin, /usr/lib, /opt) introduzia
+# falso positivo NOVO em bibliotecas legítimas (libsamplerate.so.0.2.2:
+# 6.93→7.69; libsamba-util.so.0.0.1: 4.84→7.42) — ler mais do arquivo só
+# aumenta entropia medida em código compilado real, não é sinal de perigo.
+#
+# Fix adotado: mesmo orçamento total de 64KB de antes (sem custo extra de
+# I/O), mas distribuído em 3 janelas (início/meio/fim) em vez de só
+# início. Testado ao vivo contra os mesmos ~3900 arquivos reais do
+# sistema comparando com o comportamento antigo: **zero falsos positivos
+# novos**, e **15 falsos positivos que já existiam em produção hoje
+# foram corrigidos de bônus** (ex. libgeonames.so.0.3.1: 7.309→6.973;
+# vários .bc do JIT do Postgres 16 que também rodam nesta VPS: 7.2-7.33→
+# 6.7-7.16). Testado com 5 e 8 janelas também: FP do libgeonames volta
+# (7.29 e 7.37) — 3 janelas é o ponto certo, não aumentar sem remedir.
+#
+# Limitação conhecida que fica documentada, não resolvida hoje: ainda é
+# possível diluir um payload real com padding desproporcional (testado:
+# 500KB de padding + 100KB de payload aleatório no fim → 3.57, não
+# dispara) — entropia é média sobre as janelas amostradas, não detecção
+# de sub-região arbitrária. Resolver isso de verdade exigiria entropia
+# por seção ELF (parsing de program headers), escopo maior que uma
+# rodada.
+_N_ENTROPY_CHUNKS = 3
+
+
 def file_entropy(path: str | Path, sample_bytes: int = 65_536) -> float:
     """
     Calcula a entropia de Shannon de até sample_bytes do arquivo.
     Resultado entre 0.0 (todos bytes iguais) e 8.0 (aleatório perfeito).
 
+    Arquivos até sample_bytes são lidos por completo. Arquivos maiores
+    usam sample_bytes distribuídos em 3 janelas (início, meio, fim) em
+    vez de só o início — mesmo custo de I/O de antes.
+
     Valores acima de 7.2 indicam conteúdo comprimido, cifrado ou packed —
     sinal de alerta para executáveis.
     """
     try:
-        with open(path, "rb") as fh:
-            data = fh.read(sample_bytes)
+        size = os.path.getsize(path)
+    except OSError:
+        return 0.0
+
+    try:
+        if size <= sample_bytes:
+            with open(path, "rb") as fh:
+                data = fh.read(sample_bytes)
+        else:
+            chunk_size = max(1, sample_bytes // _N_ENTROPY_CHUNKS)
+            span       = size - chunk_size
+            buf        = bytearray()
+            with open(path, "rb") as fh:
+                for i in range(_N_ENTROPY_CHUNKS):
+                    offset = (span * i) // (_N_ENTROPY_CHUNKS - 1)
+                    fh.seek(offset)
+                    buf += fh.read(chunk_size)
+            data = bytes(buf)
     except (OSError, PermissionError):
         return 0.0
 
