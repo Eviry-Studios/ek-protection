@@ -125,7 +125,15 @@ _RE_DL_SUBST_EXEC = re.compile(
     rb'["\']?(?:<\(|\$\()\s*' + _DL, re.I | re.M)
 _RE_CHMOD_X      = re.compile(rb'chmod\s+[+]?[x7][0-9]*|chmod\s+0?[0-7]*[1357]', re.I)
 _RE_DEV_TCP      = re.compile(rb'/dev/tcp/', re.I)
-_RE_REVERSE_SH   = re.compile(rb'bash\s+-i|nc\s+-[el]|ncat\s+|socat\s+', re.I)
+# H006: "nc"/"ncat"/"socat" sem word-boundary casavam por substring em
+# qualquer palavra terminada nessas letras — `rsync -e ssh ...` (forma
+# comum de deploy/backup pra especificar shell remoto) e `rsync -e "ssh
+# -p 2222" ...` disparavam via "...nc -e" (rsync termina em "nc").
+# Lookbehind negativo evita casar quando "nc"/"ncat"/"socat" é sufixo de
+# outra palavra.
+_RE_REVERSE_SH   = re.compile(
+    rb'bash\s+-i|(?<![\w.\-])nc\s+-[el]|(?<![\w.\-])ncat\s+|(?<![\w.\-])socat\s+',
+    re.I)
 _RE_PRIVESC      = re.compile(rb'sudo\s+-[isSu]|su\s+-[lc]|pkexec\b', re.I)
 _RE_CRON_INSTALL = re.compile(rb'crontab\s+-[lu]|/etc/cron|/var/spool/cron', re.I)
 _RE_SHADOW_ETC   = re.compile(rb'/etc/shadow|/etc/passwd|/etc/sudoers', re.I)
