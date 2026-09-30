@@ -393,6 +393,64 @@ class TestRuleH007Privesc:
         ctx = _ctx(content=b"echo 'running as user'")
         assert _r_privesc(ctx, "H007") is None
 
+    def test_su_dash_alone_triggers(self) -> None:
+        # `su -` (login shell completo como root) não exige -l/-c;
+        # antes da correção não disparava nada.
+        ctx = _ctx(content=b"su -")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_su_bare_triggers(self) -> None:
+        ctx = _ctx(content=b"su")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_su_root_triggers(self) -> None:
+        ctx = _ctx(content=b"su root")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_sudo_su_chained_triggers(self) -> None:
+        ctx = _ctx(content=b"sudo su -")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_su_c_with_argument_triggers(self) -> None:
+        ctx = _ctx(content=b'su -c "id"')
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_su_login_long_flag_triggers(self) -> None:
+        ctx = _ctx(content=b"su --login")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_doas_triggers(self) -> None:
+        ctx = _ctx(content=b"doas /bin/sh")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_chmod_setuid_symbolic_triggers(self) -> None:
+        ctx = _ctx(content=b"chmod u+s /tmp/backdoor")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_chmod_setuid_octal_triggers(self) -> None:
+        ctx = _ctx(content=b"chmod 4755 /tmp/backdoor")
+        assert _r_privesc(ctx, "H007") is not None
+
+    def test_su_substring_no_false_positive(self) -> None:
+        # "thisu" termina em "su" — sem word-boundary a regex antiga
+        # disparava por substring.
+        ctx = _ctx(content=b"thisu -lc bla")
+        assert _r_privesc(ctx, "H007") is None
+
+    def test_sudo_l_list_no_false_positive(self) -> None:
+        # `sudo -l` só lista permissões, não é escalação.
+        ctx = _ctx(content=b"sudo -l")
+        assert _r_privesc(ctx, "H007") is None
+
+    def test_chmod_plain_no_false_positive(self) -> None:
+        ctx = _ctx(content=b"chmod -R 755 dir/")
+        assert _r_privesc(ctx, "H007") is None
+
+    def test_chmod_plus_x_no_false_positive(self) -> None:
+        # chmod +x é coberto por H020 (download+execução), não é setuid.
+        ctx = _ctx(content=b"chmod +x script.sh")
+        assert _r_privesc(ctx, "H007") is None
+
 
 class TestRuleH008CronPersistence:
     def test_crontab_u_triggers(self) -> None:

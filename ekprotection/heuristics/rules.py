@@ -134,7 +134,22 @@ _RE_DEV_TCP      = re.compile(rb'/dev/tcp/', re.I)
 _RE_REVERSE_SH   = re.compile(
     rb'bash\s+-i|(?<![\w.\-])nc\s+-[el]|(?<![\w.\-])ncat\s+|(?<![\w.\-])socat\s+',
     re.I)
-_RE_PRIVESC      = re.compile(rb'sudo\s+-[isSu]|su\s+-[lc]|pkexec\b', re.I)
+# H007: cobria só `sudo -i/-s/-S/-u` e `su -l/-c` (com "su" sem
+# word-boundary, casando por substring em qualquer palavra terminada em
+# "su" — `thisu -lc` disparava). Passavam batido as formas mais comuns de
+# troca pra root: `su -`, `su`/`su root` sozinho (sem -l/-c), `sudo su`
+# (encadeamento comum), `doas` (alternativa ao sudo em Alpine/BSD/distros
+# minimalistas) e o bit setuid via `chmod` (`chmod u+s`/`chmod 4755`,
+# T1548.001 — dá privilégio elevado persistente sem precisar de sudo/su
+# depois). Lookbehind negativo evita casar "su" como sufixo de palavra.
+_RE_PRIVESC      = re.compile(
+    rb'sudo\s+-[isSu]|'
+    rb'(?<![\w.\-])su\s+-(?:[lc]\b|-login\b)|'
+    rb'(?<![\w.\-])su(?:\s+(?:-(?=\s|$)|[A-Za-z_][\w.\-]*\b))?\s*(?=[;&|\n]|$)|'
+    rb'pkexec\b|'
+    rb'\bdoas\s|'
+    rb'chmod\s+(?:-\S+\s+)*(?:[ugoa]*\+s\b|(?<!\d)[4-7][0-7]{3}(?!\d)\b)',
+    re.I | re.M)
 _RE_CRON_INSTALL = re.compile(rb'crontab\s+-[lu]|/etc/cron|/var/spool/cron', re.I)
 _RE_SHADOW_ETC   = re.compile(rb'/etc/shadow|/etc/passwd|/etc/sudoers', re.I)
 # H010: acha o comando `rm` (word-boundary: `confirm`/`perform` não contam;
