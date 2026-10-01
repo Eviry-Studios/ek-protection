@@ -150,7 +150,20 @@ _RE_PRIVESC      = re.compile(
     rb'\bdoas\s|'
     rb'chmod\s+(?:-\S+\s+)*(?:[ugoa]*\+s\b|(?<!\d)[4-7][0-7]{3}(?!\d)\b)',
     re.I | re.M)
-_RE_CRON_INSTALL = re.compile(rb'crontab\s+-[lu]|/etc/cron|/var/spool/cron', re.I)
+# H008: `crontab -[lu]` original só cobria listagem (-l) e troca de usuário
+# (-u), deixando passar as duas formas mais comuns de instalar persistência:
+# `crontab <arquivo>` (sem nenhuma flag) e `crontab -` (lendo do stdin via
+# pipe, idioma clássico de dropper: `echo '* * * * * payload' | crontab -`).
+# Lookbehind negativo evita casar "crontab" como sufixo de outra palavra
+# (ex: "mycrontab -l"). FLAG cobre -l/-u/stdin bare; FILE cobre instalação
+# a partir de caminho de arquivo (absoluto, relativo, ~ ou $HOME), com ou
+# sem -u <user> antes. `-r`/`-e` ficam de fora de propósito (remoção não é
+# persistência; edição interativa não é facilmente scriptável sem o truque
+# de EDITOR, fora de escopo desta rodada).
+_RE_CRON_FLAG    = re.compile(rb'(?<![\w.\-])crontab\s+-(?:[lu]\b|(?![\w-]))', re.I)
+_RE_CRON_FILE    = re.compile(
+    rb'(?<![\w.\-])crontab\s+(?:-u\s+\S+\s+)?(?:\.{0,2}/|~|\$\{?HOME\}?)\S*', re.I)
+_RE_CRON_INSTALL = re.compile(rb'/etc/cron|/var/spool/cron', re.I)
 _RE_SHADOW_ETC   = re.compile(rb'/etc/shadow|/etc/passwd|/etc/sudoers', re.I)
 # H010: acha o comando `rm` (word-boundary: `confirm`/`perform` não contam;
 # `/bin/rm`, `sudo rm`, `xargs rm` contam) e captura os argumentos até o fim
@@ -308,7 +321,9 @@ def _r_cron_persistence(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Instalação de persistência via cron."""
     if not ctx.content_sample:
         return None
-    if _RE_CRON_INSTALL.search(ctx.content_sample):
+    if (_RE_CRON_FLAG.search(ctx.content_sample)
+            or _RE_CRON_FILE.search(ctx.content_sample)
+            or _RE_CRON_INSTALL.search(ctx.content_sample)):
         return RuleMatch(rid, "modificação de cron (possível persistência)")
     return None
 
