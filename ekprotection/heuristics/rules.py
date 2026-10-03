@@ -164,7 +164,15 @@ _RE_CRON_FLAG    = re.compile(rb'(?<![\w.\-])crontab\s+-(?:[lu]\b|(?![\w-]))', r
 _RE_CRON_FILE    = re.compile(
     rb'(?<![\w.\-])crontab\s+(?:-u\s+\S+\s+)?(?:\.{0,2}/|~|\$\{?HOME\}?)\S*', re.I)
 _RE_CRON_INSTALL = re.compile(rb'/etc/cron|/var/spool/cron', re.I)
-_RE_SHADOW_ETC   = re.compile(rb'/etc/shadow|/etc/passwd|/etc/sudoers', re.I)
+# H009, rodada 2026-10-03: faltavam /etc/gshadow (hash de senha de GRUPO,
+# mesma classe de segredo que /etc/shadow) e /etc/security/opasswd
+# (histórico de senhas antigas em hash, usado por PAM pra impedir reuso —
+# útil pra quebra offline mesmo sendo "antigo"). Achado novo, testado ao
+# vivo (passavam batido antes do fix). `/etc/master.passwd` (BSD) ficou
+# de fora de propósito — esta VPS é Linux, não existe esse arquivo aqui.
+_RE_SHADOW_ETC   = re.compile(
+    rb'/etc/shadow|/etc/passwd|/etc/sudoers|/etc/gshadow|/etc/security/opasswd',
+    re.I)
 # H010: acha o comando `rm` (word-boundary: `confirm`/`perform` não contam;
 # `/bin/rm`, `sudo rm`, `xargs rm` contam) e captura os argumentos até o fim
 # do comando. Flags e alvos são analisados em _r_rm_rf, não na regex.
@@ -222,8 +230,28 @@ _RE_MEMFD        = re.compile(
     re.I,
 )
 _RE_PACKED_UPX   = re.compile(rb'UPX!|This file is packed')
+# H009, rodada 2026-10-03: `id_rsa`/`id_ed25519`/`.ssh/id_` casavam por
+# substring sem olhar o que vem depois — `cat ~/.ssh/id_rsa.pub`,
+# `ssh-copy-id -i ~/.ssh/id_rsa.pub` e `scp ~/.ssh/id_ed25519.pub
+# deploy@host:~/.ssh/authorized_keys` disparavam como "acesso a
+# credencial/wallet", mas chave PÚBLICA não é segredo — é o idioma mais
+# comum de deploy/onboarding de servidor, dispararia toda hora em uso
+# legítimo. Testado ao vivo: confirmado falso positivo nas 2 variantes
+# (`id_rsa.pub`, `id_ed25519.pub`) e em qualquer nome dentro de `.ssh/id_*`
+# (ex. `id_ecdsa.pub`, chave custom `id_github.pub`). Fix em
+# `_r_sensitive_files`: olha o que vem depois do match (nome de arquivo
+# completo) e pula se terminar em `.pub` — feito em Python, não regex,
+# porque `[\w.-]*(?!\.pub)` sofre do mesmo problema de backtracking já
+# visto antes (o quantificador recua até um corte menor que escapa da
+# negação, como o lookahead quebrado documentado no H003).
+# `/etc/ssh/ssh_host_*_key` (chave privada de host SSH — rouba isso e dá
+# pra se passar pelo servidor/fazer MITM) entrou como achado novo (falso
+# negativo, testado ao vivo, passava batido); mesma lógica de `.pub`
+# evita disparar na chave pública do host (`ssh_host_rsa_key.pub`),
+# arquivo rotineiramente lido/distribuído (fingerprint, known_hosts).
 _RE_SECRET_PATHS = re.compile(
     rb'quarantine\.key|auth\.hash|wallet\.dat|id_rsa|id_ed25519|\.ssh/id_|'
+    rb'/etc/ssh/ssh_host_\w+_key|'
     rb'UTC--|keystore|seed\s*phrase|mnemonic|private[_ ]?key',
     re.I,
 )
@@ -341,8 +369,13 @@ def _r_sensitive_files(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     m = _RE_SHADOW_ETC.search(ctx.content_sample)
     if m:
         return RuleMatch(rid, f"acesso a arquivo sensível: {m.group().decode('utf-8', errors='replace')}")
-    m = _RE_SECRET_PATHS.search(ctx.content_sample)
-    if m:
+    for m in _RE_SECRET_PATHS.finditer(ctx.content_sample):
+        # nome de arquivo completo logo após o match (ex. "rsa.pub" depois
+        # de ".ssh/id_", ou ".pub" depois de "id_rsa" direto) — se terminar
+        # em .pub é chave PÚBLICA, não segredo (ver comentário no regex).
+        tail = re.match(rb'[\w.-]*', ctx.content_sample[m.end():]).group()
+        if tail.lower().endswith(b'.pub'):
+            continue
         return RuleMatch(rid, f"acesso local a credencial/wallet: {m.group().decode('utf-8', errors='replace')}")
     return None
 
@@ -594,9 +627,12 @@ ALL_RULES: list[HeuristicRule] = [
                   _match_fn=_r_cron_persistence),
 
     HeuristicRule("H009", "Acesso a Arquivos Sensíveis",
-                  "/etc/shadow, /etc/passwd, /etc/sudoers, ou credencial/wallet "
-                  "local (wallet.dat, id_rsa, keystore, mnemonic, quarantine.key, "
-                  "auth.hash) sem exigir upload de rede",
+                  "/etc/shadow, /etc/passwd, /etc/sudoers, /etc/gshadow, "
+                  "/etc/security/opasswd, chave privada de host SSH "
+                  "(/etc/ssh/ssh_host_*_key), ou credencial/wallet local "
+                  "(wallet.dat, id_rsa, keystore, mnemonic, quarantine.key, "
+                  "auth.hash) sem exigir upload de rede — chave PÚBLICA "
+                  "(.pub) não dispara",
                   "alto", 8, ("sensitive", "credential", "wallet"),
                   _match_fn=_r_sensitive_files),
 

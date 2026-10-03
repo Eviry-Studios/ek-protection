@@ -546,6 +546,58 @@ class TestRuleH009SensitiveFiles:
         ctx = _ctx(content=b"key lime pie recipe, private beach access")
         assert _r_sensitive_files(ctx, "H009") is None
 
+    # Achado 2026-10-03: `id_rsa`/`id_ed25519`/`.ssh/id_` casavam por
+    # substring sem olhar o que vem depois de ".pub" — chave pública não é
+    # segredo, e ler/copiar ela é o idioma mais comum de deploy de servidor
+    # (ssh-copy-id, scp pra authorized_keys). Estes casos cobrem o falso
+    # positivo (não deve disparar) e a regressão (chave privada de verdade
+    # continua disparando).
+    def test_id_rsa_pub_no_trigger(self) -> None:
+        ctx = _ctx(content=b"cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys")
+        assert _r_sensitive_files(ctx, "H009") is None
+
+    def test_id_ed25519_pub_no_trigger(self) -> None:
+        ctx = _ctx(content=b"cat ~/.ssh/id_ed25519.pub")
+        assert _r_sensitive_files(ctx, "H009") is None
+
+    def test_ssh_copy_id_pub_no_trigger(self) -> None:
+        ctx = _ctx(content=b"ssh-copy-id -i ~/.ssh/id_rsa.pub user@host")
+        assert _r_sensitive_files(ctx, "H009") is None
+
+    def test_scp_pub_key_to_authorized_keys_no_trigger(self) -> None:
+        ctx = _ctx(content=b"scp ~/.ssh/id_rsa.pub deploy@host:~/.ssh/authorized_keys")
+        assert _r_sensitive_files(ctx, "H009") is None
+
+    def test_custom_named_ssh_key_without_pub_still_triggers(self) -> None:
+        ctx = _ctx(content=b"cat ~/.ssh/id_github")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_id_rsa_private_key_regression_still_triggers(self) -> None:
+        ctx = _ctx(content=b"cat ~/.ssh/id_rsa >> /tmp/collected")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    # Achado 2026-10-03: faltava /etc/gshadow (hash de senha de grupo) e
+    # /etc/security/opasswd (histórico de senhas antigas em hash).
+    def test_gshadow_triggers(self) -> None:
+        ctx = _ctx(content=b"cat /etc/gshadow")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_opasswd_triggers(self) -> None:
+        ctx = _ctx(content=b"cat /etc/security/opasswd")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    # Achado 2026-10-03: /etc/ssh/ssh_host_*_key (chave privada de host SSH)
+    # passava batido — roubar isso permite impersonar o servidor/MITM.
+    # A chave pública do host (.pub) não deve disparar (rotineiramente
+    # lida/distribuída pra fingerprint/known_hosts).
+    def test_ssh_host_private_key_triggers(self) -> None:
+        ctx = _ctx(content=b"cp /etc/ssh/ssh_host_ed25519_key /tmp/x")
+        assert _r_sensitive_files(ctx, "H009") is not None
+
+    def test_ssh_host_public_key_no_trigger(self) -> None:
+        ctx = _ctx(content=b"cp /etc/ssh/ssh_host_rsa_key.pub /tmp/known")
+        assert _r_sensitive_files(ctx, "H009") is None
+
 
 class TestRuleH010RmRf:
     def test_rm_rf_root_triggers(self) -> None:
