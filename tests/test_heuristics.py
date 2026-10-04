@@ -666,6 +666,38 @@ class TestRuleH011ForkBomb:
         ctx = _ctx(content=b"echo hello; sleep 1")
         assert _r_fork_bomb(ctx, "H011") is None
 
+    def test_renamed_fork_bomb_pipe_triggers(self) -> None:
+        ctx = _ctx(content=b"a(){ a|a& };a")
+        assert _r_fork_bomb(ctx, "H011") is not None
+
+    def test_renamed_fork_bomb_pipe_long_name_triggers(self) -> None:
+        ctx = _ctx(content=b"bomb(){ bomb|bomb& };bomb")
+        assert _r_fork_bomb(ctx, "H011") is not None
+
+    def test_dot_named_fork_bomb_triggers(self) -> None:
+        ctx = _ctx(content=b".(){ .|.& };.")
+        assert _r_fork_bomb(ctx, "H011") is not None
+
+    def test_renamed_fork_bomb_double_background_triggers(self) -> None:
+        ctx = _ctx(content=b"x(){ x & x & };x")
+        assert _r_fork_bomb(ctx, "H011") is not None
+
+    def test_similar_prefix_names_do_not_trigger(self) -> None:
+        ctx = _ctx(content=b"deploy(){ deploy_step1 && deploy_step2; }; deploy")
+        assert _r_fork_bomb(ctx, "H011") is None
+
+    def test_legit_recursive_function_without_self_pipe_does_not_trigger(self) -> None:
+        ctx = _ctx(content=b"retry(){ echo trying; retry_inner; }; retry")
+        assert _r_fork_bomb(ctx, "H011") is None
+
+    def test_legit_function_single_background_does_not_trigger(self) -> None:
+        ctx = _ctx(content=b"cleanup(){ rm -f /tmp/x & }; cleanup")
+        assert _r_fork_bomb(ctx, "H011") is None
+
+    def test_truncated_name_after_call_does_not_trigger(self) -> None:
+        ctx = _ctx(content=b"a(){ a|a& };ab")
+        assert _r_fork_bomb(ctx, "H011") is None
+
 
 class TestRuleH012HistoryDeletion:
     def test_history_c_triggers(self) -> None:

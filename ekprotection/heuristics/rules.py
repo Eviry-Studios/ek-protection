@@ -194,6 +194,21 @@ _RE_C2_NET       = re.compile(rb'\b(?:curl|wget|nc)\b', re.I)
 _RE_CRYPTO_ADDR  = re.compile(rb'[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[0-9a-fA-F]{40}')
 _RE_IP_HARDCODED = re.compile(rb'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b')
 _RE_FORK_BOMB    = re.compile(rb':\(\)\s*\{|:\|\s*:&|forkbomb', re.I | re.S)
+# H011, rodada 2026-10-04: a regex acima só cobre a fork bomb clássica com
+# a função nomeada ":" (`:(){ :|:& };:`) — trocar o nome da função
+# (`a(){ a|a& };a`, `bomb(){ bomb|bomb& };bomb`, ou a variante sem pipe
+# `x(){ x & x & };x`) passa batido mesmo sendo o mesmo ataque, é só
+# trivialmente renomear pra evadir a detecção de string literal. Backreference
+# (\1/\2) amarra o nome capturado nos dois usos dentro do corpo e na chamada
+# final, então não precisa listar nomes — qualquer função que se autoinvoca
+# em pipe+background (ou duas vezes em background) e é chamada logo após
+# definida bate, sem casar substring parcial de nomes diferentes (`deploy`
+# vs `deploy_step1`, `a` vs `ab`) graças ao `(?!...)` no fim de cada ramo.
+_RE_FORK_BOMB_GENERIC = re.compile(
+    rb'([A-Za-z0-9_.:]{1,40})\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}\s*;\s*\1(?![A-Za-z0-9_.:])'
+    rb'|([A-Za-z0-9_.:]{1,40})\s*\(\)\s*\{\s*\2\s*&\s*\2\s*&\s*\}\s*;\s*\2(?![A-Za-z0-9_.:])',
+    re.I,
+)
 # history -c/-w e HISTFILE=/dev/null/unset HIST* eram as únicas formas
 # cobertas; malware/dropper real também usa `set +o history` (desliga log
 # de histórico sem tocar em HISTFILE), HISTFILE= vazio ("" ou '' também
@@ -425,11 +440,14 @@ def _r_rm_rf(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
 
 
 def _r_fork_bomb(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """Fork bomb clássica :(){ :|:& };:"""
+    """Fork bomb clássica :(){ :|:& };: ou renomeada (mesma estrutura com
+    outro nome de função, ver H011 em _RE_FORK_BOMB_GENERIC)."""
     if not ctx.content_sample:
         return None
     if _RE_FORK_BOMB.search(ctx.content_sample):
         return RuleMatch(rid, "fork bomb detectada")
+    if _RE_FORK_BOMB_GENERIC.search(ctx.content_sample):
+        return RuleMatch(rid, "fork bomb detectada (função renomeada)")
     return None
 
 
