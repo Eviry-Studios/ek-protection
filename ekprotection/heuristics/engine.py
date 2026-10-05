@@ -38,6 +38,7 @@ from typing      import Any, Optional
 
 from ekprotection.config.manager import ConfigManager
 from ekprotection.logs.models    import EventType, LogLevel
+from ekprotection.scanner.hasher import file_entropy
 
 from .rules import (
     ALL_RULES, RULES_BY_ID,
@@ -245,15 +246,19 @@ class HeuristicEngine:
         is_elf_bin = (content[:4] == b"\x7fELF") if content and len(content) >= 4 else False
         is_sh      = (content[:2] == b"#!")      if content and len(content) >= 2 else False
 
-        # Entropia (só para executáveis — evita custo desnecessário)
+        # Entropia (só para executáveis — evita custo desnecessário). Usa
+        # file_entropy() de scanner/hasher.py (amostragem em 3 janelas
+        # início/meio/fim, fix do H001 em 2026-09-28) em vez de recalcular
+        # aqui sobre só os primeiros CONTENT_SAMPLE_SIZE bytes já lidos:
+        # essa segunda implementação, duplicada, nunca recebeu aquele fix —
+        # o monitoramento em tempo real (este caminho, usado por analyze())
+        # continuava 100% vulnerável ao blind spot original (payload de
+        # alta entropia após o byte 65536 nunca era visto) mesmo depois do
+        # fix, porque o scan sob demanda (scanner/engine.py) é o único que
+        # chamava a versão corrigida.
         entropy: Optional[float] = None
         if content and (is_exec or is_elf_bin) and len(content) >= 256:
-            import math
-            freq    = [0] * 256
-            for b in content:
-                freq[b] += 1
-            n       = len(content)
-            entropy = -sum((c/n) * math.log2(c/n) for c in freq if c > 0)
+            entropy = file_entropy(path)
 
         return HeuristicContext(
             path            = path,

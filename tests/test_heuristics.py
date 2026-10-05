@@ -37,6 +37,7 @@ from ekprotection.heuristics.rules      import (
     _r_hidden_executable, _r_no_extension_elf, _r_secret_exfiltration,
 )
 from ekprotection.heuristics.engine     import HeuristicEngine, HeuristicResult
+from ekprotection.scanner.hasher        import file_entropy
 
 
 # ---------------------------------------------------------------------------
@@ -1133,6 +1134,29 @@ class TestHeuristicEngine:
         r = engine.analyze_bytes("/tmp/test.sh", content)
         assert r.is_suspicious
         assert "H006" in r.rules_fired
+
+    def test_analyze_uses_windowed_entropy_not_duplicate_naive_calc(
+        self, engine: HeuristicEngine, tmp_path: Path
+    ) -> None:
+        """H001 (fix 2026-09-28, commit 9dd730d) corrigiu a amostragem de
+        entropia em 3 janelas (início/meio/fim) só em scanner/hasher.py
+        (file_entropy, usado pelo scan sob demanda). O motor heurístico
+        usado por analyze() -- o caminho do monitoramento em tempo real --
+        recalculava a entropia por conta própria, sobre só os primeiros
+        CONTENT_SAMPLE_SIZE (64KB) bytes já lidos para content_sample, uma
+        segunda implementação que nunca recebeu aquele fix: o blind spot
+        original do H001 (payload de alta entropia após o byte 65536 nunca
+        visto) continuava 100% aberto neste caminho mesmo depois do fix.
+        Reprodução ao vivo antes do fix de hoje: 64KB de zeros + 200KB de
+        payload aleatório -> engine.analyze() calculava entropia 0.0 (só
+        viu os zeros) enquanto hasher.file_entropy() já dava ~6.2 (janelas
+        do meio/fim caem dentro do payload aleatório)."""
+        f = tmp_path / "padded.elf"
+        f.write_bytes(b"\x7fELF" + b"\x00" * 65536 + secrets.token_bytes(200_000))
+        f.chmod(0o755)
+        r = engine.analyze(f)
+        assert r.context_summary["entropy"] == round(file_entropy(f), 3)
+        assert r.context_summary["entropy"] > 1.0  # não mais o 0.0 do calculo antigo
 
     def test_disabled_rule_not_fired(self, cfg: ConfigManager, tmp_path: Path) -> None:
         cfg.set("heuristics.disabled_rules", ["H011"])
