@@ -932,6 +932,27 @@ class TestRuleH017HardcodedIP:
         ctx = _ctx(content=b"1.2.3.4 and 5.6.7.8", is_elf=False)
         assert _r_hardcoded_ip(ctx, "H017") is None
 
+    def test_172_16_to_31_rfc1918_no_trigger(self) -> None:
+        # Faixa privada real: 172.16.0.0/12 (2o octeto 16-31).
+        ctx = _ctx(content=b"lan hosts 172.16.0.5 and 172.31.0.9", is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_172_outside_rfc1918_range_triggers(self) -> None:
+        # "172." sozinho não é privado — só 172.16-31.x.x é RFC1918.
+        # 172.67.x.x (Cloudflare) e 172.217.x.x (Google) são faixas
+        # PÚBLICAS reais; C2 hardcoded ali não pode passar como "IP local".
+        ctx = _ctx(content=b"beacon to 172.67.1.1 and 172.67.2.2", is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is not None
+
+        ctx2 = _ctx(content=b"beacon to 172.217.1.1 and 172.217.2.2", is_elf=True)
+        assert _r_hardcoded_ip(ctx2, "H017") is not None
+
+    def test_172_boundary_octets_15_and_32_trigger(self) -> None:
+        # 172.15.x.x e 172.32.x.x ficam fora por 1 do range 16-31 —
+        # confirma que o corte não "vaza" pros vizinhos adjacentes.
+        ctx = _ctx(content=b"beacon to 172.15.0.1 and 172.32.0.1", is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is not None
+
 
 class TestRuleH018CryptoStrings:
     def test_bitcoin_address_triggers(self) -> None:

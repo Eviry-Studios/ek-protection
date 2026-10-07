@@ -520,6 +520,22 @@ def _r_packed_upx(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+def _is_rfc1918_or_loopback(ip: bytes) -> bool:
+    """127.0.0.0/8, 10.0.0.0/8, 192.168.0.0/16, ou 172.16.0.0/12 (só o
+    2º octeto 16-31 — "172." sozinho pega metade errada: 172.67.x.x
+    (Cloudflare) e 172.217.x.x (Google) são faixas PÚBLICAS reais, não
+    RFC1918, e C2 hardcoded ali passava batido como "IP local")."""
+    if ip.startswith((b"127.", b"10.", b"192.168.")):
+        return True
+    if ip.startswith(b"172."):
+        try:
+            second_octet = int(ip.split(b".", 2)[1])
+        except (IndexError, ValueError):
+            return False
+        return 16 <= second_octet <= 31
+    return False
+
+
 def _r_hardcoded_ip(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """IPs hardcoded no binário (possível C2)."""
     if not ctx.content_sample or not ctx.is_elf:
@@ -528,7 +544,7 @@ def _r_hardcoded_ip(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     # Filtra IPs locais e de loopback
     external = [
         ip.decode("utf-8", errors="replace") for ip in ips
-        if not ip.startswith((b"127.", b"192.168.", b"10.", b"172."))
+        if not _is_rfc1918_or_loopback(ip)
     ]
     if len(external) >= 2:
         return RuleMatch(rid, f"{len(external)} IPs externos hardcoded",
