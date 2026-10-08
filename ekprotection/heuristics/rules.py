@@ -107,7 +107,12 @@ _RE_EVAL_EXEC    = re.compile(
     rb"|\beval\s+['\"]?(?:\$\(|\$\{|\$[A-Za-z_]|`)",
     re.I,
 )
-_RE_WGET_CURL    = re.compile(rb'wget\s+|curl\s+|fetch\s+http', re.I)
+# H020: "wget"/"curl" sem word-boundary casavam por substring em qualquer
+# identificador terminado nessas letras seguido de espaço — "libcurl
+# bindings for python", "mycurl file.sh --download", "downloadwget
+# http://..." disparavam como comando de download real, mesma classe de
+# bug já vista em H006 (nc/ncat/socat) e H008 (crontab).
+_RE_WGET_CURL    = re.compile(rb'\bwget\s+|\bcurl\s+|\bfetch\s+http', re.I)
 # H005: antes exigia curl/wget e `| sh` em QUALQUER ponto do arquivo (sem
 # relação entre eles): um `curl` de health-check + um `| sh -c` não
 # relacionado disparava (falso positivo), e as formas reais de dropper
@@ -123,7 +128,19 @@ _RE_DL_PIPE_EXEC = re.compile(
 _RE_DL_SUBST_EXEC = re.compile(
     rb'(?:^|[\s;&|(])(?:bash|sh|zsh|ash|dash|source|\.)\s+(?:-\w+\s+)*'
     rb'["\']?(?:<\(|\$\()\s*' + _DL, re.I | re.M)
-_RE_CHMOD_X      = re.compile(rb'chmod\s+[+]?[x7][0-9]*|chmod\s+0?[0-7]*[1357]', re.I)
+# H020: só cobria "chmod +x" literal ou formas octais (755/700/...).
+# Formas simbólicas com classe explícita ("chmod u+x", "chmod a+x",
+# "chmod go+x"), com múltiplas permissões junto da execução ("chmod
+# a+rx"), e com flag antes do modo ("chmod -R +x dir", "chmod -Rv u+x
+# dir") — todas idiomas extremamente comuns em script de instalação —
+# passavam batido. Flags curtas (-R, -v, -Rv...) agora são toleradas
+# antes do modo; a forma simbólica exige "+" seguido de um bloco de
+# letras rwxXst que contenha pelo menos um x/X, em qualquer ordem.
+_RE_CHMOD_X      = re.compile(
+    rb'chmod\s+(?:-[a-zA-Z]+\s+)*'
+    rb'(?:[ugoa]*[+][rwxXst]*[xX][rwxXst]*|[x7][0-9]*|0?[0-7]*[1357])',
+    re.I,
+)
 _RE_DEV_TCP      = re.compile(rb'/dev/tcp/', re.I)
 # H006: "nc"/"ncat"/"socat" sem word-boundary casavam por substring em
 # qualquer palavra terminada nessas letras — `rsync -e ssh ...` (forma
