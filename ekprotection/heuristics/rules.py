@@ -608,13 +608,38 @@ def _r_chmod_plus_x(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+_HIDDEN_EXEC_ALLOWLIST = {".xsession", ".xinitrc", ".Xclients"}
+
+
+def _is_direct_home_dir(dirname: str) -> bool:
+    """``/home/<user>`` ou ``/root``, sem subdiretório — é exatamente onde
+    display/session managers (lightdm, gdm, xdm, ``startx``) procuram e
+    executam ``.xsession``/``.xinitrc``/``.Xclients`` de verdade. Caminho
+    aninhado (ex. ``/home/user/.config/.xsession``) não é onde o DM olha,
+    então não ganha a mesma confiança."""
+    if dirname == "/root":
+        return True
+    parts = dirname.split("/")
+    return len(parts) == 3 and parts[1] == "home" and parts[2] != ""
+
+
 def _r_hidden_executable(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """Arquivo oculto (começa com .) com bit de execução."""
+    """Arquivo oculto (começa com .) com bit de execução — exceto os
+    scripts de início de sessão X padrão do sistema quando estão direto
+    na home do usuário/root. Achado ao vivo: ``/etc/skel/.xsession``
+    (shipped por padrão em Debian/Ubuntu, copiado pra TODA conta nova) e
+    `/home/hermes/.xsession` têm mode 755 e são shell scripts legítimos —
+    display managers os executam diretamente por design, não é evasão
+    nem uso incomum. Sem a exceção, qualquer sistema com ambiente desktop
+    dispararia essa regra em praticamente toda conta de usuário."""
     import os
     name = os.path.basename(ctx.path)
-    if name.startswith(".") and ctx.is_executable:
-        return RuleMatch(rid, f"arquivo oculto executável: {name}")
-    return None
+    if not (name.startswith(".") and ctx.is_executable):
+        return None
+    dirname = os.path.dirname(ctx.path)
+    if name in _HIDDEN_EXEC_ALLOWLIST and _is_direct_home_dir(dirname):
+        return None
+    return RuleMatch(rid, f"arquivo oculto executável: {name}")
 
 
 def _r_secret_exfiltration(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:

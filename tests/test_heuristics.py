@@ -1088,6 +1088,41 @@ class TestRuleH021HiddenExec:
         ctx = _ctx(path="/home/user/.bashrc", is_executable=False)
         assert _r_hidden_executable(ctx, "H021") is None
 
+    # Achado ao vivo (rodada 2026-10-09): /etc/skel/.xsession e
+    # /home/hermes/.xsession, shipped por padrão no Debian/Ubuntu (mode
+    # 755), disparavam como "oculto executável" — falso positivo real em
+    # qualquer conta de usuário com ambiente desktop, não é malware.
+    def test_xsession_in_home_no_trigger(self) -> None:
+        ctx = _ctx(path="/home/hermes/.xsession", is_executable=True)
+        assert _r_hidden_executable(ctx, "H021") is None
+
+    def test_xinitrc_and_xclients_in_home_no_trigger(self) -> None:
+        for name in (".xinitrc", ".Xclients"):
+            ctx = _ctx(path=f"/home/hermes/{name}", is_executable=True)
+            assert _r_hidden_executable(ctx, "H021") is None, name
+
+    def test_xsession_in_root_home_no_trigger(self) -> None:
+        ctx = _ctx(path="/root/.xsession", is_executable=True)
+        assert _r_hidden_executable(ctx, "H021") is None
+
+    def test_xsession_nested_path_still_triggers(self) -> None:
+        # Não é onde nenhum display manager de verdade procura
+        # ".xsession" — caminho aninhado não ganha a mesma confiança do
+        # que o DM realmente executa, pra não abrir uma rota de evasão
+        # óbvia (dropar payload disfarçado de ".xsession" fora da home).
+        ctx = _ctx(path="/home/hermes/.config/.xsession", is_executable=True)
+        assert _r_hidden_executable(ctx, "H021") is not None
+
+    def test_xsession_outside_home_still_triggers(self) -> None:
+        ctx = _ctx(path="/tmp/.xsession", is_executable=True)
+        assert _r_hidden_executable(ctx, "H021") is not None
+
+    def test_similarly_named_hidden_file_still_triggers(self) -> None:
+        # Nome parecido mas fora da allowlist exata continua disparando
+        # — não é um relaxamento genérico de ".x*"/sessão.
+        ctx = _ctx(path="/home/hermes/.xsessionrc", is_executable=True)
+        assert _r_hidden_executable(ctx, "H021") is not None
+
 
 class TestRuleH022ElfNoExtension:
     def test_elf_in_home_triggers(self) -> None:
