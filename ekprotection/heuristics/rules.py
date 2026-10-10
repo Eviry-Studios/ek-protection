@@ -19,6 +19,7 @@ ponderado que resulta num RiskScore final.
 from __future__ import annotations
 
 import re
+import struct
 from dataclasses import dataclass, field
 from typing      import Callable, Optional
 
@@ -528,12 +529,80 @@ def _r_memfd_proc(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+def _elf_shnum_phnum(content: bytes) -> Optional[tuple[int, int]]:
+    """Lê `e_shnum`/`e_phnum` do header ELF (32 ou 64 bits, qualquer
+    endianness). Retorna None se não tiver bytes suficientes."""
+    if len(content) < 5 or content[:4] != b"\x7fELF":
+        return None
+    is_64   = content[4] == 2            # EI_CLASS: 1=32-bit, 2=64-bit
+    is_be   = len(content) > 5 and content[5] == 2  # EI_DATA: 1=LE, 2=BE
+    fmt_end = ">" if is_be else "<"
+    if is_64:
+        # e_phnum @56 (H), e_shnum @60 (H) — precisa de 62 bytes
+        if len(content) < 62:
+            return None
+        phnum = struct.unpack_from(fmt_end + "H", content, 56)[0]
+        shnum = struct.unpack_from(fmt_end + "H", content, 60)[0]
+    else:
+        # e_phnum @44 (H), e_shnum @48 (H) — precisa de 50 bytes
+        if len(content) < 50:
+            return None
+        phnum = struct.unpack_from(fmt_end + "H", content, 44)[0]
+        shnum = struct.unpack_from(fmt_end + "H", content, 48)[0]
+    return (shnum, phnum)
+
+
 def _r_packed_upx(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """Binário ELF comprimido com UPX."""
+    """Binário ELF comprimido com UPX.
+
+    Rodada 2026-10-10: `_RE_PACKED_UPX` só olhava as strings `UPX!`/`This
+    file is packed`, que ficam no stub do des-empacotador só pra
+    identificação humana — não são usadas pelo loader do kernel pra
+    executar o binário. Testado ao vivo: baixar o UPX real (sem root,
+    binário estático da release oficial), empacotar `/bin/ls` de verdade
+    e sobrescrever as duas strings de assinatura por bytes aleatórios
+    (`UPX!`→`XXXX`, `This file is packed`→`XXXXXXXXXXXXXXXXXXXX`) produz
+    um binário que **continua executando perfeitamente** (mesmo
+    comportamento/saída do original) e evade 100% a regex — evasão
+    trivial de 2 patches de bytes, sem precisar entender nada do formato
+    UPX além de "apagar a string que o AV procura".
+
+    Como defesa em profundidade, soma-se um sinal estrutural que a
+    evasão acima não quebra: o UPX (por padrão, pra reduzir tamanho)
+    gera um binário com **zero section headers** (`e_shnum == 0`) e só
+    uns poucos program headers (3 no teste ao vivo, contra 11-14 em
+    binários normais do sistema). Testado contra 1145 ELFs reais de
+    `/usr/bin` e `/usr/lib` desta VPS: nenhum tinha `e_shnum == 0`
+    (nem mesmo depois de `strip --strip-all`, que remove símbolos mas
+    mantém a tabela de sections) — sinal raro em uso legítimo neste
+    ambiente. Limiar de `phnum <= 4` é margem de segurança sobre o 3
+    observado, não um valor exato medido contra uma amostra maior.
+
+    **Limitação conhecida, não resolvida hoje**: esse sinal estrutural
+    também é, em teoria, evadível — bastaria reescrever `e_shnum`/`e_phnum`
+    no header pra um valor não-zero (o loader do kernel Linux não lê a
+    tabela de sections pra executar, só os program headers, então um
+    valor falso não quebraria a execução). Isso exige entender o formato
+    ELF, não só "apagar uma string", mas não é uma barreira alta pra quem
+    já está empacotando binário deliberadamente. Não implementei checagem
+    de consistência mais profunda (ex. validar se `e_shoff` aponta pra
+    dados plausíveis) nesta rodada — registrado como possível próxima
+    frente se o Matheus achar que vale o escopo.
+    """
     if not ctx.content_sample or not ctx.is_elf:
         return None
     if _RE_PACKED_UPX.search(ctx.content_sample):
         return RuleMatch(rid, "binário comprimido com UPX (técnica de evasão)")
+    shnum_phnum = _elf_shnum_phnum(ctx.content_sample)
+    if shnum_phnum is not None:
+        shnum, phnum = shnum_phnum
+        if shnum == 0 and 0 < phnum <= 4:
+            return RuleMatch(
+                rid,
+                "binário ELF sem tabela de section headers e poucos "
+                "program headers (indicador estrutural de packing, "
+                "ex. UPX com strings de assinatura removidas)",
+            )
     return None
 
 

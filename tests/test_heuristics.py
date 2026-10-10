@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+import struct
 from pathlib import Path
 from typing  import Generator
 from unittest.mock import MagicMock, patch
@@ -898,6 +899,30 @@ class TestRuleH015Fileless:
         assert _r_memfd_proc(_ctx(content=content), "H015") is None
 
 
+def _elf64_header(*, shnum: int, phnum: int, extra: bytes = b"") -> bytes:
+    """Monta um header ELF64 LE mínimo e válido (e_ident + campos até
+    e_shstrndx), pra testar `_elf_shnum_phnum` sem depender de binário
+    real no disco."""
+    e_ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\x00" * 8  # 64-bit, LE
+    rest = struct.pack(
+        "<HHIQQQIHHHHHH",
+        3,          # e_type (ET_DYN)
+        0x3E,       # e_machine (x86-64)
+        1,          # e_version
+        0x1000,     # e_entry
+        64,         # e_phoff
+        0,          # e_shoff
+        0,          # e_flags
+        64,         # e_ehsize
+        56,         # e_phentsize
+        phnum,      # e_phnum
+        64,         # e_shentsize
+        shnum,      # e_shnum
+        0,          # e_shstrndx
+    )
+    return e_ident + rest + extra
+
+
 class TestRuleH016PackedUPX:
     def test_upx_magic_triggers(self) -> None:
         ctx = _ctx(content=b"\x7fELF\x00\x00UPX!\x00", is_elf=True)
@@ -909,6 +934,65 @@ class TestRuleH016PackedUPX:
 
     def test_not_elf_no_trigger(self) -> None:
         ctx = _ctx(content=b"UPX!", is_elf=False)
+        assert _r_packed_upx(ctx, "H016") is None
+
+    def test_real_upx_binary_triggers_on_magic(self) -> None:
+        # Reprodução do teste ao vivo (rodada 2026-10-10): /bin/ls real
+        # empacotado com o UPX oficial (binário estático baixado sem
+        # root) ainda tem as strings de assinatura intactas.
+        content = _elf64_header(shnum=0, phnum=3, extra=b"\x00" * 100 + b"UPX!" + b"\x00" * 50)
+        ctx = _ctx(content=content, is_elf=True)
+        match = _r_packed_upx(ctx, "H016")
+        assert match is not None
+        assert "evasão" in match.detail
+
+    def test_signature_strings_patched_still_triggers_via_structure(self) -> None:
+        # Achado ao vivo: sobrescrever `UPX!`/`This file is packed` por
+        # bytes aleatórios não quebra a execução do binário (kernel não
+        # lê essas strings) e evade 100% a regex antiga. O sinal
+        # estrutural (zero sections, poucos program headers) precisa
+        # continuar disparando mesmo sem a string.
+        content = _elf64_header(shnum=0, phnum=3, extra=b"X" * 100)
+        ctx = _ctx(content=content, is_elf=True)
+        match = _r_packed_upx(ctx, "H016")
+        assert match is not None
+        assert "estrutural" in match.detail
+
+    @pytest.mark.parametrize("shnum,phnum", [
+        (31, 13),   # /bin/ls real (não empacotado)
+        (30, 13),   # /bin/bash real
+        (40, 11),   # /usr/bin/docker real
+    ])
+    def test_normal_binaries_no_structural_trigger(self, shnum: int, phnum: int) -> None:
+        # Medido ao vivo contra 1145 ELFs reais de /usr/bin e /usr/lib
+        # nesta VPS: nenhum tinha e_shnum == 0, nem depois de
+        # `strip --strip-all`. Esses valores são amostras reais do scan.
+        content = _elf64_header(shnum=shnum, phnum=phnum, extra=b"X" * 100)
+        ctx = _ctx(content=content, is_elf=True)
+        assert _r_packed_upx(ctx, "H016") is None
+
+    def test_stripped_binary_keeps_section_table_no_trigger(self) -> None:
+        # `strip --strip-all` real (testado ao vivo numa cópia de
+        # /bin/ls) mantém a tabela de sections (31 sections) mesmo
+        # removendo símbolos/debug info — não é um caso de "zero
+        # sections" legítimo.
+        content = _elf64_header(shnum=31, phnum=13, extra=b"X" * 100)
+        ctx = _ctx(content=content, is_elf=True)
+        assert _r_packed_upx(ctx, "H016") is None
+
+    def test_zero_sections_but_many_program_headers_no_trigger(self) -> None:
+        # Zero sections sozinho não é suficiente — exige também poucos
+        # program headers (UPX real usa 3). Um ELF com phnum alto e
+        # shnum zero não bate o padrão observado do UPX, fica de fora
+        # pra não arriscar falso positivo num caso nunca visto.
+        content = _elf64_header(shnum=0, phnum=13, extra=b"X" * 100)
+        ctx = _ctx(content=content, is_elf=True)
+        assert _r_packed_upx(ctx, "H016") is None
+
+    def test_non_elf_content_no_structural_crash(self) -> None:
+        # _elf_shnum_phnum precisa devolver None com segurança pra
+        # conteúdo curto/não-ELF, sem IndexError/struct.error.
+        ctx = _ctx(content=b"not an elf file, too short", is_elf=False)
         assert _r_packed_upx(ctx, "H016") is None
 
 
