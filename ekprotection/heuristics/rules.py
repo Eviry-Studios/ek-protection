@@ -124,8 +124,12 @@ _RE_WGET_CURL    = re.compile(rb'\bwget\s+|\bcurl\s+|\bfetch\s+http', re.I)
 _DL = rb'(?:curl|wget|fetch)\b'
 _INTERP = (rb'(?:sudo\s+(?:-\S+\s+)*)?(?:/[\w./-]*/)?'
            rb'(?:bash|sh|zsh|ash|dash|python[23]?|perl|ruby|php)\b')
+# Bound de 4096 no trecho entre o downloader e o pipe (2026-10-11, mesmo padrão de H012/H015/H023): sem ele, uma linha
+# longa com "curl"/"wget" repetidos e sem pipe fazia cada tentativa varrer o resto da linha -> O(n²) medido ao vivo
+# (64KB 1,06s, 128KB 4,08s; 1 MiB ~268s com o arquivo inteiro). Só apareceu com anchors misturados numa linha, por isso
+# a auditoria de 2026-10-06 (um anchor por vez) não pegou. Pré-requisito para subir CONTENT_SAMPLE_SIZE.
 _RE_DL_PIPE_EXEC = re.compile(
-    _DL + rb'[^\n;&]*?\|\s*' + _INTERP, re.I)
+    _DL + rb'[^\n;&]{0,4096}?\|\s*' + _INTERP, re.I)
 _RE_DL_SUBST_EXEC = re.compile(
     rb'(?:^|[\s;&|(])(?:bash|sh|zsh|ash|dash|source|\.)\s+(?:-\w+\s+)*'
     rb'["\']?(?:<\(|\$\()\s*' + _DL, re.I | re.M)

