@@ -1225,6 +1225,73 @@ class TestRuleH022ElfNoExtension:
         ctx = _ctx(path="/home/user/noext", is_elf=False, extension="")
         assert _r_no_extension_elf(ctx, "H022") is None
 
+    # --- achado ao vivo (2026-10-11): 131 ELFs sem extensão legítimos
+    # escaneados nesta VPS real, fora dos std_dirs, nenhum deles dropper ---
+
+    def test_venv_bin_python_no_trigger(self) -> None:
+        ctx = _ctx(path="/home/hermes/myproject/venv/bin/python",
+                    is_elf=True, extension="")
+        assert _r_no_extension_elf(ctx, "H022") is None
+
+    def test_dot_venv_bin_python3_versioned_no_trigger(self) -> None:
+        ctx = _ctx(path="/home/hermes/ek-protection-lab/repo/.venv/bin/python3.12",
+                    is_elf=True, extension="")
+        assert _r_no_extension_elf(ctx, "H022") is None
+
+    def test_nvm_node_binary_no_trigger(self) -> None:
+        ctx = _ctx(
+            path="/home/hermes/.nvm/versions/node/v22.23.2/bin/node",
+            is_elf=True, extension="",
+        )
+        assert _r_no_extension_elf(ctx, "H022") is None
+
+    def test_node_modules_native_binary_no_trigger(self) -> None:
+        ctx = _ctx(
+            path="/home/hermes/work/frontend/node_modules/@esbuild/linux-x64/bin/esbuild",
+            is_elf=True, extension="",
+        )
+        assert _r_no_extension_elf(ctx, "H022") is None
+
+    def test_playwright_cache_binary_no_trigger(self) -> None:
+        ctx = _ctx(
+            path="/home/hermes/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome",
+            is_elf=True, extension="",
+        )
+        assert _r_no_extension_elf(ctx, "H022") is None
+
+    def test_update_alternatives_symlink_no_trigger(self) -> None:
+        ctx = _ctx(path="/etc/alternatives/awk", is_elf=True, extension="")
+        assert _r_no_extension_elf(ctx, "H022") is None
+
+    # --- não deve abrir rota de evasão óbvia: nome certo no lugar errado
+    # (ou lugar certo com nome errado) continua disparando normalmente ---
+
+    def test_venv_lookalike_dir_wrong_bin_name_still_triggers(self) -> None:
+        # "venv/bin/" mas o arquivo não se chama python/python3.X —
+        # payload disfarçado de dependência da venv continua detectado.
+        ctx = _ctx(path="/home/user/project/venv/bin/backdoor",
+                    is_elf=True, extension="")
+        assert _r_no_extension_elf(ctx, "H022") is not None
+
+    def test_python_name_outside_venv_bin_still_triggers(self) -> None:
+        # nome "python" mas fora de um <algo>venv/bin/ — não é a cópia
+        # real do interpretador, continua disparando.
+        ctx = _ctx(path="/tmp/python", is_elf=True, extension="")
+        assert _r_no_extension_elf(ctx, "H022") is not None
+
+    def test_nvm_lookalike_wrong_bin_name_still_triggers(self) -> None:
+        ctx = _ctx(
+            path="/home/user/.nvm/versions/node/v22.0.0/bin/backdoor",
+            is_elf=True, extension="",
+        )
+        assert _r_no_extension_elf(ctx, "H022") is not None
+
+    def test_alternatives_lookalike_nested_still_triggers(self) -> None:
+        # não é direto em /etc/alternatives/, é um subdiretório —
+        # update-alternatives real nunca cria isso.
+        ctx = _ctx(path="/etc/alternatives/fake/awk", is_elf=True, extension="")
+        assert _r_no_extension_elf(ctx, "H022") is not None
+
 
 class TestRuleH023SecretExfiltration:
     """Achado real da rodada de 2026-09-15: nenhuma regra existente cobria

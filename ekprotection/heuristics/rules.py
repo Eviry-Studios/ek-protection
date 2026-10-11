@@ -729,14 +729,83 @@ def _r_secret_exfiltration(ctx: HeuristicContext, rid: str) -> Optional[RuleMatc
     )
 
 
+_RE_PY_INTERP_NAME = re.compile(r"^python3?(\.\d+)?$")
+_NVM_BIN_NAMES      = {"node", "npm", "npx", "corepack"}
+
+
+def _is_venv_bin_interpreter(path: str, name: str) -> bool:
+    """``.../venv/bin/python`` ou ``.../.venv/bin/python3.12`` — toda
+    virtualenv Python (via ``venv``/``virtualenv``/``pip``) copia o
+    interpretador real pra dentro de ``<venv>/bin/`` sem extensão, mesma
+    convenção de nomenclatura do ``/usr/bin/python3`` já excluído pelos
+    std_dirs — só muda o diretório onde a cópia mora."""
+    import os
+    if not _RE_PY_INTERP_NAME.match(name):
+        return False
+    parent = os.path.dirname(path)
+    grandparent = os.path.dirname(parent)
+    return (os.path.basename(parent) == "bin"
+            and os.path.basename(grandparent).endswith("venv"))
+
+
+def _is_nvm_bin(path: str, name: str) -> bool:
+    """``.../.nvm/versions/node/vX.Y.Z/bin/{node,npm,npx,corepack}`` —
+    instalação padrão do nvm, binários reais do Node.js sem extensão."""
+    return name in _NVM_BIN_NAMES and "/.nvm/versions/node/" in path
+
+
+def _is_node_modules_binary(path: str) -> bool:
+    """Qualquer binário ELF sem extensão dentro de uma árvore
+    ``node_modules/`` — convenção do npm/yarn/pnpm pra pacotes que
+    distribuem binário nativo (ex. esbuild), gerenciada pelo próprio
+    gerenciador de pacotes, não um local onde se espera um dropper manual."""
+    return "/node_modules/" in path
+
+
+def _is_playwright_cache_binary(path: str) -> bool:
+    """``~/.cache/ms-playwright/...`` — binários de browser (Chromium,
+    ffmpeg) baixados pelo próprio Playwright, cache fixo e conhecido da
+    ferramenta."""
+    return "/.cache/ms-playwright/" in path
+
+
+def _is_update_alternatives_symlink(path: str) -> bool:
+    """``/etc/alternatives/<nome>`` — symlinks geridos pelo próprio
+    ``update-alternatives`` do Debian/Ubuntu, só graváveis por root."""
+    import os
+    return os.path.dirname(path) == "/etc/alternatives"
+
+
 def _r_no_extension_elf(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """Binário ELF sem extensão em local não-padrão."""
+    """Binário ELF sem extensão em local não-padrão.
+
+    Achado ao vivo (escaneados 32278 arquivos candidatos fora dos
+    std_dirs nesta VPS real): 131 ELFs sem extensão legítimos, nenhum
+    deles um dropper — cópias de interpretador em virtualenv (``.venv/
+    bin/python``), binários do nvm (``~/.nvm/versions/node/*/bin/node``),
+    binários nativos distribuídos via npm dentro de ``node_modules/``
+    (ex. ``esbuild``), cache de browser do Playwright
+    (``~/.cache/ms-playwright/``) e symlinks do ``update-alternatives``
+    em ``/etc/alternatives/``. Essas 5 convenções, sozinhas, já geravam
+    ~130 falsos positivos numa única máquina de desenvolvimento comum —
+    cada ``pip venv``/``npm install``/``npx playwright install`` novo
+    dispararia a regra via o piso de severidade (H022 isolado força
+    risk_level ``médio`` independente do score agregado, ver
+    ``_calculate_score``)."""
+    import os
     std_dirs = ("/usr/", "/bin/", "/sbin/", "/lib/", "/opt/")
     if not ctx.is_elf:
         return None
     if ctx.extension != "":
         return None
     if any(ctx.path.startswith(d) for d in std_dirs):
+        return None
+    name = os.path.basename(ctx.path)
+    if (_is_venv_bin_interpreter(ctx.path, name)
+            or _is_nvm_bin(ctx.path, name)
+            or _is_node_modules_binary(ctx.path)
+            or _is_playwright_cache_binary(ctx.path)
+            or _is_update_alternatives_symlink(ctx.path)):
         return None
     return RuleMatch(rid, f"binário ELF sem extensão em local não-padrão: {ctx.path}")
 
