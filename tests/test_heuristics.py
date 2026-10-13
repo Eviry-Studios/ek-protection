@@ -806,6 +806,39 @@ class TestRuleH013Obfuscation:
         ctx = _ctx(content=b"base64 -d in.b64 > out.bin", is_script=True)
         assert _r_obfuscation(ctx, "H013") is None
 
+    def test_obfuscation_perf_adversarial_buffer_stays_fast(self) -> None:
+        """Rodada 2026-10-12: repetindo o método que achou o bug quadrático
+        de H023/H005 (anchors combinados numa única linha, sem o delimitador
+        que fecharia o match) contra TODAS as regex de conteúdo — a auditoria
+        de 2026-10-06 tinha testado um anchor por vez e não pegou isto.
+        `_RE_OBFUSC_SH` tinha DOIS `[^|\\n]*` irrestritos aninhados (gap
+        interno do ramo openssl até o "-d", gap externo compartilhado até o
+        "|"): medido ao vivo, 20,4s em 64KB — backtracking catastrófico, pior
+        que o H005 original (1,06s em 64KB) e pior em categoria (crescimento
+        super-linear acelerando, não O(n²) simples). Com `CONTENT_SAMPLE_SIZE`
+        em 1 MiB, travaria o monitor em tempo real por completo (DoS contra o
+        próprio EK-Protection). Fix: bound de 512 nos dois gaps (não 4096
+        como H005/H009/H023 — medido ao vivo que, por serem dois
+        quantificadores aninhados aqui, o custo escala com o produto dos
+        bounds: 4096 dava 24,9s em 1 MiB, pior que antes do fix; 512 dá
+        <1s)."""
+        import time
+        unit = (
+            b"curl wget crontab history base64 -d eval nc chmod python -c "
+            b"perl -e /dev/tcp sudo openssl enc -d xxd -r rev sleep ptrace "
+            b"memfd_create LD_PRELOAD= sudo su - pkexec doas "
+        )
+        content = (unit * (1_048_576 // len(unit) + 1))[:1_048_576]
+        ctx = _ctx(content=content, is_script=True)
+        t0 = time.perf_counter()
+        _r_obfuscation(ctx, "H013")
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 2.0, (
+            f"_r_obfuscation em buffer adversarial de 1MB levou {elapsed:.3f}s "
+            f"— regressão do backtracking catastrófico de H013 (_RE_OBFUSC_SH), "
+            f"ver rodada 2026-10-12"
+        )
+
 
 class TestRuleH014PtracePreload:
     def test_ptrace_triggers(self) -> None:
@@ -1479,10 +1512,17 @@ class TestHeuristicEngine:
         assert "H006" not in r.rules_fired
 
     def test_content_sample_1mib_adversarial_is_fast(self, engine: HeuristicEngine, tmp_path: Path) -> None:
-        """Pior caso conhecido da auditoria de 2026-10-06 (anchors repetidos numa linha só, sem delimitador),
-        agora no tamanho cheio do cap: a análise de um arquivo não pode virar negação de serviço."""
+        """Pior caso conhecido das auditorias de 2026-10-06/2026-10-12 (anchors repetidos numa linha só, sem
+        delimitador), agora no tamanho cheio do cap: a análise de um arquivo não pode virar negação de serviço.
+        Anchors de decoder (base64/openssl/xxd/rev -d, sem pipe) incluídos desde 2026-10-12 — a lista original
+        não cobria H013 (_RE_OBFUSC_SH) e deixou passar um backtracking catastrófico só achado testando aquela
+        regra isoladamente; mantendo todos os anchors aqui junto cobre a integração completa do engine."""
         from ekprotection.heuristics.engine import CONTENT_SAMPLE_SIZE
-        anchors = b"curl wget crontab history base64 eval nc chmod python -c perl -e /dev/tcp sudo "
+        anchors = (
+            b"curl wget crontab history base64 -d eval nc chmod python -c perl -e "
+            b"/dev/tcp sudo openssl enc -d xxd -r rev sleep ptrace memfd_create "
+            b"LD_PRELOAD= sudo su - pkexec doas "
+        )
         blob = (anchors * (CONTENT_SAMPLE_SIZE // len(anchors) + 1))[:CONTENT_SAMPLE_SIZE]
         f = tmp_path / "adversarial.sh"
         f.write_bytes(blob)

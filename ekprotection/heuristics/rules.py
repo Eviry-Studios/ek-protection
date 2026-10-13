@@ -248,10 +248,32 @@ _RE_HISTORY_DEL  = re.compile(
     rb'(?<!>)>(?!>)\s*[^\n;]{0,80}\w*_history\b',
     re.I,
 )
+# H013, rodada 2026-10-12: os dois `[^|\n]*` irrestritos abaixo (gap interno
+# do ramo openssl até o "-d", e gap externo compartilhado por todos os ramos
+# até o "|") são aninhados — pra cada ocorrência do anchor decoder, o motor
+# tenta todo corte possível do gap interno (cada "-d" mais à frente no buffer)
+# e, pra cada um, todo corte possível do gap externo (cada "|" mais à frente)
+# até esgotar as combinações. Confirmado ao vivo com anchors combinados numa
+# linha só (mesmo método que achou o bug do H005 em 2026-10-11, mas a
+# auditoria de performance de 2026-10-06 não cobriu esta regra): **20,4s em
+# 64KB**, pior que o H005 original (1,06s em 64KB) — backtracking catastrófico
+# (crescimento super-linear acelerando: 512B 0,09ms → 32KB 2,47s → 64KB
+# timeout >15s), não só O(n²). Com `CONTENT_SAMPLE_SIZE` em 1 MiB, um arquivo
+# com "openssl"/"base64 -d" repetidos sem pipe real travaria o monitor em
+# tempo real (inotify dispara `analyze()` a cada escrita) — vetor de DoS
+# contra o próprio EK-Protection.
+#
+# Fix: bound nos dois gaps, mas **não** o mesmo valor de 4096 usado em
+# H005/H009/H023 — medido ao vivo que, por serem DOIS quantificadores
+# aninhados aqui (gap interno × gap externo, não só um), o custo no pior caso
+# escala com o produto dos bounds, não com a soma: 4096 deu 24,9s em 1 MiB
+# (pior que antes do fix!), 512 deu 0,71s, 256 deu 0,36s. 512 escolhido como
+# teto generoso pra qualquer linha real de decoder+pipe+shell (exemplos reais
+# nos testes abaixo têm <80 bytes de gap) mantendo o pior caso sub-segundo.
 _RE_OBFUSC_SH    = re.compile(
     rb'\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){5,}'                      # hex escapes em sequência
     rb'|(\\[0-7]{3}){6,}'                                        # octal escapes em sequência
-    rb'|\b(base64\s+(-d|--decode|-D)|xxd\s+-r|openssl\s+(enc|base64)\s[^|\n]*-d|rev)\b[^|\n]*\|\s*(\S*/)?(ba|z|da|k)?sh\b',  # decoder | shell
+    rb'|\b(base64\s+(-d|--decode|-D)|xxd\s+-r|openssl\s+(enc|base64)\s[^|\n]{0,512}?-d|rev)\b[^|\n]{0,512}?\|\s*(\S*/)?(ba|z|da|k)?sh\b',  # decoder | shell
     re.I)
 _RE_PTRACE_CALL  = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH', re.I)
 _RE_LD_PRELOAD   = re.compile(rb'LD_PRELOAD\s*=|/etc/ld\.so\.preload', re.I)
