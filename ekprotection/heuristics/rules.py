@@ -128,8 +128,16 @@ _INTERP = (rb'(?:sudo\s+(?:-\S+\s+)*)?(?:/[\w./-]*/)?'
 # longa com "curl"/"wget" repetidos e sem pipe fazia cada tentativa varrer o resto da linha -> O(n²) medido ao vivo
 # (64KB 1,06s, 128KB 4,08s; 1 MiB ~268s com o arquivo inteiro). Só apareceu com anchors misturados numa linha, por isso
 # a auditoria de 2026-10-06 (um anchor por vez) não pegou. Pré-requisito para subir CONTENT_SAMPLE_SIZE.
-_RE_DL_PIPE_EXEC = re.compile(
-    _DL + rb'[^\n;&]{0,4096}?\|\s*' + _INTERP, re.I)
+#
+# Rodada 2026-10-18: o bound acima tirou o termo quadrático só quando os anchors são esparsos. Com "curl " denso (um a
+# cada 5 bytes, sem pipe), cada uma das ~210 mil tentativas ainda varria até 4096 bytes: medido ao vivo 0,93s em 64KB e
+# **14,6s em 1 MiB** por arquivo (linear, mas com fator 4096) — DoS do monitor em tempo real igual. Substituído por uma
+# varredura única de tokens (downloader / separador / pipe): guarda o fim do downloader mais recente do comando atual e,
+# em cada "|", testa o interpretador só ali. Mesma semântica da regex antiga (downloader e "| interp" no mesmo comando,
+# gap <= 4096 sem \n ; &) — o downloader mais recente é sempre o melhor candidato, então não precisa tentar os outros.
+_DL_PIPE_GAP      = 4096
+_RE_DL_PIPE_TOKEN = re.compile(rb'(' + _DL + rb')|[\n;&]+|\|', re.I)
+_RE_PIPE_INTERP   = re.compile(rb'\|\s*' + _INTERP, re.I)
 _RE_DL_SUBST_EXEC = re.compile(
     rb'(?:^|[\s;&|(])(?:bash|sh|zsh|ash|dash|source|\.)\s+(?:-\w+\s+)*'
     rb'["\']?(?:<\(|\$\()\s*' + _DL, re.I | re.M)
@@ -226,9 +234,15 @@ _RE_FORK_BOMB    = re.compile(rb':\(\)\s*\{|:\|\s*:&|forkbomb', re.I | re.S)
 # em pipe+background (ou duas vezes em background) e é chamada logo após
 # definida bate, sem casar substring parcial de nomes diferentes (`deploy`
 # vs `deploy_step1`, `a` vs `ab`) graças ao `(?!...)` no fim de cada ramo.
+# Rodada 2026-10-18: sem âncora no início do nome, o motor tentava os 40
+# comprimentos do grupo em CADA byte de qualquer corrida longa de
+# [A-Za-z0-9_.:] — blob base64 de 1 MiB (comum em script/instalador
+# legítimo) levava 2,0s e "aaaa..." 3,5s por arquivo, medido ao vivo. O
+# lookbehind negativo faz o nome só começar onde começa um identificador
+# (o que já era o caso de toda fork bomb real), e o custo cai pra ~linear.
 _RE_FORK_BOMB_GENERIC = re.compile(
-    rb'([A-Za-z0-9_.:]{1,40})\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}\s*;\s*\1(?![A-Za-z0-9_.:])'
-    rb'|([A-Za-z0-9_.:]{1,40})\s*\(\)\s*\{\s*\2\s*&\s*\2\s*&\s*\}\s*;\s*\2(?![A-Za-z0-9_.:])',
+    rb'(?<![A-Za-z0-9_.:])([A-Za-z0-9_.:]{1,40})\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}\s*;\s*\1(?![A-Za-z0-9_.:])'
+    rb'|(?<![A-Za-z0-9_.:])([A-Za-z0-9_.:]{1,40})\s*\(\)\s*\{\s*\2\s*&\s*\2\s*&\s*\}\s*;\s*\2(?![A-Za-z0-9_.:])',
     re.I,
 )
 # history -c/-w e HISTFILE=/dev/null/unset HIST* eram as únicas formas
@@ -270,11 +284,28 @@ _RE_HISTORY_DEL  = re.compile(
 # (pior que antes do fix!), 512 deu 0,71s, 256 deu 0,36s. 512 escolhido como
 # teto generoso pra qualquer linha real de decoder+pipe+shell (exemplos reais
 # nos testes abaixo têm <80 bytes de gap) mantendo o pior caso sub-segundo.
+#
+# Rodada 2026-10-18: o bound de 512 resolveu o caso de anchors misturados, mas
+# não o de anchors DENSOS: "openssl enc -d " repetido (sem pipe) ainda custava
+# ~34 cortes do gap interno × 512 do externo por ocorrência — medido ao vivo
+# **22,8s em 1 MiB** ("base64 -d " denso 2,0s). O ramo decoder|shell virou uma
+# varredura de tokens (separador | ou \n, decoder completo, prefixo openssl,
+# "-d"): guarda o fim do decoder mais recente e do prefixo openssl mais recente
+# do comando atual; "-d" até 512 bytes depois do prefixo fecha o decoder openssl;
+# no "|", confere distância <= 512 e o shell logo depois. Mesma semântica
+# (decoder mais recente é sempre o melhor candidato pros dois gaps), O(n).
 _RE_OBFUSC_SH    = re.compile(
     rb'\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){5,}'                      # hex escapes em sequência
-    rb'|(\\[0-7]{3}){6,}'                                        # octal escapes em sequência
-    rb'|\b(base64\s+(-d|--decode|-D)|xxd\s+-r|openssl\s+(enc|base64)\s[^|\n]{0,512}?-d|rev)\b[^|\n]{0,512}?\|\s*(\S*/)?(ba|z|da|k)?sh\b',  # decoder | shell
+    rb'|(\\[0-7]{3}){6,}',                                       # octal escapes em sequência
     re.I)
+_OBFUSC_GAP      = 512
+_RE_OBFUSC_TOKEN = re.compile(
+    rb'([|\n])'
+    rb'|\b(?:base64\s+(?:-d|--decode|-D)|xxd\s+-r|rev)\b()'
+    rb'|\b(openssl\s+(?:enc|base64)\s)'
+    rb'|(-d)\b',
+    re.I)
+_RE_PIPE_SHELL   = re.compile(rb'\|\s*(\S*/)?(ba|z|da|k)?sh\b', re.I)
 _RE_PTRACE_CALL  = re.compile(rb'ptrace\s*\(|PTRACE_ATTACH', re.I)
 _RE_LD_PRELOAD   = re.compile(rb'LD_PRELOAD\s*=|/etc/ld\.so\.preload', re.I)
 # /proc/<pid>/mem em todas as formas em que um scraper/injetor real escreve o
@@ -308,6 +339,7 @@ _RE_PACKED_UPX   = re.compile(rb'UPX!|This file is packed')
 # negativo, testado ao vivo, passava batido); mesma lógica de `.pub`
 # evita disparar na chave pública do host (`ssh_host_rsa_key.pub`),
 # arquivo rotineiramente lido/distribuído (fingerprint, known_hosts).
+_RE_FNAME_TAIL   = re.compile(rb'[\w.-]*')
 _RE_SECRET_PATHS = re.compile(
     rb'quarantine\.key|auth\.hash|wallet\.dat|id_rsa|id_ed25519|\.ssh/id_|'
     rb'/etc/ssh/ssh_host_\w+_key|'
@@ -329,11 +361,44 @@ _RE_SECRET_PATHS = re.compile(
 # Fix: bound explícito (4096 bytes, generoso pra linha de comando real),
 # mesmo padrão já usado em H012/H015 — limita o custo por tentativa a uma
 # constante, eliminando o termo quadrático independente do tamanho do buffer.
-_RE_EXFIL_NET    = re.compile(
-    rb'curl\s+[^\n]{0,4096}(-d\s|--data|-F\s|--upload-file|-T\s)|'
-    rb'wget\s+[^\n]{0,4096}--post-data',
+#
+# Rodada 2026-10-18: igual a H005 — o bound só resolve anchors esparsos. Com
+# "curl " denso (sem flag nenhuma), cada tentativa ainda percorria 4096 bytes
+# e voltava: medido ao vivo **9,1s em 1 MiB** ("wget " 1,3s). Agora é uma
+# varredura de tokens (curl / wget / flag / \n) que guarda o fim do curl e do
+# wget mais recentes da linha e compara a distância quando aparece a flag —
+# mesma semântica (flag até 4096 bytes depois de `curl\s+`/`wget\s+`, mesma
+# linha), O(n).
+_EXFIL_GAP         = 4096
+_RE_EXFIL_TOKEN    = re.compile(
+    rb'(curl\s+)|(wget\s+)|(-d\s|--data|-F\s|--upload-file|-T\s)|(--post-data)|\n',
     re.I,
 )
+
+
+def _exfil_net(buf: bytes) -> bool:
+    # Rodada 2026-10-19: a versão de 18/10 zerava curl/wget só no token "\n"
+    # isolado — mas "-d\s"/"-F\s"/"-T\s" (e "curl\s+"/"wget\s+") podem
+    # CONSUMIR o \n, que aí nunca vira token e a linha nunca era fechada:
+    # "wget a -F\n--post-data" disparava (a regex antiga não). Achado por fuzz
+    # diferencial contra a regex antiga. Agora guarda a posição do último \n
+    # visto dentro de QUALQUER token e exige o downloader depois dele.
+    curl_end = wget_end = last_nl = -1
+    for m in _RE_EXFIL_TOKEN.finditer(buf):
+        if m.group(1) is not None:
+            curl_end = m.end()
+        elif m.group(2) is not None:
+            wget_end = m.end()
+        elif m.group(3) is not None:
+            if curl_end > last_nl and m.start() - curl_end <= _EXFIL_GAP:
+                return True
+        elif m.group(4) is not None:
+            if wget_end > last_nl and m.start() - wget_end <= _EXFIL_GAP:
+                return True
+        nl = m.group().rfind(b'\n')
+        if nl >= 0:
+            last_nl = m.start() + nl
+    return False
 
 
 def _r_high_entropy(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
@@ -384,11 +449,25 @@ def _r_eval_exec(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+def _dl_pipe_exec(buf: bytes) -> bool:
+    """downloader ... | interp no mesmo comando, em O(n) (ver _RE_DL_PIPE_TOKEN)."""
+    last_dl_end = -1
+    for m in _RE_DL_PIPE_TOKEN.finditer(buf):
+        if m.group(1) is not None:
+            last_dl_end = m.end()
+        elif m.group() != b'|':
+            last_dl_end = -1
+        elif (last_dl_end >= 0 and m.start() - last_dl_end <= _DL_PIPE_GAP
+                and _RE_PIPE_INTERP.match(buf, m.start())):
+            return True
+    return False
+
+
 def _r_download_execute(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Download seguido de execução (wget/curl | sh)."""
     if not ctx.content_sample:
         return None
-    if (_RE_DL_PIPE_EXEC.search(ctx.content_sample)
+    if (_dl_pipe_exec(ctx.content_sample)
             or _RE_DL_SUBST_EXEC.search(ctx.content_sample)):
         return RuleMatch(rid, "padrão download+execução (wget/curl | sh)")
     return None
@@ -443,12 +522,24 @@ def _r_sensitive_files(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     m = _RE_SHADOW_ETC.search(ctx.content_sample)
     if m:
         return RuleMatch(rid, f"acesso a arquivo sensível: {m.group().decode('utf-8', errors='replace')}")
-    for m in _RE_SECRET_PATHS.finditer(ctx.content_sample):
+    buf = ctx.content_sample
+    run_end, run_is_pub = -1, False
+    for m in _RE_SECRET_PATHS.finditer(buf):
         # nome de arquivo completo logo após o match (ex. "rsa.pub" depois
         # de ".ssh/id_", ou ".pub" depois de "id_rsa" direto) — se terminar
         # em .pub é chave PÚBLICA, não segredo (ver comentário no regex).
-        tail = re.match(rb'[\w.-]*', ctx.content_sample[m.end():]).group()
-        if tail.lower().endswith(b'.pub'):
+        #
+        # Rodada 2026-10-18: a versão anterior fazia `buf[m.end():]` (cópia
+        # do resto do buffer) + `[\w.-]*` do zero a CADA match — com
+        # "id_rsa.pub" repetido sem separador (uma corrida só de [\w.-] que
+        # termina em .pub), O(n²): medido ao vivo **266s em 1 MiB** por
+        # arquivo, e ~2s com espaço entre as repetições. Agora a corrida é
+        # medida uma vez (match por posição, sem cópia) e reaproveitada pelos
+        # matches seguintes que caem dentro dela — mesmo resultado, O(n).
+        if m.end() >= run_end:
+            run_end = _RE_FNAME_TAIL.match(buf, m.end()).end()
+            run_is_pub = buf[max(m.end(), run_end - 4):run_end].lower() == b'.pub'
+        if run_is_pub and run_end - m.end() >= 4:
             continue
         return RuleMatch(rid, f"acesso local a credencial/wallet: {m.group().decode('utf-8', errors='replace')}")
     return None
@@ -519,13 +610,41 @@ def _r_history_deletion(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+def _decoder_pipe_shell(buf: bytes) -> bool:
+    """decoder (base64 -d / xxd -r / openssl enc ... -d / rev) | sh, em O(n)."""
+    # Rodada 2026-10-19: mesmo bug achado em _exfil_net — "openssl enc\s" e
+    # "base64\s+-d" podem consumir o \n, que aí não vira token separador
+    # ("rev x openssl enc\n|sh" disparava, a regex antiga não). Achado por
+    # fuzz diferencial; agora o \n é rastreado dentro de qualquer token.
+    dec_end = ossl_end = last_nl = -1
+    for m in _RE_OBFUSC_TOKEN.finditer(buf):
+        if m.group(1) == b'|':
+            if (dec_end > last_nl
+                    and m.start() - dec_end <= _OBFUSC_GAP
+                    and _RE_PIPE_SHELL.match(buf, m.start())):
+                return True
+            dec_end = ossl_end = -1
+        elif m.group(2) is not None:
+            dec_end = m.end()
+        elif m.group(3) is not None:
+            ossl_end = m.end()
+        elif (m.group(4) is not None and ossl_end > last_nl
+                and m.start() - ossl_end <= _OBFUSC_GAP):
+            dec_end = m.end()
+        nl = m.group().rfind(b'\n')
+        if nl >= 0:
+            last_nl = m.start() + nl
+    return False
+
+
 def _r_obfuscation(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Ofuscação de shell script (variáveis longas, hex escapes)."""
     if not ctx.content_sample:
         return None
     if not ctx.is_script and ctx.extension not in (".sh", ".bash", ".zsh"):
         return None
-    if _RE_OBFUSC_SH.search(ctx.content_sample):
+    if (_RE_OBFUSC_SH.search(ctx.content_sample)
+            or _decoder_pipe_shell(ctx.content_sample)):
         return RuleMatch(rid, "ofuscação de código detectada em script")
     return None
 
@@ -747,7 +866,7 @@ def _r_secret_exfiltration(ctx: HeuristicContext, rid: str) -> Optional[RuleMatc
     m = _RE_SECRET_PATHS.search(ctx.content_sample)
     if not m:
         return None
-    if not _RE_EXFIL_NET.search(ctx.content_sample):
+    if not _exfil_net(ctx.content_sample):
         return None
     return RuleMatch(
         rid,

