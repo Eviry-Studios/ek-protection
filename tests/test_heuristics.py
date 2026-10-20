@@ -932,6 +932,16 @@ class TestRuleH015Fileless:
         # "mem" como prefixo de outra palavra (memory_stats) não é a técnica.
         assert _r_memfd_proc(_ctx(content=content), "H015") is None
 
+    @pytest.mark.parametrize("content", [
+        b"dd if=/proc/$(pgrep -f\n wallet)/mem of=/dev/null",
+        b"x=/proc/$(cat /run/w.pid)/mem; dd if=$x",
+        b"/proc/$( /proc/$(pgrep w)/mem",
+    ])
+    def test_proc_subst_still_triggers_after_bound(self, content: bytes) -> None:
+        """Rodada 2026-10-20: `[^)]*` -> `[^()]*` (DoS O(n²)); \\n dentro
+        do $(...) e anchor solto antes do real continuam disparando."""
+        assert _r_memfd_proc(_ctx(content=content), "H015") is not None
+
 
 def _elf64_header(*, shnum: int, phnum: int, extra: bytes = b"") -> bytes:
     """Monta um header ELF64 LE mínimo e válido (e_ident + campos até
@@ -1761,6 +1771,13 @@ class TestDenseAnchorsPerf:
         ctx = _ctx(content=b"id_rsa.pub" * 104_857)
         assert _r_sensitive_files(ctx, "H009") is None
         assert self._timed(_r_sensitive_files, ctx, "H009") < self.LIMIT
+
+    def test_h015_dense_proc_subst_is_fast(self) -> None:
+        # "/proc/$(" sem ")" — código antigo O(n²): 64KB 0,38s, 128KB 1,5s,
+        # 256KB 6,3s (256KB aqui pra falhar rápido no código antigo)
+        ctx = _ctx(content=_dense(b"/proc/$(", 262_144))
+        assert _r_memfd_proc(ctx, "H015") is None
+        assert self._timed(_r_memfd_proc, ctx, "H015") < self.LIMIT
 
 
 class TestTokenScanNewlineSemantics:

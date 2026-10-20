@@ -313,9 +313,18 @@ _RE_LD_PRELOAD   = re.compile(rb'LD_PRELOAD\s*=|/etc/ld\.so\.preload', re.I)
 # x)), placeholder de format string do Python (f"{pid}", %d/%s) ou
 # concatenação ('/proc/' + str(pid) + '/mem'). "mem" não pode ser prefixo de
 # outra palavra (/proc/<pid>/memory_stats não é a técnica).
+#
+# Rodada 2026-10-20: o ramo `\$\([^)]*\)` não tinha bound nem parava em nada
+# além de ")" — com "/proc/$(" repetido e nenhum ")" no arquivo, cada anchor
+# varria o resto do buffer inteiro: O(n²) medido ao vivo (64KB 0,38s, 128KB
+# 1,5s, 256KB 6,3s; ~100s extrapolado em 1 MiB) — mesmo vetor de DoS do
+# monitor em tempo real de H005/H013. Agora `[^()]*`: o próprio anchor tem
+# "(", então a varredura de cada um para no próximo anchor e o total fica
+# O(n). Único caso que deixa de casar é "(" solto sem ")" dentro do $(...)
+# (ex. `$(echo \( x)`) — não é como um scraper real escreve o PID.
 _RE_MEMFD        = re.compile(
     rb'memfd_create|'
-    rb'/proc/(?:self|thread-self|[0-9]+|\$\$|\$\{?\w+\}?|\{[^{}/\s]*\}|%[sd]|\$\([^)]*\))/mem(?!\w)|'
+    rb'/proc/(?:self|thread-self|[0-9]+|\$\$|\$\{?\w+\}?|\{[^{}/\s]*\}|%[sd]|\$\([^()]*\))/mem(?!\w)|'
     rb"""/proc/['"]\s*\+[^\n]{0,80}?\+\s*['"]/mem(?!\w)""",
     re.I,
 )
