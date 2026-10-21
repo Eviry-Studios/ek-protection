@@ -1040,6 +1040,86 @@ class TestRuleH016PackedUPX:
         assert _r_packed_upx(ctx, "H016") is None
 
 
+def _elf64_with_phdrs(
+    phdrs: list[tuple[int, int, int]], *,
+    shnum: int = 0, shoff: int = 0, shentsize: int = 64,
+) -> bytes:
+    """Header ELF64 LE + tabela de program headers logo depois (phoff=64).
+    `phdrs` = [(p_type, p_filesz, p_memsz), ...]. Rodada 2026-10-21."""
+    e_ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\x00" * 8
+    hdr = e_ident + struct.pack(
+        "<HHIQQQIHHHHHH", 3, 0x3E, 1, 0x1000, 64, shoff, 0, 64, 56,
+        len(phdrs), shentsize, shnum, 0,
+    )
+    for p_type, filesz, memsz in phdrs:
+        hdr += struct.pack("<IIQQQQQQ", p_type, 6, 0, 0, 0, filesz, memsz, 0x1000)
+    return hdr + b"X" * 64
+
+
+# Layout real do `/bin/ls` empacotado com UPX 4.2.4 (readelf -lW, ao vivo).
+_UPX_LS_PHDRS = [(1, 0x1000, 0x24518), (1, 0xE735, 0xE735), (0x6474E551, 0, 0)]
+
+
+class TestRuleH016ForgedHeaders:
+    """Rodada 2026-10-21: o sinal estrutural (`e_shnum == 0`) caía forjando
+    2 bytes. Testado ao vivo com UPX 4.2.4 real: `ls` empacotado, strings
+    de assinatura apagadas e `e_shnum` = 31 roda normal e evadia H016."""
+
+    def test_forged_shnum_with_zero_shoff_triggers(self) -> None:
+        content = _elf64_header(shnum=31, phnum=3, extra=b"X" * 200)
+        assert _r_packed_upx(_ctx(content=content, is_elf=True), "H016") is not None
+
+    def test_forged_shnum_with_wrong_shentsize_triggers(self) -> None:
+        content = _elf64_with_phdrs([(6, 0, 0)] * 3, shnum=31, shoff=0x200, shentsize=0)
+        assert _r_packed_upx(_ctx(content=content, is_elf=True), "H016") is not None
+
+    def test_section_table_past_end_of_file_triggers(self) -> None:
+        content = _elf64_with_phdrs([(6, 0, 0)] * 3, shnum=31, shoff=0x200)
+        ctx = _ctx(content=content, is_elf=True)
+        ctx.file_size = len(content)
+        assert _r_packed_upx(ctx, "H016") is not None
+
+    def test_fully_forged_section_table_triggers_via_load_layout(self) -> None:
+        # Tabela de sections falsa e coerente (sh[0] nulo + .shstrtab
+        # anexados no fim) também roda normal ao vivo. Só o layout de
+        # segmentos, que o kernel usa de verdade, continua entregando.
+        content = _elf64_with_phdrs(_UPX_LS_PHDRS, shnum=2, shoff=0x100)
+        ctx = _ctx(content=content, is_elf=True)
+        ctx.file_size = 0x100 + 2 * 64
+        match = _r_packed_upx(ctx, "H016")
+        assert match is not None
+        assert "segmentos" in match.detail
+
+    def test_load_layout_survives_phnum_padding(self) -> None:
+        # Inflar e_phnum com PT_NULL (ignorado pelo loader) evade o
+        # `phnum <= 4`, mas não muda os PT_LOAD.
+        content = _elf64_with_phdrs(_UPX_LS_PHDRS + [(0, 0, 0)] * 8, shnum=2, shoff=0x400)
+        assert _r_packed_upx(_ctx(content=content, is_elf=True), "H016") is not None
+
+    @pytest.mark.parametrize("phdrs", [
+        # Go estático real (gh, docker-compose): sem PT_DYNAMIC, bss grande, 3 PT_LOAD
+        [(6, 0, 0), (1, 0x100000, 0x100000), (1, 0x80000, 0x80000), (1, 0x1000, 0x2000000)],
+        # PIE dinâmico com PT_INTERP, mesmo com memsz >> filesz
+        [(3, 0x1C, 0x1C), (1, 0x1000, 0x24518), (1, 0xE735, 0xE735), (2, 0x200, 0x200)],
+        # 2 PT_LOAD sem bss relevante
+        [(1, 0x1000, 0x1000), (1, 0xE735, 0xF000)],
+    ])
+    def test_legit_layouts_no_trigger(self, phdrs: list[tuple[int, int, int]]) -> None:
+        # Varredura ao vivo: 5780 ELFs reais desta VPS, zero disparos.
+        content = _elf64_with_phdrs(phdrs, shnum=30, shoff=0x400)
+        assert _r_packed_upx(_ctx(content=content, is_elf=True), "H016") is None
+
+    def test_extended_section_numbering_is_not_missing_table(self) -> None:
+        # gABI: >= 0xff00 sections -> e_shnum = 0 e contagem em sh[0].sh_size.
+        content = _elf64_with_phdrs([(6, 0, 0)] * 3, shnum=0, shoff=0x400)
+        assert _r_packed_upx(_ctx(content=content, is_elf=True), "H016") is None
+
+    @pytest.mark.parametrize("cut", [64, 64 + 56, 64 + 56 * 2 + 10])
+    def test_truncated_phdr_table_no_crash(self, cut: int) -> None:
+        content = _elf64_with_phdrs(_UPX_LS_PHDRS, shnum=30, shoff=0x400)[:cut]
+        assert _r_packed_upx(_ctx(content=content, is_elf=True), "H016") is None
+
+
 class TestRuleH017HardcodedIP:
     def test_external_ips_trigger(self) -> None:
         ctx = _ctx(

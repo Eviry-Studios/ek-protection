@@ -706,6 +706,83 @@ def _elf_shnum_phnum(content: bytes) -> Optional[tuple[int, int]]:
     return (shnum, phnum)
 
 
+def _elf_section_table_missing(content: bytes, file_size: Optional[int]) -> bool:
+    """True se o ELF não tem tabela de section headers *crível*.
+
+    Rodada 2026-10-21: a checagem antiga era só `e_shnum == 0`. Testado
+    ao vivo com UPX 4.2.4 real: reescrever 2 bytes (`e_shnum` = 31) no
+    `/bin/ls` empacotado, sem tocar em mais nada, mantém o binário
+    executando e evadia o sinal estrutural (o kernel não lê sections).
+    Agora `e_shnum > 0` só conta como tabela real se `e_shoff != 0`,
+    `e_shentsize` for o tamanho do formato (64/40) e a tabela couber no
+    arquivo (quando o tamanho é conhecido). `e_shnum == 0` com `e_shoff`
+    != 0 é a numeração estendida do gABI (>= 0xff00 sections, contagem
+    real em sh[0].sh_size), não ausência de tabela."""
+    if len(content) < 64 or content[:4] != b"\x7fELF":
+        return False
+    is_64 = content[4] == 2
+    e     = ">" if content[5] == 2 else "<"
+    if is_64:
+        shoff = struct.unpack_from(e + "Q", content, 40)[0]
+        shentsize, shnum = struct.unpack_from(e + "HH", content, 58)
+        want = 64
+    else:
+        shoff = struct.unpack_from(e + "I", content, 32)[0]
+        shentsize, shnum = struct.unpack_from(e + "HH", content, 46)
+        want = 40
+    if shnum == 0:
+        return shoff == 0
+    if shoff == 0 or shentsize != want:
+        return True
+    return file_size is not None and shoff + shnum * shentsize > file_size
+
+
+_PT_LOAD, _PT_DYNAMIC, _PT_INTERP = 1, 2, 3
+
+
+def _elf_packed_load_layout(content: bytes) -> bool:
+    """Layout de program headers típico de packer (UPX): nenhum
+    PT_INTERP/PT_DYNAMIC, no máximo 2 PT_LOAD, e algum PT_LOAD com
+    memsz >= 8x filesz (o espaço onde o stub descomprime o original).
+
+    Rodada 2026-10-21: program headers são o que o kernel usa pra mapear
+    e executar — ao contrário de sections/strings, não dá pra forjar sem
+    quebrar a execução. Medido ao vivo: 9/9 binários UPX 4.2.4 reais
+    (ls PIE, gh e docker-compose Go estáticos, python3, gzip do klibc,
+    o próprio upx) batem, 2 PT_LOAD e razão 36x a 19000x. Contra 5040 ELFs
+    executáveis/shared reais desta VPS (/usr, /opt, /home, /var/lib):
+    zero. Os estáticos legítimos sem PT_DYNAMIC com bss grande (Go: gh,
+    docker-compose, esbuild; klibc) têm 3-4 PT_LOAD."""
+    if len(content) < 64 or content[:4] != b"\x7fELF":
+        return False
+    is_64 = content[4] == 2
+    e     = ">" if content[5] == 2 else "<"
+    if is_64:
+        phoff = struct.unpack_from(e + "Q", content, 32)[0]
+        phentsize, phnum = struct.unpack_from(e + "HH", content, 54)
+        fmt = e + "I4xQQQQQ"     # p_type, (p_flags), p_offset..p_memsz
+    else:
+        phoff = struct.unpack_from(e + "I", content, 28)[0]
+        phentsize, phnum = struct.unpack_from(e + "HH", content, 42)
+        fmt = e + "IIIIII"       # p_type, p_offset..p_memsz
+    need = struct.calcsize(fmt)
+    if phnum == 0 or phnum > 64 or phentsize < need:
+        return False
+    loads: list[tuple[int, int]] = []
+    for i in range(phnum):
+        off = phoff + i * phentsize
+        if off + need > len(content):
+            return False
+        p_type, _, _, _, filesz, memsz = struct.unpack_from(fmt, content, off)
+        if p_type in (_PT_DYNAMIC, _PT_INTERP):
+            return False
+        if p_type == _PT_LOAD:
+            loads.append((filesz, memsz))
+    if not 0 < len(loads) <= 2:
+        return False
+    return any(memsz > 0 and memsz >= 8 * filesz for filesz, memsz in loads)
+
+
 def _r_packed_upx(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Binário ELF comprimido com UPX.
 
@@ -742,6 +819,12 @@ def _r_packed_upx(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     de consistência mais profunda (ex. validar se `e_shoff` aponta pra
     dados plausíveis) nesta rodada — registrado como possível próxima
     frente se o Matheus achar que vale o escopo.
+
+    Rodada 2026-10-21: limitação acima confirmada ao vivo (2 bytes bastam)
+    e fechada em duas camadas — `_elf_section_table_missing` (tabela de
+    sections precisa ser coerente) e `_elf_packed_load_layout` (layout de
+    PT_LOAD, que o kernel usa e não dá pra forjar sem quebrar a execução).
+    Resta evasão por packer que gere 3+ PT_LOAD ou PT_DYNAMIC falso.
     """
     if not ctx.content_sample or not ctx.is_elf:
         return None
@@ -749,14 +832,23 @@ def _r_packed_upx(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
         return RuleMatch(rid, "binário comprimido com UPX (técnica de evasão)")
     shnum_phnum = _elf_shnum_phnum(ctx.content_sample)
     if shnum_phnum is not None:
-        shnum, phnum = shnum_phnum
-        if shnum == 0 and 0 < phnum <= 4:
+        _, phnum = shnum_phnum
+        if (0 < phnum <= 4
+                and _elf_section_table_missing(ctx.content_sample, ctx.file_size)):
             return RuleMatch(
                 rid,
                 "binário ELF sem tabela de section headers e poucos "
                 "program headers (indicador estrutural de packing, "
                 "ex. UPX com strings de assinatura removidas)",
             )
+    if _elf_packed_load_layout(ctx.content_sample):
+        return RuleMatch(
+            rid,
+            "binário ELF com layout de segmentos de packer (sem "
+            "PT_INTERP/PT_DYNAMIC, <=2 PT_LOAD, memsz >> filesz) — "
+            "indicador estrutural de packing que sobrevive a forjar "
+            "sections/strings",
+        )
     return None
 
 
