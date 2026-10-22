@@ -305,10 +305,15 @@ class TestAutoScanWiring:
         engine = EKEngine(manager)
         await engine.start()
         try:
+            # Rodada 2026-10-22: o endereço tinha 38 dígitos hex (não é
+            # ETH), então o H018 nunca disparou aqui — quem passava o teste
+            # era o H002 (tmp_path fica em /tmp). Corrigido pra 40 dígitos;
+            # o H002 continua disparando junto, o isolamento do H018 fica
+            # nos testes unitários (TestRuleH018ChecksumAndBoundary).
             evil = watched / "xmrig-update.sh"
             evil.write_bytes(
                 b"#!/bin/bash\n"
-                b"WALLET=0x0000000000000000000000000000000000dEaD\n"
+                b"WALLET=0x000000000000000000000000000000000000dEaD\n"
                 b"echo starting miner with wallet $WALLET\n"
             )
 

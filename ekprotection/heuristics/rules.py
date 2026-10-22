@@ -18,6 +18,7 @@ ponderado que resulta num RiskScore final.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import struct
 from dataclasses import dataclass, field
@@ -221,7 +222,37 @@ _RE_RM_HOME_KEYS = re.compile(
 )
 _RE_C2_SLEEP     = re.compile(rb'\b(?:sleep|usleep)\s+[0-9]+', re.I)
 _RE_C2_NET       = re.compile(rb'\b(?:curl|wget|nc)\b', re.I)
-_RE_CRYPTO_ADDR  = re.compile(rb'[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[0-9a-fA-F]{40}')
+# H018, rodada 2026-10-22: a regex antiga (`[13][base58]{25,34}` sem
+# boundary nem checksum) casava qualquer corrida hex/alfanumérica que
+# começasse com 1 ou 3 — build-id, hashes embutidos, tabelas de símbolos.
+# Medido: 1381 de 5508 ELFs desta VPS (25%) saíam risco "alto" por H018,
+# incluindo /bin/ls. Agora cada família tem boundary alfanumérico dos dois
+# lados e, onde o checksum é verificável só com stdlib, ele é verificado:
+# BTC legado via Base58Check (sha256d, versão 0x00/0x05) e BTC segwit via
+# bech32/bech32m (BIP173/BIP350). ETH não tem checksum verificável sem
+# Keccak (EIP-55 só existe em mixed-case), fica só com boundary. Monero
+# (o que cryptominer real usa — xmrig) não era coberto: entra pelo formato
+# estrutural (95 chars Base58, prefixo 4/8 + [0-9AB]), também sem checksum
+# pelo mesmo motivo do Keccak.
+_B58_ALPHABET    = b'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+_B58_INDEX       = {c: i for i, c in enumerate(_B58_ALPHABET)}
+_RE_BTC_LEGACY   = re.compile(rb'(?<![0-9A-Za-z])[13][a-km-zA-HJ-NP-Z1-9]{25,34}(?![0-9A-Za-z])')
+_RE_BTC_BECH32   = re.compile(rb'(?<![0-9A-Za-z])bc1(?:[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{20}){0,1}[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{39}(?![0-9A-Za-z])', re.I)
+_RE_ETH_ADDR     = re.compile(rb'(?<![0-9A-Za-z])0x[0-9a-fA-F]{40}(?![0-9A-Za-z])')
+_RE_XMR_ADDR     = re.compile(rb'(?<![0-9A-Za-z])[48][0-9AB][a-km-zA-HJ-NP-Z1-9]{93}(?:[a-km-zA-HJ-NP-Z1-9]{11})?(?![0-9A-Za-z])')
+_BECH32_CHARSET  = b'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+_BECH32_CONSTS   = (1, 0x2bc830a3)   # bech32 (v0), bech32m (v1+)
+_BECH32_POLY     = (0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
+# XOR dos geradores por valor do topo (5 bits): 1 lookup por char em vez de
+# 5 testes de bit — com candidato denso o polymod era o gargalo (1,2s/MiB).
+_BECH32_GEN: list[int] = []
+for _top in range(32):
+    _acc = 0
+    for _i, _g in enumerate(_BECH32_POLY):
+        if (_top >> _i) & 1:
+            _acc ^= _g
+    _BECH32_GEN.append(_acc)
+del _top, _acc, _i, _g
 _RE_IP_HARDCODED = re.compile(rb'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b')
 _RE_FORK_BOMB    = re.compile(rb':\(\)\s*\{|:\|\s*:&|forkbomb', re.I | re.S)
 # H011, rodada 2026-10-04: a regex acima só cobre a fork bomb clássica com
@@ -888,11 +919,45 @@ def _r_crypto_strings(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Strings de carteiras crypto (possível cryptominer)."""
     if not ctx.content_sample:
         return None
-    matches = _RE_CRYPTO_ADDR.findall(ctx.content_sample)
+    data = ctx.content_sample
+    matches = [m.group() for m in _RE_BTC_LEGACY.finditer(data) if _base58check_ok(m.group())]
+    matches += [m.group() for m in _RE_BTC_BECH32.finditer(data) if _bech32_ok(m.group())]
+    matches += _RE_ETH_ADDR.findall(data)
+    matches += _RE_XMR_ADDR.findall(data)
     if matches:
         return RuleMatch(rid, f"{len(matches)} possível(is) endereço(s) de carteira crypto",
                          evidence=matches[0].decode("utf-8", errors="replace")[:40])
     return None
+
+
+def _base58check_ok(addr: bytes) -> bool:
+    """Endereço BTC legado (P2PKH 0x00 / P2SH 0x05) com checksum sha256d
+    válido. Chance de corrida aleatória passar: 2^-32 × versão certa."""
+    n = 0
+    for c in addr:
+        n = n * 58 + _B58_INDEX[c]
+    pad = len(addr) - len(addr.lstrip(b'1'))
+    try:
+        raw = b'\x00' * pad + n.to_bytes((n.bit_length() + 7) // 8, 'big')
+    except OverflowError:
+        return False
+    if len(raw) != 25 or raw[0] not in (0x00, 0x05):
+        return False
+    return hashlib.sha256(hashlib.sha256(raw[:21]).digest()).digest()[:4] == raw[21:]
+
+
+def _bech32_ok(addr: bytes) -> bool:
+    """Endereço BTC segwit (bc1...) com checksum bech32/bech32m válido.
+    Mixed-case é inválido pela BIP173."""
+    if addr != addr.lower() and addr != addr.upper():
+        return False
+    addr = addr.lower()
+    values = [c >> 5 for c in b'bc'] + [0] + [c & 31 for c in b'bc']
+    values += [_BECH32_CHARSET.index(c) for c in addr[3:]]
+    chk = 1
+    for v in values:
+        chk = ((chk & 0x1ffffff) << 5) ^ v ^ _BECH32_GEN[chk >> 25]
+    return chk in _BECH32_CONSTS
 
 
 def _r_c2_beacon(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:

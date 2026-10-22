@@ -1164,16 +1164,87 @@ class TestRuleH017HardcodedIP:
 
 class TestRuleH018CryptoStrings:
     def test_bitcoin_address_triggers(self) -> None:
-        ctx = _ctx(content=b"send to 1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfna")
-        # valid-looking BTC address pattern
-        ctx2 = _ctx(content=b"wallet=1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfna")
-        r = _r_crypto_strings(ctx2, "H018")
-        # May or may not match depending on exact regex — just verify no crash
-        assert r is None or isinstance(r, RuleMatch)
+        # Endereço do bloco gênese. O teste antigo usava "...Divfna" (typo,
+        # o real é "...DivfNa") e aceitava None — nunca validou nada.
+        ctx = _ctx(content=b"wallet=1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+        r = _r_crypto_strings(ctx, "H018")
+        assert r is not None
+        assert r.evidence == "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
 
     def test_no_crypto_no_trigger(self) -> None:
         ctx = _ctx(content=b"hello world normal content")
         assert _r_crypto_strings(ctx, "H018") is None
+
+
+class TestRuleH018ChecksumAndBoundary:
+    """Rodada 2026-10-22: sem boundary nem checksum, 1381 de 5508 ELFs da
+    VPS (25%, incluindo /bin/ls) saíam risco alto por H018 — build-id e
+    hashes hex que começam com 1/3 casavam como endereço BTC legado."""
+
+    def test_hex_hash_starting_with_1_no_trigger(self) -> None:
+        # Evidência real do /bin/ls (rodada 10-21).
+        ctx = _ctx(content=b"\x00GNU\x0039271d878615772bb2a6ffa422f\x00", is_elf=True)
+        assert _r_crypto_strings(ctx, "H018") is None
+
+    def test_btc_bad_checksum_no_trigger(self) -> None:
+        ctx = _ctx(content=b"wallet=1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb")
+        assert _r_crypto_strings(ctx, "H018") is None
+
+    def test_btc_inside_longer_alnum_run_no_trigger(self) -> None:
+        # Endereço válido colado em mais alfanuméricos não é endereço.
+        ctx = _ctx(content=b"x1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+        assert _r_crypto_strings(ctx, "H018") is None
+        ctx = _ctx(content=b"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa0")
+        assert _r_crypto_strings(ctx, "H018") is None
+
+    def test_btc_p2sh_triggers(self) -> None:
+        ctx = _ctx(content=b'"addr":"3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"')
+        assert _r_crypto_strings(ctx, "H018") is not None
+
+    def test_bech32_segwit_triggers(self) -> None:
+        # Antes não era coberto: bc1... passava batido.
+        for addr in (b"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+                     b"BC1QAR0SRRR7XFKVY5L643LYDNW9RE59GTZZWF5MDQ",
+                     b"bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297"):
+            ctx = _ctx(content=b"payout " + addr + b"\n")
+            assert _r_crypto_strings(ctx, "H018") is not None, addr
+
+    def test_bech32_bad_checksum_or_mixed_case_no_trigger(self) -> None:
+        for addr in (b"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdr",
+                     b"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdQ"):
+            ctx = _ctx(content=b"payout " + addr + b"\n")
+            assert _r_crypto_strings(ctx, "H018") is None, addr
+
+    def test_monero_address_triggers(self) -> None:
+        # Formato padrão de config do xmrig — antes não era coberto.
+        addr = (b"44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaB"
+                b"YBb98uNbr2VBBEt7f2wfn3RVGQBEP3A")
+        assert len(addr) == 95
+        ctx = _ctx(content=b'{"pools":[{"user":"' + addr + b'"}]}')
+        assert _r_crypto_strings(ctx, "H018") is not None
+
+    def test_monero_wrong_length_no_trigger(self) -> None:
+        addr = (b"44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaB"
+                b"YBb98uNbr2VBBEt7f2wfn3RVGQBEP3")
+        ctx = _ctx(content=b'"user":"' + addr + b'"')
+        assert _r_crypto_strings(ctx, "H018") is None
+
+    def test_eth_inside_longer_hex_no_trigger(self) -> None:
+        # sha256 em hex com prefixo 0x (64 dígitos) não é endereço ETH.
+        ctx = _ctx(content=b"0x" + b"ab" * 32)
+        assert _r_crypto_strings(ctx, "H018") is None
+
+    def test_eth_address_still_triggers(self) -> None:
+        ctx = _ctx(content=b"WALLET=0x000000000000000000000000000000000000dEaD\n")
+        assert _r_crypto_strings(ctx, "H018") is not None
+
+    def test_dense_invalid_candidates_linear(self) -> None:
+        import time
+        data = (b"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb "
+                b"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdr ") * 3000
+        t = time.perf_counter()
+        assert _r_crypto_strings(_ctx(content=data), "H018") is None
+        assert time.perf_counter() - t < 2.0
 
 
 class TestRuleH019C2Beacon:
