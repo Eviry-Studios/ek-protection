@@ -15,6 +15,7 @@ Subsistemas ativos:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import signal
 from enum import Enum, auto
@@ -267,12 +268,22 @@ class EKEngine:
             FileEventKind.EXECUTED,
         ):
             return
-        if not event.is_executable_extension:
+        if event.is_executable_extension:
+            rules = None
+        elif (event.is_config_extension
+                and self.config.get("monitor.auto_scan_configs", True)):
+            # Só H024: as 23 regras em config davam 3,5% de suspeito nos
+            # configs reais da VPS (ver _RE_MINER_HINT em heuristics/rules.py).
+            from ekprotection.heuristics.rules import CONFIG_AUTOSCAN_RULES
+            rules = CONFIG_AUTOSCAN_RULES
+        else:
             return
 
         loop = asyncio.get_running_loop()
+        scan = (functools.partial(self.scanner.scan_file, event.path, heuristic_rules=rules)
+                if rules is not None else functools.partial(self.scanner.scan_file, event.path))
         try:
-            await loop.run_in_executor(None, self.scanner.scan_file, event.path)
+            await loop.run_in_executor(None, scan)
         except Exception as exc:
             logger.error("Erro no auto-scan de %s: %s", event.path, exc)
 

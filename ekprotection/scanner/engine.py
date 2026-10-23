@@ -91,7 +91,9 @@ class ScanEngine:
     # Scan de arquivo único
     # ------------------------------------------------------------------
 
-    def scan_file(self, path: str | Path) -> FileScanResult:
+    def scan_file(
+        self, path: str | Path, heuristic_rules: Optional[frozenset[str]] = None,
+    ) -> FileScanResult:
         """
         Escaneia um arquivo e retorna FileScanResult.
         Nunca lança exceção — erros são capturados no result.
@@ -103,7 +105,7 @@ class ScanEngine:
         t_start = time.monotonic()
 
         try:
-            result = self._scan_file_inner(path)
+            result = self._scan_file_inner(path, heuristic_rules)
         except Exception as exc:
             result = FileScanResult(
                 path      = path,
@@ -122,7 +124,9 @@ class ScanEngine:
 
         return result
 
-    def _scan_file_inner(self, path: str) -> FileScanResult:
+    def _scan_file_inner(
+        self, path: str, heuristic_rules: Optional[frozenset[str]] = None,
+    ) -> FileScanResult:
         p = Path(path)
 
         # --- Verificações básicas ---
@@ -222,7 +226,7 @@ class ScanEngine:
         h_result = None
         if self._heuristics:
             try:
-                h_result = self._heuristics.analyze(path)
+                h_result = self._heuristics.analyze(path, only_rules=heuristic_rules)
                 # Heurística avançada pode elevar o risco
                 if h_result.is_suspicious:
                     if h_result.risk_level in ("crítico", "alto") or not risk:

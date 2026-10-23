@@ -185,6 +185,109 @@ class TestAutoScanWiring:
             await engine.stop()
 
     @pytest.mark.asyncio
+    async def test_created_config_scanned_only_with_config_rules(
+        self, cfg: ConfigManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rodada 2026-10-23: config.json (onde o xmrig guarda carteira e
+        pool) nunca era auto-escaneado. Agora entra, só com H024."""
+        from ekprotection.heuristics.rules import CONFIG_AUTOSCAN_RULES
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            calls: list[tuple] = []
+            monkeypatch.setattr(engine.scanner, "scan_file",
+                                lambda p, heuristic_rules=None: calls.append((str(p), heuristic_rules)))
+
+            for name in ("config.json", "pool.yaml", "miner.conf"):
+                for kind in (FileEventKind.CREATED, FileEventKind.MOVED):
+                    await engine._on_monitor_event_auto_scan(
+                        FileEvent(kind=kind, path=str(tmp_path / name)))
+            await engine._on_monitor_event_auto_scan(
+                FileEvent(kind=FileEventKind.CREATED, path=str(tmp_path / "run.sh")))
+
+            assert len(calls) == 7
+            assert all(r == CONFIG_AUTOSCAN_RULES for _, r in calls[:6])
+            assert calls[6] == (str(tmp_path / "run.sh"), None)
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_config_autoscan_disabled_via_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.auto_scan_configs", False)
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            calls: list[str] = []
+            monkeypatch.setattr(engine.scanner, "scan_file",
+                                lambda p, heuristic_rules=None: calls.append(str(p)))
+            await engine._on_monitor_event_auto_scan(
+                FileEvent(kind=FileEventKind.CREATED, path=str(tmp_path / "config.json")))
+            assert calls == []
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_xmrig_config_json_auto_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso (rodada 2026-10-23): dropa um config.json no
+        formato do xmrig (endereço público do General Fund do Monero, pool
+        .invalid, nada executa) num diretório monitorado de verdade e
+        espera inotify -> auto-scan (só H024) -> quarentena. Um config
+        legítimo com "privateKey"/"mnemonic" e endereço ETH (o ruído medido
+        nos configs reais da VPS) é dropado antes e não pode gerar nada."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+        manager.set("quarantine.auto_quarantine_critical", True)
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            benign = watched / "hardhat.config.json"
+            benign.write_bytes(
+                b'{"address": "0x52908400098527886E0F7030069857D2E4169EE7", '
+                b'"privateKey": "<redacted>", "mnemonic": "<redacted>"}'
+            )
+            evil = watched / "config.json"
+            evil.write_bytes(
+                b'{"donate-level": 1, "pools": [{"algo": "rx/0", '
+                b'"url": "stratum+tcp://pool.example.invalid:3333", "user": '
+                b'"44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYB'
+                b'b98uNbr2VBBEt7f2wfn3RVGQBEP3A"}]}'
+            )
+
+            match = None
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None and not evil.exists():
+                    break
+
+            assert match is not None, "auto-scan não detectou o config.json do xmrig"
+            assert match.level.value == "CRITICAL"
+            assert not evil.exists()
+            assert any(e.original_path == str(evil) for e in engine.quarantine.list_active())
+            assert benign.exists()
+            assert not any(e.file_path == str(benign) for e in entries)
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
     async def test_end_to_end_real_eicar_via_fs_watcher(
         self, tmp_path: Path
     ) -> None:

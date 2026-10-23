@@ -59,6 +59,14 @@ class FileEvent:
             "", # sem extensão — pode ser ELF
         }
 
+    @property
+    def is_config_extension(self) -> bool:
+        """Config onde cryptominer guarda carteira/pool (config.json do
+        xmrig). Auto-escaneado só com CONFIG_AUTOSCAN_RULES."""
+        return self.extension in {
+            ".json", ".yaml", ".yml", ".conf", ".toml", ".ini", ".cfg",
+        }
+
 
 @dataclass(frozen=True)
 class ProcessEvent:

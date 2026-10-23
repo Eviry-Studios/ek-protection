@@ -930,6 +930,41 @@ def _r_crypto_strings(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
+# Rodada 2026-10-23: H024 (config de cryptominer). O `config.json` do xmrig
+# é onde a carteira fica de verdade, e o monitor em tempo real nunca o
+# escaneava (só extensões executáveis). Rodar as 23 regras em todo config
+# novo não serve: medido contra os 4527 .json/.yaml/.yml/.conf/.toml desta
+# VPS, 158 (3,5%) davam suspeito, a maioria H009 (chave "privateKey",
+# "keystore", "mnemonic" em config/fixture de repo) e H018 (endereço real
+# com checksum válido em fixture de repo cripto). Nenhum era minerador.
+# H024 exige as duas coisas no mesmo arquivo: endereço de carteira (mesmo
+# matcher do H018, com checksum) + indicador de minerador. Os indicadores
+# são específicos de minerador: esquema stratum (protocolo de pool),
+# `donate-level` (opção do xmrig, em config e em CLI) e `"algo"` com nome de
+# algoritmo de mineração.
+_RE_MINER_HINT = re.compile(
+    rb'stratum2?\+(?:tcp|ssl|tls)://|'
+    rb'["\'-]donate-level["\'=:\s]|'
+    rb'"algo"\s*:\s*"(?:rx/|cn/|cn-|randomx|kawpow|ethash|etchash|autolykos|argon2|ghostrider)',
+    re.I,
+)
+
+
+def _r_miner_config(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
+    """Carteira crypto + indicador de minerador (pool stratum, donate-level,
+    algoritmo de mineração) no mesmo arquivo."""
+    if not ctx.content_sample:
+        return None
+    hint = _RE_MINER_HINT.search(ctx.content_sample)
+    if not hint:
+        return None
+    wallet = _r_crypto_strings(ctx, rid)
+    if wallet is None:
+        return None
+    hint_txt = hint.group().decode('utf-8', errors='replace').strip('"\'-=: \t\r\n')
+    return RuleMatch(rid, f"carteira + {hint_txt}", evidence=wallet.evidence)
+
+
 def _base58check_ok(addr: bytes) -> bool:
     """Endereço BTC legado (P2PKH 0x00 / P2SH 0x05) com checksum sha256d
     válido. Chance de corrida aleatória passar: 2^-32 × versão certa."""
@@ -1246,7 +1281,16 @@ ALL_RULES: list[HeuristicRule] = [
                   "Leitura de chave/segredo (própria ou de wallet) + upload de rede",
                   "crítico", 9, ("crypto", "exfiltration", "credential"),
                   _match_fn=_r_secret_exfiltration),
+
+    HeuristicRule("H024", "Config de Cryptominer",
+                  "Carteira crypto + pool stratum/opção de minerador no mesmo arquivo",
+                  "crítico", 9, ("crypto", "miner", "config"),
+                  _match_fn=_r_miner_config),
 ]
+
+# Regras rodadas no auto-scan em tempo real de arquivos de config
+# (.json/.yaml/...). Ver comentário de _RE_MINER_HINT.
+CONFIG_AUTOSCAN_RULES: frozenset[str] = frozenset({"H024"})
 
 # Indexado por rule_id para lookup rápido
 RULES_BY_ID: dict[str, HeuristicRule] = {r.rule_id: r for r in ALL_RULES}

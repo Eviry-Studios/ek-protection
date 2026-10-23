@@ -53,6 +53,7 @@ DEFAULT_CONFIG: dict = {
         ],
         "poll_interval_ms": 500,       # Intervalo de polling como fallback (ms)
         "auto_scan_new_executables": True,  # dispara scan_file() em CREATED/MOVED/EXECUTED de executáveis
+        "auto_scan_configs": True,          # idem pra .json/.yaml/.conf/..., só com H024 (config de cryptominer)
     },
 
     # -- Scanner --------------------------------------------------------------

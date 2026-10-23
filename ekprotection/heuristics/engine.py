@@ -156,9 +156,12 @@ class HeuristicEngine:
     # API principal
     # ------------------------------------------------------------------
 
-    def analyze(self, path: str | Path) -> HeuristicResult:
+    def analyze(
+        self, path: str | Path, only_rules: Optional[frozenset[str]] = None,
+    ) -> HeuristicResult:
         """
-        Analisa um arquivo com todas as regras heurísticas.
+        Analisa um arquivo com todas as regras heurísticas (ou só as de
+        `only_rules`, usado no auto-scan de configs).
         Nunca lança exceção — erros internos resultam em score 0.
         """
         if not self._enabled:
@@ -173,7 +176,7 @@ class HeuristicEngine:
             logger.debug("Erro ao construir contexto para %s: %s", path_str, exc)
             return self._empty_result(path_str)
 
-        matches, rules_fired = self._evaluate_rules(ctx)
+        matches, rules_fired = self._evaluate_rules(ctx, only_rules)
         score, risk          = self._calculate_score(matches)
         confidence           = self._confidence(ctx)
 
@@ -282,12 +285,14 @@ class HeuristicEngine:
     # ------------------------------------------------------------------
 
     def _evaluate_rules(
-        self, ctx: HeuristicContext
+        self, ctx: HeuristicContext, only_rules: Optional[frozenset[str]] = None,
     ) -> tuple[list[RuleMatch], list[str]]:
         matches:     list[RuleMatch] = []
         rules_fired: list[str]       = []
 
         for rule in self._rules:
+            if only_rules is not None and rule.rule_id not in only_rules:
+                continue
             m = rule.match(ctx)
             if m is not None:
                 matches.append(m)

