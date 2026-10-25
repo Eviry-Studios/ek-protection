@@ -68,7 +68,7 @@ class HeuristicContext:
     is_script:      bool            = False
     is_executable:  bool            = False
     extension:      str             = ""
-    content_sample: Optional[bytes] = None   # primeiros 64KB do arquivo
+    content_sample: Optional[bytes] = None   # primeiro 1 MiB do arquivo (CONTENT_SAMPLE_SIZE)
     strings:        list[str]       = field(default_factory=list)  # strings extraídas
     process_name:   Optional[str]   = None
     process_cmdline: list[str]      = field(default_factory=list)
@@ -253,7 +253,19 @@ for _top in range(32):
             _acc ^= _g
     _BECH32_GEN.append(_acc)
 del _top, _acc, _i, _g
-_RE_IP_HARDCODED = re.compile(rb'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b')
+# H017, rodada 2026-10-24: o `\b` antigo casava 4 arcos no meio de OID
+# (`1.3.6.1.5.5.7.3.1` → `1.3.6.1`) e de versão (`1.2.3.4.5`). Agora o
+# dotted quad não pode ter ponto colado antes nem `.dígito` depois.
+# 2026-10-25: octeto validado em `_is_c2_candidate_ip`, não no regex — a
+# alternância por octeto + lookbehind no início tirava o `\b` como âncora e
+# custava ~4x o regex antigo por MiB; `\d{1,3}` com `\b` sai mais barato que
+# o original. Também fora: nome PTR reverso (`170.0.0.192.in-addr.arpa`, o
+# systemd-resolved embute vários) e número de seção (`RFC 8011 section
+# 4.1.6.2`, ipptool).
+_RE_IP_HARDCODED = re.compile(
+    rb'\b(?<!\.)(?<![Ss]ection )\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+    rb'(?!\.\d|(?i:\.in-addr\.arpa))'
+)
 _RE_FORK_BOMB    = re.compile(rb':\(\)\s*\{|:\|\s*:&|forkbomb', re.I | re.S)
 # H011, rodada 2026-10-04: a regex acima só cobre a fork bomb clássica com
 # a função nomeada ":" (`:(){ :|:& };:`) — trocar o nome da função
@@ -883,32 +895,83 @@ def _r_packed_upx(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return None
 
 
-def _is_rfc1918_or_loopback(ip: bytes) -> bool:
-    """127.0.0.0/8, 10.0.0.0/8, 192.168.0.0/16, ou 172.16.0.0/12 (só o
-    2º octeto 16-31 — "172." sozinho pega metade errada: 172.67.x.x
-    (Cloudflare) e 172.217.x.x (Google) são faixas PÚBLICAS reais, não
-    RFC1918, e C2 hardcoded ali passava batido como "IP local")."""
-    if ip.startswith((b"127.", b"10.", b"192.168.")):
-        return True
-    if ip.startswith(b"172."):
-        try:
-            second_octet = int(ip.split(b".", 2)[1])
-        except (IndexError, ValueError):
-            return False
-        return 16 <= second_octet <= 31
-    return False
+# Resolvers DNS públicos: malware usa (checagem de conectividade, descobrir
+# o IP local), mas não são C2. nmcli/nmtui embutem 8.8.8.8 + 8.8.4.4.
+_PUBLIC_RESOLVERS = frozenset({
+    b"8.8.8.8", b"8.8.4.4", b"1.1.1.1", b"1.0.0.1", b"9.9.9.9",
+    b"149.112.112.112", b"208.67.222.222", b"208.67.220.220",
+})
+# Root servers DNS (a–m; B tem 3 endereços na história): root hints do
+# dirmngr/unbound/bind. 2026-10-25, único H017 restante do dirmngr.
+_DNS_ROOT_SERVERS = frozenset({
+    b"198.41.0.4", b"170.247.170.2", b"199.9.14.201", b"192.228.79.201",
+    b"192.33.4.12", b"199.7.91.13", b"192.203.230.10", b"192.5.5.241",
+    b"192.112.36.4", b"198.97.190.53", b"192.36.148.17", b"192.58.128.30",
+    b"193.0.14.129", b"199.7.83.42", b"202.12.27.33",
+})
+
+
+def _net(cidr: str) -> tuple[int, int]:
+    base, bits = cidr.split("/")
+    mask = (0xFFFFFFFF << (32 - int(bits))) & 0xFFFFFFFF
+    return int.from_bytes(bytes(int(x) for x in base.split(".")), "big"), mask
+
+
+# Faixas não-globais/não-unicast do registro IANA (as mesmas que tiram o
+# `is_global` do `ipaddress`, + multicast). Máscara de inteiro em vez de
+# `ipaddress.IPv4Address`: com 1 MiB de quads únicos o `ipaddress` levava
+# 1,4s; isto leva bem menos (ver EK-Protection.md, 2026-10-24).
+_NON_GLOBAL_V4 = tuple(_net(c) for c in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+    "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15",
+    "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+))
+
+
+def _is_c2_candidate_ip(ip: bytes) -> bool:
+    """IP que pode ser C2: global e unicast (tira RFC1918, loopback, 0/8,
+    CGNAT, link-local, TEST-NET, multicast, 240/4), fora dos resolvers
+    públicos e sem cara de OID/versão.
+
+    Medido em 2026-10-24 nos 5575 ELFs da VPS: H017 disparava em 100, todos
+    falso positivo. A maioria era OID de X.509/LDAP/SNMP com 4 arcos, que
+    é formalmente um IPv4 válido (`2.5.29.19`, `1.3.6.1`, `1.3.101.112`), e
+    versão (`1.2.3.3` do zlib). OID começa com arco 0/1/2 e o 2º arco é
+    < 40 pra 0/1 (X.660), por isso `o[0] <= 2 and o[1] < 40` sai. Custo:
+    C2 real em 1.0–1.39.x.x / 2.0–2.39.x.x deixa de contar. Final .0/.255
+    (rede/broadcast, e versões tipo `13.0.10.0`) também sai."""
+    o = [int(x) for x in ip.split(b".")]
+    if max(o) > 255:
+        return False
+    if o[0] <= 2 and o[1] < 40:
+        return False
+    if o[3] in (0, 255) or ip in _PUBLIC_RESOLVERS or ip in _DNS_ROOT_SERVERS:
+        return False
+    n = (o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]
+    return not any((n & mask) == base for base, mask in _NON_GLOBAL_V4)
 
 
 def _r_hardcoded_ip(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
-    """IPs hardcoded no binário (possível C2)."""
+    """IPs hardcoded no binário (possível C2). Conta IPs distintos: o
+    mesmo IP repetido 5x (era o caso de `1.101.3.4` nos módulos do grub)
+    não é evidência de 2 destinos."""
     if not ctx.content_sample or not ctx.is_elf:
         return None
-    ips = _RE_IP_HARDCODED.findall(ctx.content_sample)
-    # Filtra IPs locais e de loopback
-    external = [
-        ip.decode("utf-8", errors="replace") for ip in ips
-        if not _is_rfc1918_or_loopback(ip)
-    ]
+    # Dedup antes de classificar e para no 5º (só 5 vão pra evidência):
+    # 1 MiB denso de OID/IP custava 0,5–0,7s validando cada ocorrência.
+    seen: set[bytes] = set()
+    found: list[str] = []
+    for m in _RE_IP_HARDCODED.finditer(ctx.content_sample):
+        ip = m.group()
+        if ip in seen:
+            continue
+        seen.add(ip)
+        if _is_c2_candidate_ip(ip):
+            found.append(ip.decode("ascii"))
+            if len(found) == 5:
+                break
+    external = sorted(found)
     if len(external) >= 2:
         return RuleMatch(rid, f"{len(external)} IPs externos hardcoded",
                          evidence=", ".join(external[:5]))
@@ -1038,6 +1101,32 @@ def _is_direct_home_dir(dirname: str) -> bool:
     return len(parts) == 3 and parts[1] == "home" and parts[2] != ""
 
 
+# Áreas graváveis por qualquer usuário, onde dropper cai primeiro (um
+# www-data comprometido não escreve em mais nada). H021/H022, 2026-10-24.
+_STAGING_DIRS = ("/tmp/", "/var/tmp/", "/dev/shm/")
+
+
+def _in_staging_dir(path: str) -> bool:
+    return path.startswith(_STAGING_DIRS)
+
+
+def _hidden_dir_in_staging(path: str) -> Optional[str]:
+    """Diretório oculto no caminho de um arquivo em /tmp, /var/tmp ou
+    /dev/shm — o padrão de botnet de mineração: Outlaw em
+    ``/tmp/.X25-unix/.rsync/c/``, TeamTNT/Kinsing em ``/tmp/.ICE-unix/``
+    e ``/dev/shm/.x/``. O nome do arquivo não começa com ponto, então o
+    H021 antigo (só basename) não via. Medido 2026-10-24: 1212 executáveis
+    sob diretório oculto na VPS (``~/.nvm``, ``~/.cache``, ``~/.local``...),
+    **zero** deles em área temporária — por isso só lá."""
+    if not _in_staging_dir(path):
+        return None
+    parts = path.split("/")[:-1]
+    for i, part in enumerate(parts):
+        if part.startswith(".") and part not in (".", ".."):
+            return "/".join(parts[:i + 1])
+    return None
+
+
 def _r_hidden_executable(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Arquivo oculto (começa com .) com bit de execução — exceto os
     scripts de início de sessão X padrão do sistema quando estão direto
@@ -1049,7 +1138,14 @@ def _r_hidden_executable(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]
     dispararia essa regra em praticamente toda conta de usuário."""
     import os
     name = os.path.basename(ctx.path)
-    if not (name.startswith(".") and ctx.is_executable):
+    if not ctx.is_executable:
+        return None
+    if not name.startswith("."):
+        hidden_dir = _hidden_dir_in_staging(ctx.path)
+        if hidden_dir:
+            return RuleMatch(
+                rid, f"executável dentro de diretório oculto em área "
+                     f"temporária: {hidden_dir}/.../{name}")
         return None
     dirname = os.path.dirname(ctx.path)
     if name in _HIDDEN_EXEC_ALLOWLIST and _is_direct_home_dir(dirname):
@@ -1122,6 +1218,20 @@ def _is_update_alternatives_symlink(path: str) -> bool:
     return os.path.dirname(path) == "/etc/alternatives"
 
 
+# H022, 2026-10-24: ELF com extensão de texto/imagem/dado é disfarce
+# (`/tmp/update.png`, `kdevtmpfsi.log`). Antes qualquer extensão saía da
+# regra. Medido nos 5575 ELFs da VPS: nenhum com extensão desta lista; as
+# extensões reais de ELF são .so, .so.N, .o, .mod, .node, .cgi, .real, .img.
+_MASQUERADE_EXTENSIONS = frozenset({
+    ".txt", ".log", ".md", ".csv", ".json", ".yaml", ".yml", ".xml",
+    ".html", ".htm", ".css", ".js", ".ini", ".cfg", ".conf", ".toml",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico", ".svg", ".webp",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".mp3", ".mp4", ".wav",
+    ".zip", ".gz", ".tgz", ".tar", ".bz2", ".xz", ".7z", ".rar",
+    ".sh", ".py", ".pl", ".rb", ".php", ".pid", ".lock", ".sql",
+})
+
+
 def _r_no_extension_elf(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     """Binário ELF sem extensão em local não-padrão.
 
@@ -1142,11 +1252,20 @@ def _r_no_extension_elf(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     std_dirs = ("/usr/", "/bin/", "/sbin/", "/lib/", "/opt/")
     if not ctx.is_elf:
         return None
+    if ctx.extension in _MASQUERADE_EXTENSIONS:
+        return RuleMatch(rid, f"binário ELF disfarçado de {ctx.extension}: "
+                              f"{ctx.path}")
     if ctx.extension != "":
         return None
     if any(ctx.path.startswith(d) for d in std_dirs):
         return None
     name = os.path.basename(ctx.path)
+    # As exceções abaixo são convenção de caminho, e caminho em /tmp o
+    # atacante cria com mkdir: `/tmp/node_modules/xmrig`,
+    # `/dev/shm/.cache/ms-playwright/kdevtmpfsi` e `/tmp/x/.venv/bin/python3`
+    # passavam (2026-10-24). Em área temporária não vale exceção.
+    if _in_staging_dir(ctx.path):
+        return RuleMatch(rid, f"binário ELF sem extensão em local não-padrão: {ctx.path}")
     if (_is_venv_bin_interpreter(ctx.path, name)
             or _is_nvm_bin(ctx.path, name)
             or _is_node_modules_binary(ctx.path)

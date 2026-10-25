@@ -1163,6 +1163,99 @@ class TestRuleH017HardcodedIP:
         assert _r_hardcoded_ip(ctx, "H017") is not None
 
 
+class TestRuleH017NoiseAndBoundary:
+    """Rodada 2026-10-24: 100 dos 5575 ELFs da VPS davam H017, todos falso
+    positivo (OID de 4 arcos, versão, 0.0.0.0, multicast, resolver)."""
+
+    def test_x509_oids_no_trigger(self) -> None:
+        # libgcr/gnome-keyring/libcups: OIDs X.509 de 4 arcos, NUL-separados.
+        ctx = _ctx(content=b"2.5.29.19\x002.5.29.37\x002.5.4.10\x001.3.101.112",
+                   is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_quad_inside_longer_oid_no_trigger(self) -> None:
+        # `\b` antigo casava `1.3.6.1` e `5.5.7.3` dentro do OID longo.
+        ctx = _ctx(content=b"oid 1.3.6.1.5.5.7.3.1 and 1.3.6.1.4.1.311.10.3.4",
+                   is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_version_strings_no_trigger(self) -> None:
+        ctx = _ctx(content=b"zlib 1.2.3.3 1.2.0.8 vmtools 13.0.10.0 1.2.3.4.5",
+                   is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_non_routable_no_trigger(self) -> None:
+        ctx = _ctx(content=b"0.0.0.0 255.255.255.255 224.0.0.56 169.254.1.1 "
+                           b"100.64.0.1 203.0.113.5 198.51.100.7",
+                   is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_public_resolvers_no_trigger(self) -> None:
+        # nmcli/nmtui embutem os dois do Google.
+        ctx = _ctx(content=b"8.8.8.8\x008.8.4.4\x001.1.1.1", is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_same_ip_repeated_counts_once(self) -> None:
+        ctx = _ctx(content=b"45.33.32.156 45.33.32.156 45.33.32.156", is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_c2_pair_amid_oids_still_triggers(self) -> None:
+        # Filtro não pode esconder C2 real misturado com OID.
+        ctx = _ctx(content=b"2.5.29.19\x00185.220.101.1\x001.3.6.1\x00"
+                           b"45.33.32.156\x008.8.8.8",
+                   is_elf=True)
+        m = _r_hardcoded_ip(ctx, "H017")
+        assert m is not None
+        assert m.evidence == "185.220.101.1, 45.33.32.156"
+
+    def test_c2_pair_with_trailing_dot_triggers(self) -> None:
+        # Fim de frase (`.` sem dígito depois) não é OID.
+        ctx = _ctx(content=b"to 185.220.101.1. then 45.33.32.156.", is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is not None
+
+    # Rodada 2026-10-25: os 3 H017 que sobraram nos 5810 ELFs da VPS.
+    def test_reverse_ptr_names_no_trigger(self) -> None:
+        # systemd-resolved: zonas reversas de DNS64/stub, não destino.
+        ctx = _ctx(content=b"170.0.0.192.in-addr.arpa\x00171.0.0.192.in-addr.arpa"
+                           b"\x0053.0.0.127.IN-ADDR.ARPA\x0054.0.0.127.in-addr.arpa",
+                   is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_rfc_section_numbers_no_trigger(self) -> None:
+        # ipptool: "(RFC 8011 section 4.1.6.2)".
+        ctx = _ctx(content=b"RFC 8011 section 4.1.6.2\x00RFC 8011 Section 4.1.6.3",
+                   is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_dns_root_hints_no_trigger(self) -> None:
+        # dirmngr embute os root servers.
+        ctx = _ctx(content=b"198.41.0.4\x00192.33.4.12\x00199.7.91.13\x00"
+                           b"192.203.230.10\x00192.228.79.201",
+                   is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_octet_over_255_no_trigger(self) -> None:
+        ctx = _ctx(content=b"999.220.101.1 45.33.32.256 300.1.1.1", is_elf=True)
+        assert _r_hardcoded_ip(ctx, "H017") is None
+
+    def test_c2_pair_next_to_ptr_and_port_triggers(self) -> None:
+        # Filtro de PTR é só para o sufixo; IP com porta continua contando.
+        ctx = _ctx(content=b"1.0.0.127.in-addr.arpa 185.220.101.1:3333 "
+                           b"stratum+tcp://45.33.32.156:443",
+                   is_elf=True)
+        m = _r_hardcoded_ip(ctx, "H017")
+        assert m is not None
+        assert m.evidence == "185.220.101.1, 45.33.32.156"
+
+    def test_dense_quads_1mib_fast(self) -> None:
+        import time
+        blob = (b"1.3.6.1.4.1.311.10.3.4 " * 50000)[:1 << 20]
+        ctx = _ctx(content=blob, is_elf=True)
+        t = time.perf_counter()
+        _r_hardcoded_ip(ctx, "H017")
+        assert time.perf_counter() - t < 1.0
+
+
 class TestRuleH018CryptoStrings:
     def test_bitcoin_address_triggers(self) -> None:
         # Endereço do bloco gênese. O teste antigo usava "...Divfna" (typo,
@@ -1549,6 +1642,70 @@ class TestRuleH022ElfNoExtension:
         # update-alternatives real nunca cria isso.
         ctx = _ctx(path="/etc/alternatives/fake/awk", is_elf=True, extension="")
         assert _r_no_extension_elf(ctx, "H022") is not None
+
+
+class TestRuleH021H022StagingEvasion:
+    """Rodada 2026-10-24: evasões por caminho/extensão em H021/H022."""
+
+    # H021: diretório oculto em área temporária (Outlaw, TeamTNT, Kinsing)
+    def test_exec_in_hidden_dir_in_tmp_triggers(self) -> None:
+        for path in ("/tmp/.X25-unix/.rsync/c/tsm64",
+                     "/tmp/.ICE-unix/xmrig",
+                     "/dev/shm/.x/kdevtmpfsi",
+                     "/var/tmp/.cache/sshd"):
+            ctx = _ctx(path=path, is_executable=True, extension="")
+            assert _r_hidden_executable(ctx, "H021") is not None, path
+
+    def test_non_exec_in_hidden_dir_in_tmp_no_trigger(self) -> None:
+        ctx = _ctx(path="/tmp/.X11-unix/X0", is_executable=False, extension="")
+        assert _r_hidden_executable(ctx, "H021") is None
+
+    def test_exec_in_hidden_dir_in_home_no_trigger(self) -> None:
+        # 1212 desses na VPS (~/.nvm, ~/.local/bin, ~/.cache): fora do escopo.
+        for path in ("/home/hermes/.nvm/versions/node/v22.0.0/bin/node",
+                     "/home/hermes/.local/bin/uv"):
+            ctx = _ctx(path=path, is_executable=True, extension="")
+            assert _r_hidden_executable(ctx, "H021") is None, path
+
+    # H022: exceções de caminho forjadas em área temporária
+    def test_allowlisted_conventions_in_tmp_trigger(self) -> None:
+        for path in ("/tmp/node_modules/xmrig",
+                     "/dev/shm/.cache/ms-playwright/kdevtmpfsi",
+                     "/tmp/x/.venv/bin/python3",
+                     "/var/tmp/.nvm/versions/node/v1/bin/node"):
+            ctx = _ctx(path=path, is_elf=True, extension="")
+            assert _r_no_extension_elf(ctx, "H022") is not None, path
+
+    def test_allowlisted_conventions_in_home_still_exempt(self) -> None:
+        for path in ("/home/u/proj/node_modules/esbuild/bin/esbuild",
+                     "/home/u/.cache/ms-playwright/chromium-1/chrome-linux/chrome",
+                     "/home/u/proj/.venv/bin/python3"):
+            ctx = _ctx(path=path, is_elf=True, extension="")
+            assert _r_no_extension_elf(ctx, "H022") is None, path
+
+    # H022: ELF disfarçado de extensão não-binária
+    def test_masquerading_elf_triggers(self) -> None:
+        for path, ext in (("/tmp/update.png", ".png"),
+                          ("/var/tmp/kdevtmpfsi.log", ".log"),
+                          ("/home/u/notes.txt", ".txt"),
+                          ("/usr/share/doc/x/readme.pdf", ".pdf"),
+                          ("/tmp/install.sh", ".sh")):
+            ctx = _ctx(path=path, is_elf=True, extension=ext)
+            m = _r_no_extension_elf(ctx, "H022")
+            assert m is not None, path
+            assert "disfarçado" in m.detail
+
+    def test_real_elf_extensions_no_trigger(self) -> None:
+        for path, ext in (("/home/u/lib/libfoo.so", ".so"),
+                          ("/home/u/lib/libicudata.so.73", ".73"),
+                          ("/home/u/node_modules/@rollup/r/rollup.linux-x64-gnu.node", ".node"),
+                          ("/home/u/build/main.o", ".o")):
+            ctx = _ctx(path=path, is_elf=True, extension=ext)
+            assert _r_no_extension_elf(ctx, "H022") is None, path
+
+    def test_non_elf_with_masquerade_ext_no_trigger(self) -> None:
+        ctx = _ctx(path="/tmp/photo.png", is_elf=False, extension=".png")
+        assert _r_no_extension_elf(ctx, "H022") is None
 
 
 class TestRuleH023SecretExfiltration:
