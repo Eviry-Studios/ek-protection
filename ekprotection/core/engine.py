@@ -256,6 +256,7 @@ class EKEngine:
 
     async def _on_monitor_event_auto_scan(self, event: Any) -> None:
         from ekprotection.monitor.events import FileEvent, FileEventKind
+        from ekprotection.scanner.hasher import is_elf
 
         if not isinstance(event, FileEvent) or event.is_dir:
             return
@@ -264,11 +265,22 @@ class EKEngine:
         # duplicados do mesmo arquivo já coberto no CREATED inicial.
         if event.kind not in (
             FileEventKind.CREATED,
+            FileEventKind.CLOSED,
             FileEventKind.MOVED,
             FileEventKind.EXECUTED,
         ):
             return
+        # Vazio no IN_CREATE = open() de quem ainda vai escrever; o scan
+        # útil vem no CLOSED. (Com o polling observer não há CLOSED, mas o
+        # polling só vê o arquivo depois que ele já tem conteúdo.)
+        if event.kind == FileEventKind.CREATED and event.size == 0:
+            return
         if event.is_executable_extension:
+            rules = None
+        elif is_elf(event.path):  # só 4 bytes lidos
+            # ELF com extensão de imagem/texto/config (`/tmp/update.png`,
+            # `x.json`): pela extensão nunca era escaneado, ou só com H024,
+            # e o H022 (disfarce) nunca rodava em tempo real (2026-10-26).
             rules = None
         elif (event.is_config_extension
                 and self.config.get("monitor.auto_scan_configs", True)):

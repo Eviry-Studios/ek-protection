@@ -407,6 +407,21 @@ class TestScanEngineFile:
         r = engine.scan_file(f)
         assert r.verdict == ScanVerdict.SKIPPED
 
+    def test_png_real_still_skipped(self, engine: ScanEngine, tmp_path: Path) -> None:
+        f = tmp_path / "logo.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        assert engine.scan_file(f).verdict == ScanVerdict.SKIPPED
+
+    def test_elf_disguised_as_png_not_skipped(self, engine: ScanEngine,
+                                              tmp_path: Path) -> None:
+        """2026-10-26: `update.png` que é ELF saía como SKIPPED pela extensão,
+        então o H022 (disfarce) nunca rodava, nem sob demanda."""
+        f = tmp_path / "update.png"
+        f.write_bytes(b"\x7fELF" + b"\x00" * 100)
+        r = engine.scan_file(f)
+        assert r.verdict != ScanVerdict.SKIPPED
+        assert r.is_elf
+
     def test_large_file_skipped(self, cfg: ConfigManager, sig_db: SignatureDB,
                                 tmp_path: Path) -> None:
         cfg.set("scanner.max_file_size_mb", 0)   # 0MB = qualquer arquivo é grande demais

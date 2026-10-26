@@ -82,6 +82,12 @@ class _EKPEventHandler(FileSystemEventHandler):
     def on_modified(self, event: FileSystemEvent) -> None:
         self._push(event.src_path, FileEventKind.MODIFIED, event.is_directory)
 
+    def on_closed(self, event: FileSystemEvent) -> None:
+        # IN_CLOSE_WRITE. No IN_CREATE o arquivo ainda está vazio ou pela
+        # metade (download lento era escaneado com 1/4 do conteúdo, medido
+        # 2026-10-26); é aqui que o conteúdo final existe.
+        self._push(event.src_path, FileEventKind.CLOSED, event.is_directory)
+
     def on_deleted(self, event: FileSystemEvent) -> None:
         self._push(event.src_path, FileEventKind.DELETED, event.is_directory)
 

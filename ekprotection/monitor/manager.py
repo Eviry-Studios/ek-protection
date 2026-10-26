@@ -228,6 +228,7 @@ class MonitorManager:
                 FileEventKind.DELETED:  (EventType.FILE_DELETED,  LogLevel.DEBUG),
                 FileEventKind.MOVED:    (EventType.FILE_MODIFIED, LogLevel.DEBUG),
                 FileEventKind.EXECUTED: (EventType.FILE_EXECUTED, LogLevel.INFO),
+                FileEventKind.CLOSED:   (EventType.FILE_MODIFIED, LogLevel.DEBUG),
             }
             etype, level = kind_map.get(event.kind, (EventType.GENERIC, LogLevel.DEBUG))
             msg = f"[{event.kind.name}] {event.path}"

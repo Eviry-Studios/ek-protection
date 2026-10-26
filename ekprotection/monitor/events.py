@@ -25,6 +25,7 @@ class FileEventKind(Enum):
     DELETED  = auto()
     MOVED    = auto()
     EXECUTED = auto()   # detectado via modificação de xattr/execve (heurística)
+    CLOSED   = auto()   # IN_CLOSE_WRITE: escrita terminou (download/cp completo)
 
 
 class ProcEventKind(Enum):
