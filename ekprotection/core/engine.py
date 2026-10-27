@@ -17,7 +17,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
 import signal
+import stat as stat_mod
+from collections import OrderedDict
 from enum import Enum, auto
 from typing import Any
 
@@ -52,6 +55,11 @@ class EKEngine:
         self.scanner:     Any = None
         self.heuristics:  Any = None
         self.updater:     Any = None
+
+        # path -> (inode, tinha bit de exec) do último auto-scan. Serve pra
+        # reconhecer o `chmod +x` que vem depois da escrita (ver
+        # _is_new_exec_bit). Limitado a _EXEC_SEEN_MAX entradas (LRU).
+        self._exec_seen: OrderedDict[str, tuple[int, bool]] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -263,7 +271,14 @@ class EKEngine:
         # DELETED/MODIFIED de propósito fora: MODIFIED dispararia várias
         # vezes durante uma escrita em partes (download), gerando scans
         # duplicados do mesmo arquivo já coberto no CREATED inicial.
-        if event.kind not in (
+        # Exceção: MODIFIED que é o `chmod +x` (IN_ATTRIB chega como
+        # MODIFIED no watchdog) de um arquivo já escaneado sem o bit. O scan
+        # do CLOSED via `is_executable=False` e o H021 nunca disparava
+        # (2026-10-27).
+        if event.kind == FileEventKind.MODIFIED:
+            if not self._is_new_exec_bit(event.path):
+                return
+        elif event.kind not in (
             FileEventKind.CREATED,
             FileEventKind.CLOSED,
             FileEventKind.MOVED,
@@ -291,6 +306,7 @@ class EKEngine:
         else:
             return
 
+        self._remember_exec_state(event.path)
         loop = asyncio.get_running_loop()
         scan = (functools.partial(self.scanner.scan_file, event.path, heuristic_rules=rules)
                 if rules is not None else functools.partial(self.scanner.scan_file, event.path))
@@ -298,6 +314,32 @@ class EKEngine:
             await loop.run_in_executor(None, scan)
         except Exception as exc:
             logger.error("Erro no auto-scan de %s: %s", event.path, exc)
+
+    _EXEC_SEEN_MAX = 4096
+    _EXEC_BITS = stat_mod.S_IXUSR | stat_mod.S_IXGRP | stat_mod.S_IXOTH
+
+    def _remember_exec_state(self, path: str) -> None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        self._exec_seen[path] = (st.st_ino, bool(st.st_mode & self._EXEC_BITS))
+        self._exec_seen.move_to_end(path)
+        if len(self._exec_seen) > self._EXEC_SEEN_MAX:
+            self._exec_seen.popitem(last=False)
+
+    def _is_new_exec_bit(self, path: str) -> bool:
+        """True só se o arquivo já foi auto-escaneado sem bit de exec e agora
+        tem. MODIFIED de escrita (bit não mudou) e arquivo nunca escaneado
+        continuam ignorados: medido em 2026-10-27, ver EK-Protection.md."""
+        prev = self._exec_seen.get(path)
+        if prev is None or prev[1]:
+            return False
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        return st.st_ino == prev[0] and bool(st.st_mode & self._EXEC_BITS)
 
     # ------------------------------------------------------------------
     # Utilitários

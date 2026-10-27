@@ -7,6 +7,7 @@ Testes do EKEngine (core).
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -367,6 +368,139 @@ class TestAutoScanWiring:
 
             assert match is not None, "conteúdo escrito depois do IN_CREATE não foi escaneado"
             assert match.level.value == "CRITICAL"
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_modified_rescans_only_on_new_exec_bit(
+        self, cfg: ConfigManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """2026-10-27: `chmod +x` depois da escrita chega como MODIFIED
+        (IN_ATTRIB) e era ignorado. Re-scan só na transição sem->com bit de
+        um arquivo já escaneado; escrita (MODIFIED sem mudar o bit), arquivo
+        nunca escaneado e segundo chmod continuam sem scan."""
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        # Monitor real olhando outro lugar: senão o inotify de verdade sobre
+        # tmp_path (/tmp) também chama o callback e duplica as chamadas.
+        (tmp_path / "unwatched").mkdir()
+        cfg.set("monitor.paths", [str(tmp_path / "unwatched")])
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            calls: list[str] = []
+            monkeypatch.setattr(engine.scanner, "scan_file", lambda p: calls.append(str(p)))
+
+            payload = tmp_path / "payload"
+            payload.write_bytes(b"#!/bin/sh\ntrue\n")
+            payload.chmod(0o644)
+            never = tmp_path / "never_scanned.sh"
+            never.write_bytes(b"#!/bin/sh\n")
+            mod = lambda p: FileEvent(kind=FileEventKind.MODIFIED, path=str(p))
+
+            await engine._on_monitor_event_auto_scan(
+                FileEvent(kind=FileEventKind.CLOSED, path=str(payload)))
+            assert calls == [str(payload)]
+
+            await engine._on_monitor_event_auto_scan(mod(payload))  # escrita, sem bit
+            assert calls == [str(payload)]
+
+            payload.chmod(0o755)
+            await engine._on_monitor_event_auto_scan(mod(payload))
+            assert calls == [str(payload)] * 2
+
+            payload.chmod(0o700)
+            await engine._on_monitor_event_auto_scan(mod(payload))
+            assert calls == [str(payload)] * 2
+
+            never.chmod(0o755)
+            await engine._on_monitor_event_auto_scan(mod(never))
+            assert calls == [str(payload)] * 2
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_modified_after_replace_is_not_treated_as_chmod(
+        self, cfg: ConfigManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inode diferente = outro arquivo no mesmo path; esse caminho é
+        coberto pelo CREATED/MOVED dele, não pelo re-scan de chmod."""
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+
+        # Monitor real olhando outro lugar: senão o inotify de verdade sobre
+        # tmp_path (/tmp) também chama o callback e duplica as chamadas.
+        (tmp_path / "unwatched").mkdir()
+        cfg.set("monitor.paths", [str(tmp_path / "unwatched")])
+        engine = EKEngine(cfg)
+        await engine.start()
+        try:
+            calls: list[str] = []
+            monkeypatch.setattr(engine.scanner, "scan_file", lambda p: calls.append(str(p)))
+
+            target = tmp_path / "run.sh"
+            target.write_bytes(b"#!/bin/sh\n")
+            target.chmod(0o644)
+            await engine._on_monitor_event_auto_scan(
+                FileEvent(kind=FileEventKind.CLOSED, path=str(target)))
+            other = tmp_path / "other.sh"
+            other.write_bytes(b"#!/bin/sh\n")
+            other.chmod(0o755)
+            os.replace(other, target)  # inode diferente (unlink+create pode reusar)
+            await engine._on_monitor_event_auto_scan(
+                FileEvent(kind=FileEventKind.MODIFIED, path=str(target)))
+            assert calls == [str(target)]
+        finally:
+            await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_chmod_x_after_write_triggers_h021(
+        self, tmp_path: Path
+    ) -> None:
+        """Teste intenso 2026-10-27: script inofensivo escrito sem bit de
+        exec em diretório oculto de área temporária (`.X25-unix/.rsync/c/tsm`,
+        layout de dropper de minerador) e só depois `chmod +x`, como faz
+        `curl -o x && chmod +x x`. O scan do CLOSED via `is_executable=False`
+        e o H021 nunca rodava com o bit. (Em /tmp o H002 já pega o script;
+        fora de /tmp — `~/.cache/.sshd` — o H021 é a única regra.)"""
+        watched = tmp_path / "watch"
+        drop = watched / ".X25-unix" / ".rsync" / "c"
+        drop.mkdir(parents=True)
+
+        manager = ConfigManager(tmp_path / "config.yaml")
+        manager.load()
+        manager.set("monitor.paths", [str(watched)])
+
+        engine = EKEngine(manager)
+        await engine.start()
+        try:
+            fired: list[list[str]] = []
+            real_analyze = engine.heuristics.analyze
+
+            def spy(path, *a, **kw):
+                res = real_analyze(path, *a, **kw)
+                if str(path) == str(tsm):
+                    fired.append(list(res.rules_fired))
+                return res
+
+            engine.scanner._heuristics.analyze = spy
+
+            tsm = drop / "tsm"
+            tsm.write_bytes(b"#!/bin/sh\necho ok\n")
+            tsm.chmod(0o644)
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if fired:
+                    break
+            assert fired and all("H021" not in f for f in fired)
+            tsm.chmod(0o755)
+
+            for _ in range(50):  # até ~5s
+                await asyncio.sleep(0.1)
+                if any("H021" in f for f in fired):
+                    break
+
+            assert any("H021" in f for f in fired), (
+                f"chmod +x depois da escrita não gerou re-scan com H021: {fired}")
         finally:
             await engine.stop()
 
