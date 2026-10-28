@@ -457,12 +457,123 @@ class TestProcWatcher:
 
             mock_proc = MagicMock(spec=psutil.Process)
             mock_proc.name.return_value = "systemd"   # sempre confiável
+            mock_proc.exe.return_value  = "/usr/lib/systemd/systemd"
+            mock_proc.create_time.return_value = 1.0
+            mock_proc.cmdline.return_value = ["/sbin/init"]
 
             with patch("psutil.Process", return_value=mock_proc):
                 return await pw._check_suspicious(1)
 
         result = asyncio.run(_run())
         assert result is None
+
+
+def _mock_proc(name: str, exe: str, cmdline: list[str], ctime: float = 1.0) -> MagicMock:
+    import psutil
+    m = MagicMock(spec=psutil.Process)
+    m.name.return_value = name
+    m.exe.return_value = exe
+    m.cmdline.return_value = cmdline
+    m.create_time.return_value = ctime
+    m.cpu_percent.return_value = 0.0
+    m.net_connections.return_value = []
+    m.ppid.return_value = 1
+    m.username.return_value = "x"
+    m.memory_percent.return_value = 0.0
+    return m
+
+
+_XMR = "48" + "A" * 93
+_BTC = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+
+
+class TestProcWatcherTrustedNameAndMiner:
+    """Rodada 2026-10-28: nome confiável (comm = basename do executável) não
+    dispensa mais exe em dir suspeito nem minerador na cmdline."""
+
+    def _check(self, queue: asyncio.Queue, proc: MagicMock, pid: int = 4242,
+               pw: ProcWatcher | None = None) -> ProcessEvent | None:
+        pw = pw or ProcWatcher(queue, interval=1.0)
+        with patch("psutil.Process", return_value=proc):
+            return asyncio.run(pw._check_suspicious(pid))
+
+    @pytest.mark.parametrize("name", ["bash", "kworker", "sshd", "systemd"])
+    def test_trusted_name_in_tmp_flagged(self, event_queue: asyncio.Queue, name: str) -> None:
+        ev = self._check(event_queue, _mock_proc(name, f"/tmp/.x/{name}", [name]))
+        assert ev is not None and "/tmp" in (ev.reason or "")
+
+    def test_trusted_name_miner_cmdline_flagged(self, event_queue: asyncio.Queue) -> None:
+        argv = ["sshd", "-o", "stratum+tcp://pool.example.com:3333", "--donate-level", "1"]
+        ev = self._check(event_queue, _mock_proc("sshd", "/usr/bin/python3", argv))
+        assert ev is not None and "minerador" in (ev.reason or "")
+
+    @pytest.mark.parametrize("argv", [
+        ["kdevtmpfsi", "-o", "pool.minexmr.com:443", "-u", _BTC, "-k", "--tls"],
+        ["xmrig", "--url=10.0.0.5:3333", "--algo=rx/0"],
+        ["x", "-o", "stratum+ssl://p.example.org:443"],
+        ["x", "-a", "kawpow", "-u", _XMR],
+    ])
+    def test_miner_cmdline_flagged(self, event_queue: asyncio.Queue, argv: list[str]) -> None:
+        ev = self._check(event_queue, _mock_proc("x", "/usr/local/bin/x", argv))
+        assert ev is not None and "minerador" in (ev.reason or "")
+
+    @pytest.mark.parametrize("argv", [
+        ["grep", "-r", "stratum+tcp://", "/etc"],
+        ["curl", "-o", "a.example.com:80", "http://x"],
+        ["gcc", "-o", "main", "main.c"],
+        ["ssh", "-o", "Port=22", "host"],
+        ["geth", "--etherbase", "0x" + "ab" * 20],
+        ["vim", "notes-donate-level.txt"],
+    ])
+    def test_single_or_no_signal_not_flagged(self, event_queue: asyncio.Queue,
+                                             argv: list[str]) -> None:
+        assert self._check(event_queue, _mock_proc("x", "/usr/bin/x", argv)) is None
+
+    def test_cmdline_cached_per_create_time(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = _mock_proc("x", "/usr/bin/x", ["x"])
+        self._check(event_queue, proc, pw=pw)
+        self._check(event_queue, proc, pw=pw)
+        assert proc.cmdline.call_count == 1
+        # PID reusado por outro processo (create_time diferente) relê a cmdline
+        proc2 = _mock_proc("x", "/usr/bin/x",
+                           ["x", "-o", "stratum+tcp://p.example.com:1", "--donate-level", "0"],
+                           ctime=2.0)
+        ev = self._check(event_queue, proc2, pw=pw)
+        assert pw._miner_cache[4242][0] == 2.0
+        assert ev is not None and "minerador" in (ev.reason or "")
+
+    def test_cache_pruned_on_terminate(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        pw._snapshot = {1: "systemd", 4242: "x"}
+        pw._miner_cache = {4242: (1.0, [])}
+        with patch.object(pw, "_current_pids", return_value={1: "systemd"}), \
+             patch.object(pw, "_check_suspicious", return_value=None):
+            asyncio.run(pw._tick())
+        assert 4242 not in pw._miner_cache
+
+    def test_end_to_end_real_process(self, event_queue: asyncio.Queue,
+                                     tmp_path: Path) -> None:
+        """Processo real e inofensivo (python dormindo) via symlink chamado
+        `sshd` fora de /tmp, com argv de xmrig. Antes do fix: None."""
+        import subprocess, sys
+        link = tmp_path / "sshd"
+        link.symlink_to(os.path.realpath(sys.executable))
+        miner = subprocess.Popen([str(link), "-c", "import time; time.sleep(30)",
+                                  "-o", "stratum+tcp://pool.example.com:3333",
+                                  "-u", _XMR, "--donate-level", "1"])
+        benign = subprocess.Popen([str(link), "-c", "import time; time.sleep(30)",
+                                   "grep", "stratum+tcp://"])
+        try:
+            time.sleep(0.3)
+            pw = ProcWatcher(event_queue, interval=1.0)
+            ev = asyncio.run(pw._check_suspicious(miner.pid))
+            assert ev is not None and ev.name == "sshd"
+            assert "minerador" in (ev.reason or "")
+            assert asyncio.run(pw._check_suspicious(benign.pid)) is None
+        finally:
+            for p in (miner, benign):
+                p.kill(); p.wait()
 
 
 # ---------------------------------------------------------------------------

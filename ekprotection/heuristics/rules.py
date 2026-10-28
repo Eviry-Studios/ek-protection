@@ -1028,6 +1028,46 @@ def _r_miner_config(ctx: HeuristicContext, rid: str) -> Optional[RuleMatch]:
     return RuleMatch(rid, f"carteira + {hint_txt}", evidence=wallet.evidence)
 
 
+# Rodada 2026-10-28: o mesmo indicador do H024 na cmdline de processo
+# (usado pelo ProcWatcher). Minerador lançado por dropper costuma vir sem
+# config.json, tudo na linha de comando: `kdevtmpfsi -o pool:443 -u <carteira>`
+# ou `xmrig -o stratum+tcp://... --donate-level 1`. Exige 2 sinais distintos,
+# assim `grep stratum+tcp:// x`, `curl -o a:80` ou um `geth` com endereço 0x
+# no argv não disparam sozinhos.
+_RE_CMD_STRATUM = re.compile(r'stratum2?\+(?:tcp|ssl|tls)://', re.I)
+_RE_CMD_ALGO    = re.compile(
+    r'(?:rx/|cn/|cn-|randomx|kawpow|ethash|etchash|autolykos|argon2|ghostrider)', re.I)
+_RE_CMD_POOL    = re.compile(r'(?:[a-z][a-z0-9+]*://)?(?:[\w-]+\.)+[\w-]+:\d{2,5}/?', re.I)
+
+
+def cmdline_miner_signals(argv: list[str]) -> list[str]:
+    """Sinais de minerador na cmdline: pool stratum, `--donate-level`,
+    `-a/--algo` de mineração, `-o/--url host:porta`, carteira com checksum.
+    Devolve a lista de sinais distintos (o chamador decide o limiar)."""
+    signals: list[str] = []
+
+    def add(s: str) -> None:
+        if s not in signals:
+            signals.append(s)
+
+    for i, arg in enumerate(argv):
+        flag, eq, inline = arg.partition('=')
+        nxt = inline if eq else (argv[i + 1] if i + 1 < len(argv) else '')
+        if _RE_CMD_STRATUM.search(arg):
+            add('stratum')
+        if flag == '--donate-level':
+            add('donate-level')
+        if flag in ('-a', '--algo') and _RE_CMD_ALGO.match(nxt):
+            add('algo')
+        if flag in ('-o', '--url') and _RE_CMD_POOL.fullmatch(nxt):
+            add('pool')
+    if argv and _r_crypto_strings(
+            HeuristicContext(path='', content_sample=' '.join(argv).encode('utf-8', 'replace')),
+            '') is not None:
+        add('carteira')
+    return signals
+
+
 def _base58check_ok(addr: bytes) -> bool:
     """Endereço BTC legado (P2PKH 0x00 / P2SH 0x05) com checksum sha256d
     válido. Chance de corrida aleatória passar: 2^-32 × versão certa."""

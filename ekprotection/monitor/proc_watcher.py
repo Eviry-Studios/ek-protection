@@ -13,6 +13,7 @@ Detecta:
       * Processos com UID 0 inesperados
       * Processos com muitas conexões de rede abertas
       * Shells invocadas por processos não-interativos
+      * Minerador na cmdline (pool stratum, carteira, --donate-level...)
 
 Design:
   - Polling periódico assíncrono (não usa inotify para processos)
@@ -30,6 +31,7 @@ from typing import Optional
 
 import psutil
 
+from ..heuristics.rules import cmdline_miner_signals
 from .events import ProcessEvent, ProcEventKind
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,9 @@ _SUSPICIOUS_EXEC_DIRS = {
     "/tmp", "/dev/shm", "/var/tmp", "/run/user",
     "/proc/self/fd",
 }
+
+# Sinais distintos de minerador na cmdline pra alertar (ver cmdline_miner_signals)
+_MINER_MIN_SIGNALS = 2
 
 # Limites para alertas
 _CPU_ALERT_PCT    = 80.0   # % de CPU sustentado por 2 ciclos consecutivos
@@ -81,6 +86,8 @@ class ProcWatcher:
         self._running  = False
         self._snapshot: dict[int, str] = {}   # pid → name
         self._cpu_high: dict[int, int] = {}   # pid → contagem de ciclos com CPU alto
+        # pid → (create_time, sinais de minerador): cmdline lida uma vez por processo
+        self._miner_cache: dict[int, tuple[float, list[str]]] = {}
 
     # ------------------------------------------------------------------
     # Loop principal
@@ -131,6 +138,7 @@ class ProcWatcher:
                 name  = self._snapshot.get(pid, "?"),
             )
             await self._queue.put(ev)
+            self._miner_cache.pop(pid, None)
 
         # Verifica suspeitos nos processos em execução
         for pid in current:
@@ -149,9 +157,12 @@ class ProcWatcher:
         try:
             proc = psutil.Process(pid)
             name = proc.name()
-
-            if name in self._trusted:
-                return None
+            # Rodada 2026-10-28: o nome (comm) é só o basename do executável,
+            # então `cp xmrig /tmp/bash` herdava a confiança e pulava tudo.
+            # Nome confiável agora só dispensa as checagens de comportamento
+            # (CPU, conexões); executável em dir suspeito e minerador na
+            # cmdline valem pra qualquer nome.
+            trusted = name in self._trusted
 
             reasons: list[str] = []
 
@@ -164,6 +175,13 @@ class ProcWatcher:
                         break
             except (psutil.AccessDenied, psutil.NoSuchProcess, FileNotFoundError):
                 exe = None
+
+            miner = self._miner_signals(proc, pid)
+            if len(miner) >= _MINER_MIN_SIGNALS:
+                reasons.append(f"minerador na cmdline ({', '.join(miner)})")
+
+            if trusted and not reasons:
+                return None
 
             # Processo sem nome
             if not name or name.strip() == "":
@@ -240,6 +258,20 @@ class ProcWatcher:
             )
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
             return None
+
+    def _miner_signals(self, proc: psutil.Process, pid: int) -> list[str]:
+        """Sinais de minerador na cmdline, com cache por (pid, create_time)
+        pra não reler /proc/<pid>/cmdline de todo processo a cada tick."""
+        try:
+            ctime = proc.create_time()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            return []
+        cached = self._miner_cache.get(pid)
+        if cached is not None and cached[0] == ctime:
+            return cached[1]
+        signals = cmdline_miner_signals(self._safe_cmdline(proc))
+        self._miner_cache[pid] = (ctime, signals)
+        return signals
 
     @staticmethod
     def _current_pids() -> dict[int, str]:
