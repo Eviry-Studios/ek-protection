@@ -535,7 +535,10 @@ class TestProcWatcherTrustedNameAndMiner:
         self._check(event_queue, proc, pw=pw)
         self._check(event_queue, proc, pw=pw)
         assert proc.cmdline.call_count == 1
-        # PID reusado por outro processo (create_time diferente) relê a cmdline
+        # PID reusado por outro processo (create_time diferente) relê a cmdline.
+        # O watcher guarda o Process entre ticks (2026-10-29); psutil real dá
+        # is_running() False quando o create_time do PID mudou.
+        proc.is_running.return_value = False
         proc2 = _mock_proc("x", "/usr/bin/x",
                            ["x", "-o", "stratum+tcp://p.example.com:1", "--donate-level", "0"],
                            ctime=2.0)
@@ -579,6 +582,109 @@ class TestProcWatcherTrustedNameAndMiner:
 # ---------------------------------------------------------------------------
 # Testes: MonitorManager
 # ---------------------------------------------------------------------------
+
+class TestProcWatcherCpuAndTrustedExe:
+    """Rodada 2026-10-29: cpu_percent(None) num psutil.Process novo sempre dá
+    0.0, e o watcher criava um objeto por tick, então a checagem de CPU nunca
+    disparou. E nome confiável embutido agora exige exe de sistema."""
+
+    def _ticks(self, queue: asyncio.Queue, proc: MagicMock, n: int,
+               pw: ProcWatcher | None = None, pid: int = 4343) -> list:
+        pw = pw or ProcWatcher(queue, interval=1.0)
+        with patch("psutil.Process", return_value=proc):
+            return [asyncio.run(pw._check_suspicious(pid)) for _ in range(n)]
+
+    def _busy(self, name: str, exe: str | None) -> MagicMock:
+        import psutil
+        m = _mock_proc(name, exe or "", [name])
+        if exe is None:
+            m.exe.side_effect = psutil.AccessDenied(4343)
+        m.cpu_percent.return_value = 99.0
+        return m
+
+    def test_process_object_reused_between_ticks(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = _mock_proc("x", "/usr/local/bin/x", ["x"])
+        with patch("psutil.Process", return_value=proc) as ctor:
+            for _ in range(3):
+                asyncio.run(pw._check_suspicious(4343))
+        assert ctor.call_count == 1
+
+    def test_untrusted_high_cpu_flagged_on_second_tick(self, event_queue: asyncio.Queue) -> None:
+        evs = self._ticks(event_queue, self._busy("x", "/usr/local/bin/x"), 3)
+        assert evs[0] is None
+        assert evs[1] is not None and "CPU alta" in (evs[1].reason or "")
+        assert evs[1].cpu_pct == 99.0
+
+    def test_cpu_percent_called_once_per_tick(self, event_queue: asyncio.Queue) -> None:
+        proc = self._busy("x", "/usr/local/bin/x")
+        self._ticks(event_queue, proc, 3)
+        assert proc.cpu_percent.call_count == 3
+
+    @pytest.mark.parametrize("name,exe", [
+        ("bash", "/home/u/.cache/bash"),
+        ("sshd", "/opt/x/sshd"),
+        ("kworker", "/var/lib/kworker"),
+        ("bash", "/usr/binx/bash"),
+    ])
+    def test_trusted_name_outside_system_dirs_loses_trust(
+        self, event_queue: asyncio.Queue, name: str, exe: str
+    ) -> None:
+        evs = self._ticks(event_queue, self._busy(name, exe), 2)
+        assert evs[1] is not None and "CPU alta" in (evs[1].reason or "")
+
+    @pytest.mark.parametrize("name,exe", [
+        ("bash", "/usr/bin/bash"),
+        ("sshd", "/usr/sbin/sshd"),
+        ("systemd", "/usr/lib/systemd/systemd"),
+        ("bash", "/usr/bin/bash (deleted)"),   # binário trocado por upgrade
+        ("kworker", ""),                        # thread de kernel
+        ("sshd", None),                         # AccessDenied: mantém confiança
+    ])
+    def test_trusted_name_with_system_exe_keeps_trust(
+        self, event_queue: asyncio.Queue, name: str, exe: str | None
+    ) -> None:
+        assert self._ticks(event_queue, self._busy(name, exe), 3) == [None] * 3
+
+    def test_user_trusted_name_keeps_trust_by_name(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0, trusted={"myapp"})
+        evs = self._ticks(event_queue, self._busy("myapp", "/opt/myapp/myapp"), 3, pw=pw)
+        assert evs == [None] * 3
+
+    def test_pid_reuse_gets_new_object_and_resets_count(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        old, new = self._busy("x", "/usr/local/bin/x"), self._busy("x", "/usr/local/bin/x")
+        self._ticks(event_queue, old, 1, pw=pw)
+        assert pw._cpu_high[4343] == 1
+        old.is_running.return_value = False   # create_time mudou
+        with patch("psutil.Process", return_value=new):
+            ev = asyncio.run(pw._check_suspicious(4343))
+        assert ev is None and pw._procs[4343] is new and pw._cpu_high[4343] == 1
+
+    def test_gone_pid_pruned(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        self._ticks(event_queue, self._busy("x", "/usr/local/bin/x"), 1, pw=pw)
+        pw._snapshot = {4343: "x"}
+        with patch.object(ProcWatcher, "_current_pids", return_value={}):
+            asyncio.run(pw._tick())
+        assert 4343 not in pw._procs and 4343 not in pw._cpu_high
+
+    def test_e2e_real_busy_process_flagged(self, event_queue: asyncio.Queue) -> None:
+        import subprocess, sys, time
+        p = subprocess.Popen([sys.executable, "-I", "-c", "while True: pass"])
+        try:
+            time.sleep(0.3)
+            pw = ProcWatcher(event_queue, interval=1.0)
+            reasons = []
+            for _ in range(5):
+                ev = asyncio.run(pw._check_suspicious(p.pid))
+                reasons.append(ev.reason if ev else "")
+                time.sleep(1.0)
+            assert any("CPU alta" in r for r in reasons), reasons
+        finally:
+            p.kill()
+            p.wait()
+
 
 class TestMonitorManager:
     @pytest.fixture

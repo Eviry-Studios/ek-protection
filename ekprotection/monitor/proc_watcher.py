@@ -48,6 +48,14 @@ _TRUSTED_PROCESSES = {
     "ekp", "ekp-daemon",   # o próprio EK-Protection
 }
 
+# Nome embutido só vale como confiável se o executável real estiver num
+# destes diretórios (rodada 2026-10-29). Fora deles é impostor: `xmrig`
+# copiado pra ~/bash herdava a dispensa de CPU só pelo nome.
+_SYSTEM_EXEC_DIRS = (
+    "/usr/bin", "/usr/sbin", "/bin", "/sbin",
+    "/usr/lib", "/lib", "/usr/libexec", "/usr/local/bin", "/usr/local/sbin",
+)
+
 # Diretórios suspeitos para executáveis
 _SUSPICIOUS_EXEC_DIRS = {
     "/tmp", "/dev/shm", "/var/tmp", "/run/user",
@@ -60,6 +68,14 @@ _MINER_MIN_SIGNALS = 2
 # Limites para alertas
 _CPU_ALERT_PCT    = 80.0   # % de CPU sustentado por 2 ciclos consecutivos
 _NET_CONN_ALERT   = 50     # número de conexões abertas
+
+
+def _exe_is_system(exe: Optional[str]) -> bool:
+    """Exe compatível com nome confiável embutido. None (sem permissão pra
+    ler) mantém a confiança, como antes; "" é thread de kernel."""
+    if not exe:
+        return True
+    return any(exe.startswith(d + "/") for d in _SYSTEM_EXEC_DIRS)
 
 
 class ProcWatcher:
@@ -82,12 +98,19 @@ class ProcWatcher:
     ) -> None:
         self._queue    = queue
         self._interval = interval
-        self._trusted  = (trusted or set()) | _TRUSTED_PROCESSES
+        # Nomes do usuário (config) seguem confiáveis só pelo nome: escolha
+        # explícita dele, pode ser app fora dos dirs de sistema.
+        self._user_trusted = set(trusted or ())
+        self._trusted  = self._user_trusted | _TRUSTED_PROCESSES
         self._running  = False
         self._snapshot: dict[int, str] = {}   # pid → name
         self._cpu_high: dict[int, int] = {}   # pid → contagem de ciclos com CPU alto
         # pid → (create_time, sinais de minerador): cmdline lida uma vez por processo
         self._miner_cache: dict[int, tuple[float, list[str]]] = {}
+        # pid → psutil.Process reaproveitado entre ticks. cpu_percent(None)
+        # mede desde a chamada anterior *no mesmo objeto*; num objeto novo a
+        # 1ª chamada sempre devolve 0.0 (rodada 2026-10-29).
+        self._procs: dict[int, psutil.Process] = {}
 
     # ------------------------------------------------------------------
     # Loop principal
@@ -139,6 +162,8 @@ class ProcWatcher:
             )
             await self._queue.put(ev)
             self._miner_cache.pop(pid, None)
+            self._procs.pop(pid, None)
+            self._cpu_high.pop(pid, None)
 
         # Verifica suspeitos nos processos em execução
         for pid in current:
@@ -155,15 +180,13 @@ class ProcWatcher:
     async def _check_suspicious(self, pid: int) -> Optional[ProcessEvent]:
         """Analisa um processo em execução. Retorna ProcessEvent ou None."""
         try:
-            proc = psutil.Process(pid)
+            proc = self._get_proc(pid)
             name = proc.name()
             # Rodada 2026-10-28: o nome (comm) é só o basename do executável,
             # então `cp xmrig /tmp/bash` herdava a confiança e pulava tudo.
             # Nome confiável agora só dispensa as checagens de comportamento
             # (CPU, conexões); executável em dir suspeito e minerador na
             # cmdline valem pra qualquer nome.
-            trusted = name in self._trusted
-
             reasons: list[str] = []
 
             # Executável em diretório suspeito
@@ -175,6 +198,10 @@ class ProcWatcher:
                         break
             except (psutil.AccessDenied, psutil.NoSuchProcess, FileNotFoundError):
                 exe = None
+
+            trusted = name in self._user_trusted or (
+                name in self._trusted and _exe_is_system(exe)
+            )
 
             miner = self._miner_signals(proc, pid)
             if len(miner) >= _MINER_MIN_SIGNALS:
@@ -188,6 +215,7 @@ class ProcWatcher:
                 reasons.append("processo sem nome")
 
             # CPU alta sustentada
+            cpu = None
             try:
                 cpu = proc.cpu_percent(interval=None)
                 if cpu > _CPU_ALERT_PCT:
@@ -216,7 +244,9 @@ class ProcWatcher:
                 ppid     = proc.ppid()
                 username = proc.username()
                 mem_pct  = proc.memory_percent()
-                cpu_pct  = proc.cpu_percent(interval=None)
+                # Não chama cpu_percent de novo: mediria só os µs desde a
+                # chamada acima e zeraria a base do próximo tick.
+                cpu_pct  = cpu
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 cmdline, ppid, username, mem_pct, cpu_pct = [], None, None, None, None
 
@@ -258,6 +288,21 @@ class ProcWatcher:
             )
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
             return None
+
+    def _get_proc(self, pid: int) -> psutil.Process:
+        """psutil.Process do pid, reaproveitado entre ticks. PID reusado
+        (create_time diferente) ganha objeto novo e zera a contagem de CPU."""
+        proc = self._procs.get(pid)
+        if proc is not None:
+            try:
+                if proc.is_running():   # compara create_time internamente
+                    return proc
+            except psutil.Error:
+                pass
+            self._cpu_high.pop(pid, None)
+        proc = psutil.Process(pid)
+        self._procs[pid] = proc
+        return proc
 
     def _miner_signals(self, proc: psutil.Process, pid: int) -> list[str]:
         """Sinais de minerador na cmdline, com cache por (pid, create_time)
