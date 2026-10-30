@@ -111,6 +111,9 @@ class ProcWatcher:
         # mede desde a chamada anterior *no mesmo objeto*; num objeto novo a
         # 1ª chamada sempre devolve 0.0 (rodada 2026-10-29).
         self._procs: dict[int, psutil.Process] = {}
+        # pid → tipos de motivo já alertados. Sem isso, CPU alta repetia o
+        # WARNING a cada tick (~720/h num build de 1h, rodada 2026-10-30).
+        self._alerted: dict[int, frozenset[str]] = {}
 
     # ------------------------------------------------------------------
     # Loop principal
@@ -164,6 +167,7 @@ class ProcWatcher:
             self._miner_cache.pop(pid, None)
             self._procs.pop(pid, None)
             self._cpu_high.pop(pid, None)
+            self._alerted.pop(pid, None)
 
         # Verifica suspeitos nos processos em execução
         for pid in current:
@@ -187,14 +191,16 @@ class ProcWatcher:
             # Nome confiável agora só dispensa as checagens de comportamento
             # (CPU, conexões); executável em dir suspeito e minerador na
             # cmdline valem pra qualquer nome.
-            reasons: list[str] = []
+            # (tipo, texto): o tipo identifica o motivo pro dedup, o texto
+            # carrega o valor medido (CPU %, nº de conexões).
+            reasons: list[tuple[str, str]] = []
 
             # Executável em diretório suspeito
             try:
                 exe = proc.exe()
                 for suspicious_dir in _SUSPICIOUS_EXEC_DIRS:
                     if exe.startswith(suspicious_dir):
-                        reasons.append(f"executável em {suspicious_dir}")
+                        reasons.append(("exe_dir", f"executável em {suspicious_dir}"))
                         break
             except (psutil.AccessDenied, psutil.NoSuchProcess, FileNotFoundError):
                 exe = None
@@ -205,14 +211,15 @@ class ProcWatcher:
 
             miner = self._miner_signals(proc, pid)
             if len(miner) >= _MINER_MIN_SIGNALS:
-                reasons.append(f"minerador na cmdline ({', '.join(miner)})")
+                reasons.append(("miner", f"minerador na cmdline ({', '.join(miner)})"))
 
             if trusted and not reasons:
+                self._alerted.pop(pid, None)
                 return None
 
             # Processo sem nome
             if not name or name.strip() == "":
-                reasons.append("processo sem nome")
+                reasons.append(("no_name", "processo sem nome"))
 
             # CPU alta sustentada
             cpu = None
@@ -221,7 +228,7 @@ class ProcWatcher:
                 if cpu > _CPU_ALERT_PCT:
                     self._cpu_high[pid] = self._cpu_high.get(pid, 0) + 1
                     if self._cpu_high[pid] >= 2:
-                        reasons.append(f"CPU alta sustentada ({cpu:.0f}%)")
+                        reasons.append(("cpu", f"CPU alta sustentada ({cpu:.0f}%)"))
                 else:
                     self._cpu_high.pop(pid, None)
             except (psutil.AccessDenied, psutil.NoSuchProcess):
@@ -231,11 +238,20 @@ class ProcWatcher:
             try:
                 conns = proc.net_connections()
                 if len(conns) > _NET_CONN_ALERT:
-                    reasons.append(f"{len(conns)} conexões de rede abertas")
+                    reasons.append(("net", f"{len(conns)} conexões de rede abertas"))
             except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
                 pass
 
             if not reasons:
+                self._alerted.pop(pid, None)
+                return None
+
+            # Dedup: alerta só quando aparece um tipo de motivo que não estava
+            # no alerta anterior. Motivo que some e volta alerta de novo.
+            kinds = frozenset(k for k, _ in reasons)
+            previous = self._alerted.get(pid, frozenset())
+            self._alerted[pid] = kinds
+            if kinds <= previous:
                 return None
 
             # Coleta metadados completos para o evento
@@ -260,7 +276,7 @@ class ProcWatcher:
                 username = username,
                 mem_pct  = mem_pct,
                 cpu_pct  = cpu_pct,
-                reason   = "; ".join(reasons),
+                reason   = "; ".join(text for _, text in reasons),
             )
 
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
@@ -300,6 +316,7 @@ class ProcWatcher:
             except psutil.Error:
                 pass
             self._cpu_high.pop(pid, None)
+            self._alerted.pop(pid, None)
         proc = psutil.Process(pid)
         self._procs[pid] = proc
         return proc
@@ -356,4 +373,5 @@ class ProcWatcher:
             "interval_s":    self._interval,
             "tracked_pids":  len(self._snapshot),
             "cpu_high_pids": len(self._cpu_high),
+            "alerted_pids":  len(self._alerted),
         }

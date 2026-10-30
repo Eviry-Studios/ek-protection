@@ -686,6 +686,109 @@ class TestProcWatcherCpuAndTrustedExe:
             p.wait()
 
 
+class TestProcWatcherAlertDedup:
+    """Rodada 2026-10-30: o mesmo motivo repetia o WARNING a cada tick (CPU
+    alta num build de 1h dava ~720). Agora alerta 1x por (processo, tipo de
+    motivo) e de novo só se aparecer tipo novo ou o motivo sumir e voltar."""
+
+    def _proc(self, name: str = "x", exe: str = "/usr/local/bin/x",
+              cpu: float = 99.0, cmdline: list[str] | None = None) -> MagicMock:
+        m = _mock_proc(name, exe, cmdline or [name])
+        m.cpu_percent.return_value = cpu
+        return m
+
+    def _ticks(self, pw: ProcWatcher, proc: MagicMock, n: int, pid: int = 4444) -> list:
+        with patch("psutil.Process", return_value=proc):
+            return [asyncio.run(pw._check_suspicious(pid)) for _ in range(n)]
+
+    def test_sustained_cpu_alerts_once(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        evs = self._ticks(pw, self._proc(), 10)
+        assert [e is not None for e in evs] == [False, True] + [False] * 8
+
+    def test_exe_in_tmp_alerts_once(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        evs = self._ticks(pw, self._proc(exe="/tmp/evil", cpu=0.0), 5)
+        assert evs[0] is not None and "/tmp" in evs[0].reason
+        assert evs[1:] == [None] * 4
+
+    def test_new_reason_kind_realerts_with_all_reasons(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = self._proc(exe="/tmp/evil", cpu=0.0)
+        first = self._ticks(pw, proc, 2)
+        assert first[0] is not None and first[1] is None
+        proc.cpu_percent.return_value = 99.0
+        evs = self._ticks(pw, proc, 3)
+        assert evs[0] is None                     # 1º ciclo de CPU alta
+        assert evs[1] is not None
+        assert "/tmp" in evs[1].reason and "CPU alta" in evs[1].reason
+        assert evs[2] is None
+
+    def test_cpu_value_change_alone_does_not_realert(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = self._proc(cpu=85.0)
+        self._ticks(pw, proc, 2)
+        proc.cpu_percent.return_value = 150.0
+        assert self._ticks(pw, proc, 3) == [None] * 3
+
+    def test_condition_clears_then_returns_realerts(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = self._proc()
+        assert self._ticks(pw, proc, 2)[1] is not None
+        proc.cpu_percent.return_value = 1.0
+        assert self._ticks(pw, proc, 1) == [None]
+        assert 4444 not in pw._alerted
+        proc.cpu_percent.return_value = 99.0
+        evs = self._ticks(pw, proc, 2)
+        assert evs[0] is None and evs[1] is not None
+
+    def test_reason_dropping_out_does_not_realert(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = self._proc(exe="/tmp/evil")
+        evs = self._ticks(pw, proc, 2)
+        assert evs[1] is not None and "CPU alta" in evs[1].reason
+        proc.cpu_percent.return_value = 1.0      # só o /tmp continua
+        assert self._ticks(pw, proc, 3) == [None] * 3
+
+    def test_pid_reuse_realerts(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        old, new = self._proc(exe="/tmp/a", cpu=0.0), self._proc(exe="/tmp/b", cpu=0.0)
+        assert self._ticks(pw, old, 1)[0] is not None
+        old.is_running.return_value = False      # create_time mudou
+        assert self._ticks(pw, new, 1)[0] is not None
+
+    def test_gone_pid_pruned_from_alerted(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        self._ticks(pw, self._proc(exe="/tmp/evil", cpu=0.0), 1)
+        assert 4444 in pw._alerted
+        pw._snapshot = {4444: "x"}
+        with patch.object(ProcWatcher, "_current_pids", return_value={}):
+            asyncio.run(pw._tick())
+        assert 4444 not in pw._alerted
+
+    def test_dedup_is_per_pid(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        a, b = self._proc(exe="/tmp/a", cpu=0.0), self._proc(exe="/tmp/b", cpu=0.0)
+        assert self._ticks(pw, a, 1, pid=1)[0] is not None
+        assert self._ticks(pw, b, 1, pid=2)[0] is not None
+
+    def test_e2e_real_busy_process_alerts_once(self, event_queue: asyncio.Queue) -> None:
+        import subprocess, sys, time
+        p = subprocess.Popen([sys.executable, "-I", "-c", "while True: pass"])
+        try:
+            time.sleep(0.3)
+            pw = ProcWatcher(event_queue, interval=1.0)
+            evs = []
+            for _ in range(6):
+                evs.append(asyncio.run(pw._check_suspicious(p.pid)))
+                time.sleep(1.0)
+            cpu_alerts = [e for e in evs if e and "CPU alta" in (e.reason or "")]
+            assert len(cpu_alerts) == 1, [e.reason if e else None for e in evs]
+        finally:
+            p.kill()
+            p.wait()
+
+
 class TestMonitorManager:
     @pytest.fixture
     def monitor(self, cfg: ConfigManager) -> MonitorManager:
