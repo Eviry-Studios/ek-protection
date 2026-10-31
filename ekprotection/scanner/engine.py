@@ -282,7 +282,8 @@ class ScanEngine:
 
         # Executável em diretório suspeito
         for d in _SUSPICIOUS_DIRS:
-            if path.startswith(d + "/") or path.startswith(d):
+            # Fronteira de diretório: `/tmpfoo/x` e `/run/username` não contam.
+            if path.startswith(d + "/"):
                 if is_exec or elf_file or script_file:
                     reasons.append(f"executável em {d}")
                     risk = "alto"

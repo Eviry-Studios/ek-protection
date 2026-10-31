@@ -532,6 +532,23 @@ class TestScanEngineHeuristics:
         if r.verdict == ScanVerdict.SUSPICIOUS:
             assert "tmp" in (r.reason or "").lower()
 
+    @pytest.mark.parametrize("path, flagged", [
+        ("/tmp/x", True),
+        ("/var/tmp/a/b", True),
+        ("/run/user/1000/x", True),
+        ("/dev/shm/x", True),
+        ("/tmpfoo/x", False),        # rodada 2026-10-31: prefixo sem fronteira
+        ("/run/username/x", False),
+        ("/dev/shmem/x", False),
+    ])
+    def test_suspicious_dir_needs_path_boundary(
+        self, engine: ScanEngine, path: str, flagged: bool,
+    ) -> None:
+        risk, reason = engine._heuristic_check(
+            path, "", 512, 0o100755, True, False, False, None,
+        )
+        assert (reason is not None and "executável em" in reason) is flagged
+
     def test_high_entropy_executable_flagged(self, engine: ScanEngine, tmp_path: Path) -> None:
         f = tmp_path / "packed"
         f.write_bytes(secrets.token_bytes(4096))

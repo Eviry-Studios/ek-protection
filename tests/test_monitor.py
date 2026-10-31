@@ -789,6 +789,63 @@ class TestProcWatcherAlertDedup:
             p.wait()
 
 
+class TestProcWatcherMemfdAndDirBoundary:
+    """Rodada 2026-10-31: processo carregado via memfd_create + execve
+    (malware fileless) tinha exe `/memfd:<nome>` e passava sem alerta; o
+    `/proc/self/fd` da lista nunca casava porque `proc.exe()` já vem
+    resolvido. E `exe.startswith("/tmp")` casava `/tmpfoo`."""
+
+    def _check(self, pw: ProcWatcher, proc: MagicMock, pid: int = 5555):
+        with patch("psutil.Process", return_value=proc):
+            return asyncio.run(pw._check_suspicious(pid))
+
+    @pytest.mark.parametrize("exe", ["/memfd:kworkerz", "/memfd: (deleted)", "/memfd:x (deleted)"])
+    def test_memfd_exe_alerts(self, event_queue: asyncio.Queue, exe: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("3", exe, ["kworkerz", "60"]))
+        assert ev is not None and "sem arquivo" in ev.reason and exe in ev.reason
+
+    def test_memfd_exe_with_trusted_name_still_alerts(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("sshd", "/memfd:sshd", ["sshd"]))
+        assert ev is not None and "sem arquivo" in ev.reason
+
+    def test_memfd_alerts_once(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = _mock_proc("3", "/memfd:x", ["x"])
+        evs = [self._check(pw, proc) for _ in range(4)]
+        assert evs[0] is not None and evs[1:] == [None] * 3
+
+    @pytest.mark.parametrize("exe", ["/tmpfoo/x", "/run/username/x", "/var/tmpx/y", "/dev/shmem/z"])
+    def test_prefix_without_boundary_not_flagged(self, event_queue: asyncio.Queue, exe: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        assert self._check(pw, _mock_proc("x", exe, ["x"])) is None
+
+    @pytest.mark.parametrize("exe", ["/tmp/x", "/tmp/a/b (deleted)", "/run/user/1000/x", "/dev/shm/.x/y"])
+    def test_real_suspicious_dirs_still_flagged(self, event_queue: asyncio.Queue, exe: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("x", exe, ["x"]))
+        assert ev is not None and "executável em" in ev.reason
+
+    def test_e2e_real_memfd_process_alerts(self, event_queue: asyncio.Queue) -> None:
+        import subprocess, sys, time
+        loader = (
+            "import os\n"
+            "fd = os.memfd_create('ekp-test', 0)\n"
+            "os.write(fd, open('/bin/sleep', 'rb').read())\n"
+            "os.execv(f'/proc/self/fd/{fd}', ['ekp-test', '30'])\n"
+        )
+        p = subprocess.Popen([sys.executable, "-I", "-c", loader])
+        try:
+            time.sleep(0.5)
+            pw = ProcWatcher(event_queue, interval=1.0)
+            ev = asyncio.run(pw._check_suspicious(p.pid))
+            assert ev is not None and "/memfd:ekp-test" in ev.reason
+        finally:
+            p.kill()
+            p.wait()
+
+
 class TestMonitorManager:
     @pytest.fixture
     def monitor(self, cfg: ConfigManager) -> MonitorManager:

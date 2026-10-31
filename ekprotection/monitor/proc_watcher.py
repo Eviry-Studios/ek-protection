@@ -10,6 +10,7 @@ Detecta:
       * Alto consumo de CPU sustentado
       * Processos sem nome / nome vazio
       * Executáveis em /tmp ou /dev/shm
+      * Executável sem arquivo (memfd_create + exec, malware fileless)
       * Processos com UID 0 inesperados
       * Processos com muitas conexões de rede abertas
       * Shells invocadas por processos não-interativos
@@ -57,10 +58,15 @@ _SYSTEM_EXEC_DIRS = (
 )
 
 # Diretórios suspeitos para executáveis
+# `proc.exe()` já vem resolvido, então `/proc/self/fd` nunca casava aqui;
+# exec a partir de memfd aparece como `/memfd:<nome>` (ver _MEMFD_EXE_PREFIX).
 _SUSPICIOUS_EXEC_DIRS = {
     "/tmp", "/dev/shm", "/var/tmp", "/run/user",
-    "/proc/self/fd",
 }
+
+# Exe de processo carregado via memfd_create + execve(/proc/self/fd/N).
+# O kernel mostra `/memfd:<nome>` (com ` (deleted)` em kernels antigos).
+_MEMFD_EXE_PREFIX = "/memfd:"
 
 # Sinais distintos de minerador na cmdline pra alertar (ver cmdline_miner_signals)
 _MINER_MIN_SIGNALS = 2
@@ -198,12 +204,16 @@ class ProcWatcher:
             # Executável em diretório suspeito
             try:
                 exe = proc.exe()
+                # Fronteira de diretório: `/tmpfoo/x` não é `/tmp`.
                 for suspicious_dir in _SUSPICIOUS_EXEC_DIRS:
-                    if exe.startswith(suspicious_dir):
+                    if exe.startswith(suspicious_dir + "/"):
                         reasons.append(("exe_dir", f"executável em {suspicious_dir}"))
                         break
             except (psutil.AccessDenied, psutil.NoSuchProcess, FileNotFoundError):
                 exe = None
+
+            if exe and exe.startswith(_MEMFD_EXE_PREFIX):
+                reasons.append(("memfd", f"executável sem arquivo ({exe})"))
 
             trusted = name in self._user_trusted or (
                 name in self._trusted and _exe_is_system(exe)
