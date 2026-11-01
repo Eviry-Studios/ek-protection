@@ -11,6 +11,7 @@ Detecta:
       * Processos sem nome / nome vazio
       * Executáveis em /tmp ou /dev/shm
       * Executável sem arquivo (memfd_create + exec, malware fileless)
+      * Programa em dir suspeito rodado via loader dinâmico (ld.so /tmp/x)
       * Processos com UID 0 inesperados
       * Processos com muitas conexões de rede abertas
       * Shells invocadas por processos não-interativos
@@ -28,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
 
 import psutil
@@ -68,12 +70,54 @@ _SUSPICIOUS_EXEC_DIRS = {
 # O kernel mostra `/memfd:<nome>` (com ` (deleted)` em kernels antigos).
 _MEMFD_EXE_PREFIX = "/memfd:"
 
+# Loader dinâmico chamado direto (`/lib64/ld-linux-x86-64.so.2 /tmp/x`,
+# rodada 2026-11-01): o exe é o loader, em dir de sistema, e o programa de
+# verdade só aparece na cmdline. Também roda arquivo sem bit +x, o que fura
+# `/tmp` montado com noexec.
+_LOADER_NAME_RE = re.compile(r"^(ld-linux[\w.-]*\.so(\.\d+)*|ld-musl-[\w.-]+\.so(\.\d+)*|ld\.so(\.\d+)*)$")
+# Opções do ld.so que consomem o argumento seguinte.
+_LOADER_OPTS_WITH_ARG = {
+    "--library-path", "--preload", "--audit", "--argv0", "--inhibit-rpath",
+    "--glibc-hwcaps-prefix", "--glibc-hwcaps-mask",
+}
+# Só inspecionam o binário, não executam (usadas pelo ldd).
+_LOADER_NO_EXEC_OPTS = {"--list", "--verify", "--help", "--version", "--list-tunables", "--list-diagnostics"}
+# `ld.so /proc/self/fd/N`: memfd passado direto pro loader.
+_PROC_FD_RE = re.compile(r"^/proc/(self|\d+)/fd/\d+$")
+
 # Sinais distintos de minerador na cmdline pra alertar (ver cmdline_miner_signals)
 _MINER_MIN_SIGNALS = 2
 
 # Limites para alertas
 _CPU_ALERT_PCT    = 80.0   # % de CPU sustentado por 2 ciclos consecutivos
 _NET_CONN_ALERT   = 50     # número de conexões abertas
+
+
+def _in_suspicious_dir(path: str) -> Optional[str]:
+    """Dir suspeito que contém `path` (com fronteira: `/tmpfoo/x` não é `/tmp`)."""
+    for d in _SUSPICIOUS_EXEC_DIRS:
+        if path.startswith(d + "/"):
+            return d
+    return None
+
+
+def _loader_target(exe: Optional[str], cmdline: list[str]) -> Optional[str]:
+    """Programa executado quando o processo é o loader dinâmico chamado
+    direto. None se o exe não é loader, se só inspeciona (--list/--verify)
+    ou se não há programa na cmdline."""
+    if not exe or not _LOADER_NAME_RE.match(os.path.basename(exe)):
+        return None
+    args = iter(cmdline[1:])
+    for arg in args:
+        if arg in _LOADER_NO_EXEC_OPTS:
+            return None
+        if arg in _LOADER_OPTS_WITH_ARG:
+            next(args, None)
+            continue
+        if arg.startswith("--"):
+            continue
+        return arg
+    return None
 
 
 def _exe_is_system(exe: Optional[str]) -> bool:
@@ -204,16 +248,18 @@ class ProcWatcher:
             # Executável em diretório suspeito
             try:
                 exe = proc.exe()
-                # Fronteira de diretório: `/tmpfoo/x` não é `/tmp`.
-                for suspicious_dir in _SUSPICIOUS_EXEC_DIRS:
-                    if exe.startswith(suspicious_dir + "/"):
-                        reasons.append(("exe_dir", f"executável em {suspicious_dir}"))
-                        break
+                suspicious_dir = _in_suspicious_dir(exe)
+                if suspicious_dir:
+                    reasons.append(("exe_dir", f"executável em {suspicious_dir}"))
             except (psutil.AccessDenied, psutil.NoSuchProcess, FileNotFoundError):
                 exe = None
 
             if exe and exe.startswith(_MEMFD_EXE_PREFIX):
                 reasons.append(("memfd", f"executável sem arquivo ({exe})"))
+
+            loader_reason = self._loader_reason(proc, exe)
+            if loader_reason:
+                reasons.append(("loader", loader_reason))
 
             trusted = name in self._user_trusted or (
                 name in self._trusted and _exe_is_system(exe)
@@ -330,6 +376,28 @@ class ProcWatcher:
         proc = psutil.Process(pid)
         self._procs[pid] = proc
         return proc
+
+    def _loader_reason(self, proc: psutil.Process, exe: Optional[str]) -> Optional[str]:
+        # Checa o nome antes de ler a cmdline: só o loader paga a leitura de
+        # /proc/<pid>/cmdline (o resto usa o cache de _miner_signals).
+        if not exe or not _LOADER_NAME_RE.match(os.path.basename(exe)):
+            return None
+        target = _loader_target(exe, self._safe_cmdline(proc))
+        if not target:
+            return None
+        loader = os.path.basename(exe)
+        if _PROC_FD_RE.match(target):
+            return f"loader {loader} executando descritor ({target})"
+        if not target.startswith("/"):
+            try:
+                target = os.path.join(proc.cwd(), target)
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                return None
+        target = os.path.normpath(target)
+        suspicious_dir = _in_suspicious_dir(target)
+        if suspicious_dir:
+            return f"loader {loader} executando programa em {suspicious_dir} ({target})"
+        return None
 
     def _miner_signals(self, proc: psutil.Process, pid: int) -> list[str]:
         """Sinais de minerador na cmdline, com cache por (pid, create_time)

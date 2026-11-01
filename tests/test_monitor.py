@@ -846,6 +846,86 @@ class TestProcWatcherMemfdAndDirBoundary:
             p.wait()
 
 
+_LD = "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+
+
+class TestProcWatcherLoaderExec:
+    """Rodada 2026-11-01: `ld.so /tmp/x` tem exe = loader (dir de sistema) e
+    o programa real só aparece na cmdline; passava sem alerta, inclusive com
+    arquivo sem +x (fura /tmp noexec)."""
+
+    def _check(self, pw: ProcWatcher, proc: MagicMock, pid: int = 6666):
+        with patch("psutil.Process", return_value=proc):
+            return asyncio.run(pw._check_suspicious(pid))
+
+    @pytest.mark.parametrize("exe,cmdline", [
+        (_LD, ["/lib64/ld-linux-x86-64.so.2", "/tmp/x", "60"]),
+        (_LD, ["ld", "--library-path", "/opt/lib", "/dev/shm/.m/xmr"]),
+        (_LD, ["ld", "--argv0", "kworker", "--inhibit-cache", "/var/tmp/y"]),
+        ("/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1", ["ld", "/run/user/1000/z"]),
+        ("/lib/ld-musl-x86_64.so.1", ["ld", "/tmp/a/../b"]),
+    ])
+    def test_loader_running_suspicious_dir_alerts(self, event_queue: asyncio.Queue,
+                                                  exe: str, cmdline: list[str]) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc(os.path.basename(exe), exe, cmdline))
+        assert ev is not None and "loader" in ev.reason
+
+    def test_relative_target_resolved_against_cwd(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = _mock_proc("ld-linux-x86-64.so.2", _LD, ["ld", "./x"])
+        proc.cwd.return_value = "/dev/shm"
+        ev = self._check(pw, proc)
+        assert ev is not None and "/dev/shm/x" in ev.reason
+
+    def test_proc_fd_target_alerts(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("ld-linux-x86-64.so.2", _LD, ["ld", "/proc/self/fd/3"]))
+        assert ev is not None and "descritor" in ev.reason
+
+    @pytest.mark.parametrize("cmdline", [
+        ["ld", "/usr/bin/ls"],                       # programa de sistema
+        ["ld", "--list", "/tmp/x"],                  # ldd: só inspeciona
+        ["ld", "--verify", "/tmp/x"],
+        ["ld", "--library-path", "/tmp/lib", "/usr/bin/ls"],  # arg de opção não é o alvo
+        ["ld", "/tmpfoo/x"],                         # fronteira de path
+        ["ld"],
+    ])
+    def test_loader_benign_not_flagged(self, event_queue: asyncio.Queue, cmdline: list[str]) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        assert self._check(pw, _mock_proc("ld-linux-x86-64.so.2", _LD, cmdline)) is None
+
+    def test_non_loader_exe_ignores_cmdline_path(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        assert self._check(pw, _mock_proc("cat", "/usr/bin/cat", ["cat", "/tmp/x"])) is None
+
+    def test_loader_alerts_once(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        proc = _mock_proc("ld-linux-x86-64.so.2", _LD, ["ld", "/tmp/x"])
+        evs = [self._check(pw, proc) for _ in range(3)]
+        assert evs[0] is not None and evs[1:] == [None] * 2
+
+    def test_e2e_real_loader_exec_alerts(self, event_queue: asyncio.Queue) -> None:
+        import shutil, subprocess, tempfile, time
+        ld = "/lib64/ld-linux-x86-64.so.2"
+        if not os.path.exists(ld):
+            pytest.skip("sem loader x86_64")
+        d = tempfile.mkdtemp(dir="/tmp")
+        payload = os.path.join(d, "ekp-test")
+        shutil.copy("/bin/sleep", payload)
+        os.chmod(payload, 0o644)
+        p = subprocess.Popen([ld, payload, "30"])
+        try:
+            time.sleep(0.5)
+            pw = ProcWatcher(event_queue, interval=1.0)
+            ev = asyncio.run(pw._check_suspicious(p.pid))
+            assert ev is not None and payload in ev.reason
+        finally:
+            p.kill()
+            p.wait()
+            shutil.rmtree(d)
+
+
 class TestMonitorManager:
     @pytest.fixture
     def monitor(self, cfg: ConfigManager) -> MonitorManager:
