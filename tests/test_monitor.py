@@ -50,6 +50,17 @@ def cfg(tmp_path: Path) -> ConfigManager:
     return manager
 
 
+@pytest.fixture(autouse=True)
+def _no_real_maps(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Testes com PID falso (mock) não podem ler /proc/<pid>/maps real: o PID
+    pode existir no host. Quem precisa do /proc de verdade marca `real_maps`."""
+    if request.node.get_closest_marker("real_maps"):
+        yield
+        return
+    with patch.object(ProcWatcher, "_read_maps", staticmethod(lambda pid: "")):
+        yield
+
+
 @pytest.fixture
 def event_queue() -> asyncio.Queue:
     return asyncio.Queue()
@@ -920,6 +931,144 @@ class TestProcWatcherLoaderExec:
             pw = ProcWatcher(event_queue, interval=1.0)
             ev = asyncio.run(pw._check_suspicious(p.pid))
             assert ev is not None and payload in ev.reason
+        finally:
+            p.kill()
+            p.wait()
+            shutil.rmtree(d)
+
+
+_LIBZ = "/usr/lib/x86_64-linux-gnu/libz.so.1"
+
+
+def _maps(*paths: str, perms: str = "r-xp") -> str:
+    """maps sintético: libc de sistema, anônimo, [vdso] e os `paths` dados."""
+    lines = [
+        "7f00-7f10 r-xp 00000000 08:01 11 /usr/lib/x86_64-linux-gnu/libc.so.6",
+        "7f10-7f20 rw-p 00000000 00:00 0 ",
+        "7f20-7f30 r-xp 00000000 00:00 0 [vdso]",
+    ]
+    lines += [f"7f40-7f50 {perms} 00000000 08:01 99 {p}" for p in paths]
+    return "\n".join(lines) + "\n"
+
+
+class TestProcWatcherMappedLib:
+    """Rodada 2026-11-02: `LD_PRELOAD=/tmp/x.so` (ou dlopen de /tmp) injeta
+    código num binário de sistema sem mudar exe nem cmdline; passava sem
+    alerta. Agora /proc/<pid>/maps é lido (com cache) atrás de mapeamento
+    executável de arquivo em dir suspeito."""
+
+    def _check(self, pw: ProcWatcher, proc: MagicMock, maps: str | MagicMock,
+               pid: int = 7777):
+        reader = maps if isinstance(maps, MagicMock) else MagicMock(return_value=maps)
+        with patch("psutil.Process", return_value=proc), \
+             patch.object(ProcWatcher, "_read_maps", staticmethod(reader)):
+            return asyncio.run(pw._check_suspicious(pid))
+
+    @pytest.mark.parametrize("path", [
+        "/tmp/libkworker.so",
+        "/dev/shm/.x/hook.so",
+        "/var/tmp/a.so (deleted)",          # apagado depois do preload
+        "/run/user/1000/inj.so",
+    ])
+    def test_exec_mapping_in_suspicious_dir_alerts(self, event_queue: asyncio.Queue,
+                                                   path: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("sleep", "/usr/bin/sleep", ["sleep", "60"]), _maps(path))
+        assert ev is not None and "biblioteca executável mapeada" in ev.reason
+        assert path.replace(" (deleted)", "") + ")" in ev.reason
+
+    def test_trusted_name_still_alerts(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("sshd", "/usr/sbin/sshd", ["sshd"]), _maps("/tmp/pam.so"))
+        assert ev is not None and "/tmp/pam.so" in ev.reason
+
+    @pytest.mark.parametrize("maps", [
+        _maps(),                                        # só sistema/anônimo
+        _maps("/tmp/dados.bin", perms="r--p"),          # mmap de dado, sem exec
+        _maps("/tmp/cache.db", perms="rw-s"),
+        _maps("/tmpfoo/x.so"),                          # fronteira de path
+        _maps("/home/u/.local/lib/x.so"),
+        "",                                             # sem permissão / thread de kernel
+    ])
+    def test_benign_maps_not_flagged(self, event_queue: asyncio.Queue, maps: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        assert self._check(pw, _mock_proc("sleep", "/usr/bin/sleep", ["sleep"]), maps) is None
+
+    def test_exe_in_tmp_reports_exe_dir_only(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        reader = MagicMock(return_value=_maps("/tmp/x", "/tmp/y.so"))
+        ev = self._check(pw, _mock_proc("x", "/tmp/x", ["/tmp/x"]), reader)
+        assert ev is not None and "executável em /tmp" in ev.reason
+        assert "mapeada" not in ev.reason
+        reader.assert_not_called()   # mesmo incidente: nem lê maps
+
+    def test_loader_exec_reports_loader_only(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        reader = MagicMock(return_value=_maps("/tmp/x"))
+        proc = _mock_proc("ld-linux-x86-64.so.2", _LD, ["ld", "/tmp/x"])
+        ev = self._check(pw, proc, reader)
+        assert ev is not None and "loader" in ev.reason and "mapeada" not in ev.reason
+        reader.assert_not_called()
+
+    def test_maps_cached_within_rescan_window(self, event_queue: asyncio.Queue) -> None:
+        from ekprotection.monitor import proc_watcher as pwm
+        pw = ProcWatcher(event_queue, interval=1.0)
+        reader = MagicMock(return_value=_maps())
+        proc = _mock_proc("sleep", "/usr/bin/sleep", ["sleep"])
+        for _ in range(pwm._MAPS_RESCAN_TICKS):   # ticks 1..N: só a 1ª lê
+            pw._tick_no += 1
+            self._check(pw, proc, reader)
+        assert reader.call_count == 1
+        pw._tick_no += 1
+        self._check(pw, proc, reader)
+        assert reader.call_count == 2
+
+    def test_late_dlopen_caught_on_rescan_and_alerts_once(self, event_queue: asyncio.Queue) -> None:
+        from ekprotection.monitor import proc_watcher as pwm
+        pw = ProcWatcher(event_queue, interval=1.0)
+        reader = MagicMock(return_value=_maps())
+        proc = _mock_proc("python3", "/usr/bin/python3", ["python3", "app.py"])
+        assert self._check(pw, proc, reader) is None
+        reader.return_value = _maps("/dev/shm/stage2.so")
+        evs = []
+        for _ in range(2 * pwm._MAPS_RESCAN_TICKS):
+            pw._tick_no += 1
+            evs.append(self._check(pw, proc, reader))
+        hits = [e for e in evs if e is not None]
+        assert len(hits) == 1 and "/dev/shm/stage2.so" in hits[0].reason
+
+    def test_new_create_time_rereads_maps(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        reader = MagicMock(return_value=_maps())
+        old = _mock_proc("sleep", "/usr/bin/sleep", ["sleep"], ctime=1.0)
+        self._check(pw, old, reader)
+        old.is_running.return_value = False   # PID reusado por outro processo
+        reader.return_value = _maps("/tmp/x.so")
+        ev = self._check(pw, _mock_proc("sleep", "/usr/bin/sleep", ["sleep"], ctime=2.0), reader)
+        assert reader.call_count == 2 and ev is not None
+
+    def test_terminated_clears_maps_cache(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        pw._snapshot = {7777: "sleep"}
+        pw._maps_cache[7777] = (1.0, 0, None)
+        with patch.object(ProcWatcher, "_current_pids", staticmethod(lambda: {})):
+            asyncio.run(pw._tick())
+        assert 7777 not in pw._maps_cache
+
+    @pytest.mark.real_maps
+    def test_e2e_real_ld_preload_alerts(self, event_queue: asyncio.Queue) -> None:
+        import shutil, subprocess
+        if not os.path.exists(_LIBZ):
+            pytest.skip("sem libz x86_64")
+        d = tempfile.mkdtemp(dir="/tmp")
+        lib = os.path.join(d, "libekp-test.so")
+        shutil.copy(_LIBZ, lib)   # .so inofensiva, só pra ficar mapeada
+        p = subprocess.Popen(["/bin/sleep", "30"], env={**os.environ, "LD_PRELOAD": lib})
+        try:
+            time.sleep(0.5)
+            pw = ProcWatcher(event_queue, interval=1.0)
+            ev = asyncio.run(pw._check_suspicious(p.pid))
+            assert ev is not None and lib in ev.reason
         finally:
             p.kill()
             p.wait()

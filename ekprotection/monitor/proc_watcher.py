@@ -12,6 +12,7 @@ Detecta:
       * Executáveis em /tmp ou /dev/shm
       * Executável sem arquivo (memfd_create + exec, malware fileless)
       * Programa em dir suspeito rodado via loader dinâmico (ld.so /tmp/x)
+      * Biblioteca executável mapeada de dir suspeito (LD_PRELOAD=/tmp/x.so)
       * Processos com UID 0 inesperados
       * Processos com muitas conexões de rede abertas
       * Shells invocadas por processos não-interativos
@@ -85,6 +86,14 @@ _LOADER_NO_EXEC_OPTS = {"--list", "--verify", "--help", "--version", "--list-tun
 # `ld.so /proc/self/fd/N`: memfd passado direto pro loader.
 _PROC_FD_RE = re.compile(r"^/proc/(self|\d+)/fd/\d+$")
 
+# Rodada 2026-11-02: `LD_PRELOAD=/tmp/x.so` (ou dlopen de /tmp) injeta
+# código num binário de sistema sem mudar exe nem cmdline. Aparece em
+# /proc/<pid>/maps como mapeamento executável de arquivo em dir suspeito.
+# Lido na 1ª vez que o processo é visto e a cada N ticks (dlopen tardio),
+# não todo tick: como root são dezenas de milhares de linhas.
+_MAPS_RESCAN_TICKS = 12   # ~60s no intervalo padrão de 5s
+_DELETED_SUFFIX = " (deleted)"
+
 # Sinais distintos de minerador na cmdline pra alertar (ver cmdline_miner_signals)
 _MINER_MIN_SIGNALS = 2
 
@@ -117,6 +126,22 @@ def _loader_target(exe: Optional[str], cmdline: list[str]) -> Optional[str]:
         if arg.startswith("--"):
             continue
         return arg
+    return None
+
+
+def _suspicious_exec_mapping(maps: str, skip: Optional[str]) -> Optional[str]:
+    """1º arquivo mapeado como executável a partir de dir suspeito, fora o
+    próprio exe (`skip`, já coberto por exe_dir). Formato de cada
+    linha: `addr perms offset dev inode [path]`."""
+    for line in maps.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6 or "x" not in parts[1]:
+            continue
+        path = parts[5]
+        if path.endswith(_DELETED_SUFFIX):
+            path = path[: -len(_DELETED_SUFFIX)]
+        if path != skip and _in_suspicious_dir(path):
+            return path
     return None
 
 
@@ -164,6 +189,9 @@ class ProcWatcher:
         # pid → tipos de motivo já alertados. Sem isso, CPU alta repetia o
         # WARNING a cada tick (~720/h num build de 1h, rodada 2026-10-30).
         self._alerted: dict[int, frozenset[str]] = {}
+        # pid → (create_time, tick da última leitura de maps, achado)
+        self._maps_cache: dict[int, tuple[float, int, Optional[str]]] = {}
+        self._tick_no = 0
 
     # ------------------------------------------------------------------
     # Loop principal
@@ -195,6 +223,7 @@ class ProcWatcher:
     # ------------------------------------------------------------------
 
     async def _tick(self) -> None:
+        self._tick_no += 1
         current = self._current_pids()
 
         new_pids  = set(current) - set(self._snapshot)
@@ -218,6 +247,7 @@ class ProcWatcher:
             self._procs.pop(pid, None)
             self._cpu_high.pop(pid, None)
             self._alerted.pop(pid, None)
+            self._maps_cache.pop(pid, None)
 
         # Verifica suspeitos nos processos em execução
         for pid in current:
@@ -260,6 +290,11 @@ class ProcWatcher:
             loader_reason = self._loader_reason(proc, exe)
             if loader_reason:
                 reasons.append(("loader", loader_reason))
+
+            # Exe/loader/memfd já alertou: o mapeamento é o mesmo incidente.
+            mapped = None if reasons else self._mapped_from_suspicious(proc, pid, exe)
+            if mapped:
+                reasons.append(("mapped", f"biblioteca executável mapeada de {_in_suspicious_dir(mapped)} ({mapped})"))
 
             trusted = name in self._user_trusted or (
                 name in self._trusted and _exe_is_system(exe)
@@ -398,6 +433,32 @@ class ProcWatcher:
         if suspicious_dir:
             return f"loader {loader} executando programa em {suspicious_dir} ({target})"
         return None
+
+    def _mapped_from_suspicious(self, proc: psutil.Process, pid: int,
+                                exe: Optional[str]) -> Optional[str]:
+        """Arquivo executável mapeado de dir suspeito, com cache por
+        (pid, create_time) e releitura a cada _MAPS_RESCAN_TICKS ticks."""
+        try:
+            ctime = proc.create_time()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            return None
+        cached = self._maps_cache.get(pid)
+        if (cached is not None and cached[0] == ctime
+                and self._tick_no - cached[1] < _MAPS_RESCAN_TICKS):
+            return cached[2]
+        found = _suspicious_exec_mapping(self._read_maps(pid), exe)
+        self._maps_cache[pid] = (ctime, self._tick_no, found)
+        return found
+
+    @staticmethod
+    def _read_maps(pid: int) -> str:
+        """Conteúdo de /proc/<pid>/maps. Sem permissão (outro usuário sem
+        root) o kernel devolve vazio ou EACCES: trata como sem achado."""
+        try:
+            with open(f"/proc/{pid}/maps") as f:
+                return f.read()
+        except OSError:
+            return ""
 
     def _miner_signals(self, proc: psutil.Process, pid: int) -> list[str]:
         """Sinais de minerador na cmdline, com cache por (pid, create_time)
