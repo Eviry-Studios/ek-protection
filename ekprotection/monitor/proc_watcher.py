@@ -93,6 +93,14 @@ _PROC_FD_RE = re.compile(r"^/proc/(self|\d+)/fd/\d+$")
 # não todo tick: como root são dezenas de milhares de linhas.
 _MAPS_RESCAN_TICKS = 12   # ~60s no intervalo padrão de 5s
 _DELETED_SUFFIX = " (deleted)"
+# Rodada 2026-11-03: `.so` carregada de memfd (LD_PRELOAD=/proc/self/fd/N,
+# dlopen de memfd) aparece em maps como `/memfd:<nome> (deleted)` executável.
+# Único uso legítimo conhecido: o JIT do .NET (W^X) mapeia o memfd
+# `doublemapper`. Como o nome é escolhido por quem cria o memfd, ele só é
+# aceito se o runtime do .NET (libcoreclr.so de arquivo real, fora de dir
+# suspeito) também estiver mapeado no processo.
+_MEMFD_DOTNET_JIT = "/memfd:doublemapper"
+_DOTNET_RUNTIME_LIB = "/libcoreclr.so"
 
 # Sinais distintos de minerador na cmdline pra alertar (ver cmdline_miner_signals)
 _MINER_MIN_SIGNALS = 2
@@ -130,18 +138,33 @@ def _loader_target(exe: Optional[str], cmdline: list[str]) -> Optional[str]:
 
 
 def _suspicious_exec_mapping(maps: str, skip: Optional[str]) -> Optional[str]:
-    """1º arquivo mapeado como executável a partir de dir suspeito, fora o
-    próprio exe (`skip`, já coberto por exe_dir). Formato de cada
-    linha: `addr perms offset dev inode [path]`."""
+    """1º arquivo mapeado como executável a partir de dir suspeito ou de
+    memfd, fora o próprio exe (`skip`, já coberto por exe_dir/memfd).
+    Formato de cada linha: `addr perms offset dev inode [path]`."""
+    memfd_jit = False
+    dotnet_runtime = False
     for line in maps.splitlines():
         parts = line.split(None, 5)
-        if len(parts) < 6 or "x" not in parts[1]:
+        if len(parts) < 6:
             continue
         path = parts[5]
         if path.endswith(_DELETED_SUFFIX):
             path = path[: -len(_DELETED_SUFFIX)]
-        if path != skip and _in_suspicious_dir(path):
+        if (path.endswith(_DOTNET_RUNTIME_LIB) and path.startswith("/")
+                and not path.startswith(_MEMFD_EXE_PREFIX)
+                and not _in_suspicious_dir(path)):
+            dotnet_runtime = True
+        if "x" not in parts[1] or path == skip:
+            continue
+        if _in_suspicious_dir(path):
             return path
+        if path.startswith(_MEMFD_EXE_PREFIX):
+            if path == _MEMFD_DOTNET_JIT:
+                memfd_jit = True
+                continue
+            return path
+    if memfd_jit and not dotnet_runtime:
+        return _MEMFD_DOTNET_JIT
     return None
 
 
@@ -294,7 +317,8 @@ class ProcWatcher:
             # Exe/loader/memfd já alertou: o mapeamento é o mesmo incidente.
             mapped = None if reasons else self._mapped_from_suspicious(proc, pid, exe)
             if mapped:
-                reasons.append(("mapped", f"biblioteca executável mapeada de {_in_suspicious_dir(mapped)} ({mapped})"))
+                origin = "memfd" if mapped.startswith(_MEMFD_EXE_PREFIX) else _in_suspicious_dir(mapped)
+                reasons.append(("mapped", f"biblioteca executável mapeada de {origin} ({mapped})"))
 
             trusted = name in self._user_trusted or (
                 name in self._trusted and _exe_is_system(exe)

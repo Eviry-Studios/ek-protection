@@ -1075,6 +1075,115 @@ class TestProcWatcherMappedLib:
             shutil.rmtree(d)
 
 
+_CORECLR = "/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.0/libcoreclr.so"
+
+
+class TestProcWatcherMemfdLib:
+    """Rodada 2026-11-03: `.so` carregada de memfd (`LD_PRELOAD=/proc/self/fd/N`
+    ou dlopen de memfd) passava sem alerta: aparece em maps como
+    `/memfd:<nome> (deleted)` executável, fora de qualquer dir suspeito. O
+    memfd `doublemapper` do JIT do .NET só é aceito com libcoreclr.so de
+    arquivo real mapeada no mesmo processo."""
+
+    _check = TestProcWatcherMappedLib._check
+
+    @pytest.mark.parametrize("path", [
+        "/memfd:kworker (deleted)",
+        "/memfd:kworker",                       # kernel sem o sufixo
+        "/memfd: (deleted)",                    # nome vazio
+        "/memfd:libc.so.6 (deleted)",           # nome imitando lib de sistema
+    ])
+    def test_exec_memfd_mapping_alerts(self, event_queue: asyncio.Queue, path: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("sleep", "/usr/bin/sleep", ["sleep", "60"]), _maps(path))
+        assert ev is not None and "mapeada de memfd" in ev.reason
+        assert path.replace(" (deleted)", "") + ")" in ev.reason
+
+    def test_trusted_name_still_alerts(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("sshd", "/usr/sbin/sshd", ["sshd"]), _maps("/memfd:x (deleted)"))
+        assert ev is not None and "/memfd:x" in ev.reason
+
+    def test_dotnet_doublemapper_with_runtime_not_flagged(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        maps = _maps(_CORECLR, "/memfd:doublemapper (deleted)")
+        assert self._check(pw, _mock_proc("dotnet", "/usr/share/dotnet/dotnet", ["dotnet", "app.dll"]), maps) is None
+
+    def test_runtime_listed_after_doublemapper_not_flagged(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        maps = _maps("/memfd:doublemapper (deleted)", _CORECLR)
+        assert self._check(pw, _mock_proc("app", "/opt/app/app", ["app"]), maps) is None
+
+    @pytest.mark.parametrize("maps", [
+        _maps("/memfd:doublemapper (deleted)"),                          # sem runtime .NET
+        _maps("/tmp/x/libcoreclr.so", "/memfd:doublemapper (deleted)"),  # runtime falso em /tmp
+        _maps("/memfd:libcoreclr.so (deleted)", "/memfd:doublemapper (deleted)"),
+    ])
+    def test_doublemapper_without_real_runtime_alerts(self, event_queue: asyncio.Queue, maps: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        ev = self._check(pw, _mock_proc("sleep", "/usr/bin/sleep", ["sleep"]), maps)
+        assert ev is not None and "mapeada de" in ev.reason
+
+    def test_dotnet_runtime_does_not_hide_other_memfd(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        maps = _maps(_CORECLR, "/memfd:doublemapper (deleted)", "/memfd:stage2 (deleted)")
+        ev = self._check(pw, _mock_proc("dotnet", "/usr/share/dotnet/dotnet", ["dotnet"]), maps)
+        assert ev is not None and "/memfd:stage2" in ev.reason
+
+    @pytest.mark.parametrize("maps", [
+        _maps("/memfd:pulseaudio (deleted)", perms="rw-s"),   # memória compartilhada, sem exec
+        _maps("/memfd:wayland-cursor (deleted)", perms="r--p"),
+        _maps("/home/u/memfd:x.so"),                          # só contém o texto
+    ])
+    def test_non_exec_memfd_not_flagged(self, event_queue: asyncio.Queue, maps: str) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        assert self._check(pw, _mock_proc("sleep", "/usr/bin/sleep", ["sleep"]), maps) is None
+
+    def test_memfd_exe_reports_memfd_only(self, event_queue: asyncio.Queue) -> None:
+        pw = ProcWatcher(event_queue, interval=1.0)
+        reader = MagicMock(return_value=_maps("/memfd:x (deleted)", "/memfd:y (deleted)"))
+        ev = self._check(pw, _mock_proc("x", "/memfd:x (deleted)", ["x"]), reader)
+        assert ev is not None and "executável sem arquivo" in ev.reason
+        assert "mapeada" not in ev.reason
+        reader.assert_not_called()
+
+    def test_late_memfd_dlopen_caught_on_rescan_and_alerts_once(self, event_queue: asyncio.Queue) -> None:
+        from ekprotection.monitor import proc_watcher as pwm
+        pw = ProcWatcher(event_queue, interval=1.0)
+        reader = MagicMock(return_value=_maps())
+        proc = _mock_proc("python3", "/usr/bin/python3", ["python3", "app.py"])
+        assert self._check(pw, proc, reader) is None
+        reader.return_value = _maps("/memfd:stage2 (deleted)")
+        evs = []
+        for _ in range(2 * pwm._MAPS_RESCAN_TICKS):
+            pw._tick_no += 1
+            evs.append(self._check(pw, proc, reader))
+        hits = [e for e in evs if e is not None]
+        assert len(hits) == 1 and "/memfd:stage2" in hits[0].reason
+
+    @pytest.mark.real_maps
+    def test_e2e_real_memfd_preload_alerts(self, event_queue: asyncio.Queue) -> None:
+        import subprocess
+        if not os.path.exists(_LIBZ) or not hasattr(os, "memfd_create"):
+            pytest.skip("sem libz x86_64 ou memfd_create")
+        fd = os.memfd_create("ekp-test", 0)
+        try:
+            with open(_LIBZ, "rb") as f:
+                os.write(fd, f.read())   # .so inofensiva, só pra ficar mapeada
+            p = subprocess.Popen(["/bin/sleep", "30"], pass_fds=(fd,),
+                                 env={**os.environ, "LD_PRELOAD": f"/proc/self/fd/{fd}"})
+            try:
+                time.sleep(0.5)
+                pw = ProcWatcher(event_queue, interval=1.0)
+                ev = asyncio.run(pw._check_suspicious(p.pid))
+                assert ev is not None and "/memfd:ekp-test" in ev.reason
+            finally:
+                p.kill()
+                p.wait()
+        finally:
+            os.close(fd)
+
+
 class TestMonitorManager:
     @pytest.fixture
     def monitor(self, cfg: ConfigManager) -> MonitorManager:
