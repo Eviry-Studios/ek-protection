@@ -1,0 +1,176 @@
+"""
+ekprotection.monitor.canary
+=============================
+Arquivos-isca (canary/honeytoken) de credencial e wallet.
+
+Infostealer e invasor manual leem ``~/.ssh/id_*``, keystore, ``wallet.dat``
+e seed phrase com ``open()`` + ``read()``. Leitura não gera nenhum evento no
+FSWatcher (só escrita/criação/remoção), e as regras de conteúdo (H023 etc.)
+só olham o *código* de quem lê, quando ele cai em disco. Um ``cat
+~/.ssh/id_ed25519`` numa shell invadida passava sem nada (medido
+2026-11-04).
+
+O usuário planta arquivos falsos com nome de segredo em
+``monitor.canary_paths``. Ninguém legítimo abre esses arquivos, então
+qualquer IN_OPEN neles vira alerta CRITICAL. Não serve pra arquivo de
+segredo *real*: a própria wallet/ssh abre o seu arquivo o tempo todo.
+
+Nome da isca: NÃO usar os nomes padrão do cliente ssh (``id_rsa``,
+``id_ecdsa``, ``id_ed25519``, ``id_dsa``, ``id_xmss`` e ``*_sk``). O ``ssh``
+abre esses arquivos sozinho a cada conexão sem ``IdentitiesOnly`` (``ssh -G``
+na VPS, 2026-11-04), então todo ``git push`` alertaria. Stealer faz glob de
+``~/.ssh/*``, então ``~/.ssh/id_ed25519_old``, ``~/.ssh/backup_prod.pem``,
+``~/wallets/UTC--...--<addr>`` ou ``~/seed-phrase.txt`` pegam igual.
+
+Limites:
+  - inotify não diz quem abriu. A atribuição varre ``/proc/*/fd`` logo depois
+    do evento (melhor esforço): ``cat`` costuma já ter fechado o arquivo.
+  - Cooldown de ``_COOLDOWN_S`` por arquivo: loop que abre o arquivo mil
+    vezes gera 1 alerta, não mil.
+  - O próprio scanner pula os arquivos-isca (ver ScanEngine), senão um
+    ``ekp scan /home`` disparava o alerta.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+from watchdog.events import FileOpenedEvent, FileSystemEvent, FileSystemEventHandler
+from watchdog.observers import Observer
+
+from .events import FileEvent, FileEventKind
+
+logger = logging.getLogger(__name__)
+
+_COOLDOWN_S = 60.0
+
+
+def find_openers(path: str, proc_root: str = "/proc") -> list[str]:
+    """PIDs (como ``"nome(pid)"``) com fd aberto apontando pra ``path``.
+    Só enxerga processos que o usuário atual pode ler."""
+    found: list[str] = []
+    own = str(os.getpid())
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit() and p != own]
+    except OSError:
+        return found
+    for pid in pids:
+        fd_dir = os.path.join(proc_root, pid, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if target == path:
+                try:
+                    with open(os.path.join(proc_root, pid, "comm")) as f:
+                        name = f.read().strip()
+                except OSError:
+                    name = "?"
+                found.append(f"{name}({pid})")
+                break
+    return found
+
+
+def resolve_canaries(paths: list[str]) -> dict[str, str]:
+    """Path real -> path configurado, só dos arquivos que existem."""
+    out: dict[str, str] = {}
+    for raw in paths or []:
+        p = Path(raw).expanduser()
+        if not p.is_file():
+            logger.warning("Arquivo-isca não existe (ignorado): %s", raw)
+            continue
+        out[str(p.resolve())] = str(p)
+    return out
+
+
+class _CanaryHandler(FileSystemEventHandler):
+    def __init__(
+        self,
+        canaries: dict[str, str],
+        emit:     Callable[[FileEvent], None],
+        clock:    Callable[[], float] = time.monotonic,
+        openers:  Callable[[str], list[str]] = find_openers,
+    ) -> None:
+        super().__init__()
+        self._canaries = canaries
+        self._emit     = emit
+        self._clock    = clock
+        self._openers  = openers
+        self._last: dict[str, float] = {}
+
+    def on_opened(self, event: FileSystemEvent) -> None:
+        self.handle_open(event.src_path)
+
+    def handle_open(self, real_path: str) -> None:
+        configured = self._canaries.get(real_path)
+        if configured is None:
+            return
+        now  = self._clock()
+        last = self._last.get(real_path)
+        if last is not None and now - last < _COOLDOWN_S:
+            return
+        self._last[real_path] = now
+        who = self._openers(real_path)
+        detail = ("aberto por " + ", ".join(who)) if who else "processo não identificado"
+        self._emit(FileEvent(kind=FileEventKind.ACCESSED, path=configured, detail=detail))
+
+
+class CanaryWatcher:
+    """Observa IN_OPEN nos arquivos-isca e empurra FileEvent ACCESSED na fila."""
+
+    def __init__(
+        self,
+        paths: list[str],
+        queue: asyncio.Queue,
+        loop:  asyncio.AbstractEventLoop,
+    ) -> None:
+        self._canaries = resolve_canaries(paths)
+        self._queue    = queue
+        self._loop     = loop
+        self._observer: Optional[Observer] = None
+
+    def _emit(self, ev: FileEvent) -> None:
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, ev)
+
+    def start(self) -> None:
+        if not self._canaries:
+            return
+        from watchdog.observers.inotify import InotifyObserver
+        self._observer = InotifyObserver()
+        handler = _CanaryHandler(self._canaries, self._emit)
+        # Watch no dir pai (não recursivo), filtrado só pra IN_OPEN. O
+        # handler descarta abertura de qualquer outro arquivo do dir.
+        for parent in sorted({os.path.dirname(p) for p in self._canaries}):
+            try:
+                self._observer.schedule(handler, parent, recursive=False,
+                                        event_filter=[FileOpenedEvent])
+            except OSError as exc:
+                logger.error("Não foi possível vigiar arquivos-isca em %s: %s", parent, exc)
+        self._observer.start()
+        logger.info("CanaryWatcher: %d arquivo(s)-isca vigiado(s).", len(self._canaries))
+
+    def stop(self) -> None:
+        if self._observer and self._observer.is_alive():
+            self._observer.stop()
+            self._observer.join(timeout=5)
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self._observer and self._observer.is_alive())
+
+    @property
+    def paths(self) -> list[str]:
+        return sorted(self._canaries.values())
+
+    def status(self) -> dict:
+        return {"running": self.is_running, "canaries": self.paths}

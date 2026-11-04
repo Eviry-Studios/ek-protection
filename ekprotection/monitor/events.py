@@ -26,6 +26,7 @@ class FileEventKind(Enum):
     MOVED    = auto()
     EXECUTED = auto()   # detectado via modificação de xattr/execve (heurística)
     CLOSED   = auto()   # IN_CLOSE_WRITE: escrita terminou (download/cp completo)
+    ACCESSED = auto()   # IN_OPEN num arquivo-isca (monitor.canary_paths)
 
 
 class ProcEventKind(Enum):
@@ -45,6 +46,7 @@ class FileEvent:
     size:       Optional[int]     = None     # bytes, se disponível
     uid:        Optional[int]     = None     # dono do arquivo
     mode:       Optional[int]     = None     # permissões (stat.st_mode)
+    detail:     Optional[str]     = None     # para ACCESSED: quem abriu
 
     @property
     def extension(self) -> str:

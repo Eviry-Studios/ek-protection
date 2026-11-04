@@ -1322,3 +1322,168 @@ class TestMonitorManager:
             name="evil", reason="teste",
         )
         monitor._log_event_from(ev)   # não deve lançar
+
+
+# ---------------------------------------------------------------------------
+# Testes: arquivos-isca (canary) — 2026-11-04
+# ---------------------------------------------------------------------------
+
+from ekprotection.monitor.canary import (  # noqa: E402
+    CanaryWatcher, _CanaryHandler, find_openers, resolve_canaries,
+)
+
+
+class TestCanary:
+    """Leitura de chave/wallet não gerava evento nenhum (só escrita gera).
+    `cat ~/.ssh/id_ed25519` passava limpo (medido 2026-11-04)."""
+
+    @staticmethod
+    def _decoy(tmp_path: Path, name: str = "id_ed25519") -> str:
+        p = tmp_path / name
+        p.write_text("FAKE-DECOY\n")
+        return str(p)
+
+    @staticmethod
+    def _handler(canaries: dict[str, str], clock=None, openers=None):
+        out: list[FileEvent] = []
+        t = [0.0]
+        h = _CanaryHandler(
+            canaries, out.append,
+            clock=clock or (lambda: t[0]),
+            openers=openers or (lambda p: []),
+        )
+        return h, out, t
+
+    def test_resolve_skips_missing_and_dir(self, tmp_path: Path) -> None:
+        key = self._decoy(tmp_path)
+        (tmp_path / "d").mkdir()
+        got = resolve_canaries([key, str(tmp_path / "nope"), str(tmp_path / "d")])
+        assert got == {str(Path(key).resolve()): key}
+
+    def test_resolve_symlink_maps_back_to_configured(self, tmp_path: Path) -> None:
+        real = self._decoy(tmp_path, "real.dat")
+        link = tmp_path / "wallet.dat"
+        link.symlink_to(real)
+        assert resolve_canaries([str(link)]) == {str(Path(real).resolve()): str(link)}
+
+    def test_open_of_canary_emits_accessed(self) -> None:
+        h, out, _ = self._handler({"/r/id": "/c/id"}, openers=lambda p: ["cat(42)"])
+        h.handle_open("/r/id")
+        assert len(out) == 1
+        assert out[0].kind == FileEventKind.ACCESSED
+        assert out[0].path == "/c/id"
+        assert out[0].detail == "aberto por cat(42)"
+
+    def test_unknown_opener_detail(self) -> None:
+        h, out, _ = self._handler({"/r/id": "/r/id"})
+        h.handle_open("/r/id")
+        assert out[0].detail == "processo não identificado"
+
+    def test_other_file_in_same_dir_ignored(self) -> None:
+        h, out, _ = self._handler({"/r/.ssh/id_ed25519": "/r/.ssh/id_ed25519"})
+        h.handle_open("/r/.ssh/known_hosts")
+        h.handle_open("/r/.ssh/id_ed25519.pub")
+        assert out == []
+
+    def test_cooldown_per_file(self) -> None:
+        h, out, t = self._handler({"/a": "/a", "/b": "/b"})
+        for _ in range(100):
+            h.handle_open("/a")
+        h.handle_open("/b")
+        assert [e.path for e in out] == ["/a", "/b"]
+        t[0] = 59.9
+        h.handle_open("/a")
+        assert len(out) == 2
+        t[0] = 60.0
+        h.handle_open("/a")
+        assert [e.path for e in out] == ["/a", "/b", "/a"]
+
+    def test_find_openers_sees_held_fd(self, tmp_path: Path) -> None:
+        import subprocess, sys
+        key = self._decoy(tmp_path)
+        p = subprocess.Popen([sys.executable, "-c",
+                              f"f=open({key!r}); import sys; sys.stdin.read()"],
+                             stdin=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            found: list[str] = []
+            while time.monotonic() < deadline and not found:
+                found = find_openers(key)
+                time.sleep(0.05)
+            assert f"({p.pid})" in " ".join(found)
+        finally:
+            p.stdin.close(); p.wait(timeout=5)
+
+    def test_find_openers_skips_self(self, tmp_path: Path) -> None:
+        key = self._decoy(tmp_path)
+        with open(key):
+            assert all(f"({os.getpid()})" not in o for o in find_openers(key))
+
+    def test_watcher_without_canaries_does_not_start(self, event_queue) -> None:
+        w = CanaryWatcher([], event_queue, asyncio.new_event_loop())
+        w.start()
+        assert not w.is_running
+        assert w.status() == {"running": False, "canaries": []}
+
+    @pytest.mark.asyncio
+    async def test_e2e_cat_of_decoy_key_alerts_once(self, tmp_path: Path) -> None:
+        import subprocess
+        key = self._decoy(tmp_path)
+        other = self._decoy(tmp_path, "known_hosts")
+        q: asyncio.Queue = asyncio.Queue()
+        w = CanaryWatcher([key], q, asyncio.get_running_loop())
+        w.start()
+        try:
+            await asyncio.sleep(0.3)
+            subprocess.run(["cat", other], stdout=subprocess.DEVNULL, check=True)
+            for _ in range(3):
+                subprocess.run(["cat", key], stdout=subprocess.DEVNULL, check=True)
+            await asyncio.sleep(0.8)
+        finally:
+            w.stop()
+        evs = []
+        while not q.empty():
+            evs.append(q.get_nowait())
+        assert [(e.kind, e.path) for e in evs] == [(FileEventKind.ACCESSED, key)]
+
+    @pytest.mark.asyncio
+    async def test_e2e_stat_and_write_do_not_alert(self, tmp_path: Path) -> None:
+        """Só open() conta. stat/ls (indexador, `find`) não abrem o arquivo."""
+        key = self._decoy(tmp_path)
+        q: asyncio.Queue = asyncio.Queue()
+        w = CanaryWatcher([key], q, asyncio.get_running_loop())
+        w.start()
+        try:
+            await asyncio.sleep(0.3)
+            os.stat(key); os.listdir(tmp_path); os.access(key, os.R_OK)
+            await asyncio.sleep(0.5)
+        finally:
+            w.stop()
+        assert q.empty()
+
+    @pytest.mark.asyncio
+    async def test_manager_wires_canary_and_logs_critical(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        import subprocess
+        from ekprotection.logs.models import EventType, LogLevel
+        key = self._decoy(tmp_path)
+        cfg.set("monitor.canary_paths", [key])
+        log = MagicMock()
+        mon = MonitorManager(cfg, log)
+        seen: list = []
+        mon.add_callback(seen.append)
+        with patch.object(ProcWatcher, "run", AsyncMock()):
+            await mon.start()
+            try:
+                await asyncio.sleep(0.3)
+                subprocess.run(["cat", key], stdout=subprocess.DEVNULL, check=True)
+                await asyncio.sleep(1.5)
+                st = mon.status()
+            finally:
+                await mon.stop()
+        acc = [e for e in seen if isinstance(e, FileEvent) and e.kind == FileEventKind.ACCESSED]
+        assert len(acc) == 1
+        assert st["counters"]["canary_accessed"] == 1
+        assert st["canary"]["canaries"] == [key]
+        calls = log.get_source.return_value.event.call_args_list
+        crit = [c for c in calls if c.args[0] == EventType.CANARY_ACCESSED]
+        assert len(crit) == 1 and crit[0].kwargs["level"] == LogLevel.CRITICAL

@@ -30,6 +30,7 @@ _KIND_ICON = {
     FileEventKind.DELETED:  ("✖",  "red"),
     FileEventKind.MOVED:    ("➜",  "cyan"),
     FileEventKind.EXECUTED: ("⚡", "bold red"),
+    FileEventKind.ACCESSED: ("🔑", "bold red"),
 }
 
 

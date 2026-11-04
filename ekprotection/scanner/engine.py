@@ -86,6 +86,9 @@ class ScanEngine:
         self._max_size    = config.get("scanner.max_file_size_mb", 512) * 1024 * 1024
         self._entropy_thr = config.get("heuristics.entropy_threshold", 7.2)
         self._auto_quar   = config.get("quarantine.auto_quarantine_critical", True)
+        # Arquivo-isca: abrir pra escanear disparava o próprio alerta.
+        self._canaries    = {os.path.realpath(os.path.expanduser(c))
+                             for c in (config.get("monitor.canary_paths", []) or [])}
 
     # ------------------------------------------------------------------
     # Scan de arquivo único
@@ -136,6 +139,9 @@ class ScanEngine:
         if not p.is_file():
             return FileScanResult(path=path, verdict=ScanVerdict.SKIPPED,
                                   reason="não é arquivo regular")
+        if self._canaries and os.path.realpath(path) in self._canaries:
+            return FileScanResult(path=path, verdict=ScanVerdict.SKIPPED,
+                                  reason="arquivo-isca (monitor.canary_paths)")
 
         try:
             st        = p.stat()

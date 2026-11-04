@@ -34,6 +34,7 @@ from .events import (
     ProcessEvent, ProcEventKind,
     MonitorEvent,
 )
+from .canary       import CanaryWatcher
 from .fs_watcher   import FSWatcher
 from .proc_watcher import ProcWatcher
 
@@ -68,6 +69,7 @@ class MonitorManager:
         self._queue:     asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._callbacks: list[EventCallback] = []
         self._fs_watcher:   Optional[FSWatcher]   = None
+        self._canary:       Optional[CanaryWatcher] = None
         self._proc_watcher: Optional[ProcWatcher] = None
         self._dispatch_task: Optional[asyncio.Task] = None
         self._proc_task:     Optional[asyncio.Task] = None
@@ -81,6 +83,7 @@ class MonitorManager:
             "file_moved":     0,
             "proc_new":       0,
             "proc_suspicious":0,
+            "canary_accessed":0,
             "dropped":        0,
         }
 
@@ -111,6 +114,14 @@ class MonitorManager:
                 ignores   = ignores,
             )
             self._fs_watcher.start()
+
+            canaries = self.config.get("monitor.canary_paths", [])
+            if canaries:
+                self._canary = CanaryWatcher(canaries, self._queue, loop)
+                try:
+                    self._canary.start()
+                except Exception as exc:
+                    logger.error("Erro ao iniciar CanaryWatcher: %s", exc)
 
         # --- ProcWatcher ---
         proc_enabled = self.config.get("monitor.enabled", True)
@@ -155,6 +166,8 @@ class MonitorManager:
         # Para fs watcher (thread)
         if self._fs_watcher:
             self._fs_watcher.stop()
+        if self._canary:
+            self._canary.stop()
 
         # Para dispatch loop
         if self._dispatch_task and not self._dispatch_task.done():
@@ -221,7 +234,14 @@ class MonitorManager:
 
     def _log_event_from(self, event: MonitorEvent) -> None:
         """Grava evento de monitoramento nos logs estruturados."""
-        if isinstance(event, FileEvent):
+        if isinstance(event, FileEvent) and event.kind == FileEventKind.ACCESSED:
+            self._log_event(
+                EventType.CANARY_ACCESSED,
+                f"Arquivo-isca aberto: {event.path} — {event.detail}",
+                LogLevel.CRITICAL,
+                file_path=event.path,
+            )
+        elif isinstance(event, FileEvent):
             kind_map = {
                 FileEventKind.CREATED:  (EventType.FILE_CREATED,  LogLevel.DEBUG),
                 FileEventKind.MODIFIED: (EventType.FILE_MODIFIED, LogLevel.DEBUG),
@@ -274,6 +294,7 @@ class MonitorManager:
                 FileEventKind.DELETED:  "file_deleted",
                 FileEventKind.MOVED:    "file_moved",
                 FileEventKind.EXECUTED: "file_created",
+                FileEventKind.ACCESSED: "canary_accessed",
             }.get(event.kind)
             if key:
                 self._counters[key] = self._counters.get(key, 0) + 1
@@ -293,4 +314,6 @@ class MonitorManager:
             result["fs_watcher"] = self._fs_watcher.status()
         if self._proc_watcher:
             result["proc_watcher"] = self._proc_watcher.status()
+        if self._canary:
+            result["canary"] = self._canary.status()
         return result

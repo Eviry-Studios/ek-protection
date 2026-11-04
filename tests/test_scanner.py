@@ -432,6 +432,31 @@ class TestScanEngineFile:
         assert r.verdict == ScanVerdict.SKIPPED
         assert "grande" in (r.reason or "")
 
+    def test_canary_skipped_without_opening(self, cfg: ConfigManager, sig_db: SignatureDB,
+                                            tmp_path: Path) -> None:
+        """Escanear o arquivo-isca disparava o alerta de canary (2026-11-04)."""
+        key = tmp_path / "id_ed25519"
+        key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE\n")
+        link = tmp_path / "link"
+        link.symlink_to(key)
+        other = tmp_path / "x.sh"
+        other.write_text("echo oi\n")
+        cfg.set("monitor.canary_paths", [str(key)])
+        eng = ScanEngine(cfg, sig_db=sig_db)
+        real_open = open
+        opened: list[str] = []
+        def spy(p, *a, **kw):
+            opened.append(os.path.realpath(str(p)))
+            return real_open(p, *a, **kw)
+        with patch("builtins.open", spy):
+            r1 = eng.scan_file(key)
+            r2 = eng.scan_file(link)
+            r3 = eng.scan_file(other)
+        assert r1.verdict == ScanVerdict.SKIPPED and "isca" in (r1.reason or "")
+        assert r2.verdict == ScanVerdict.SKIPPED
+        assert r3.verdict != ScanVerdict.SKIPPED
+        assert str(key.resolve()) not in opened
+
     def test_whitelist_path_skipped(self, cfg: ConfigManager, sig_db: SignatureDB,
                                     tmp_path: Path) -> None:
         from ekprotection.exceptions.manager import ExceptionManager
