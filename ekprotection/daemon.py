@@ -630,6 +630,11 @@ def run_daemon(config_path: str | None = None) -> None:
 
     _setup_logging(log_level, log_dir)
     logger.info("Iniciando EK-Protection Daemon v0.9.0")
+    # O load() roda antes do logging existir, então o aviso dele se perde.
+    for issue in cfg.permission_issues:
+        logger.critical("Config adulterável: %s", issue)
+    if cfg.rejected:
+        logger.critical("Config %s IGNORADA, daemon rodando com defaults.", cfg.config_path)
 
     try:
         asyncio.run(_daemon_loop(cfg))
