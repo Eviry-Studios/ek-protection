@@ -545,3 +545,187 @@ class TestEndToEnd:
         for expected in ["auth", "logs", "monitor", "exceptions",
                          "quarantine", "scan", "heuristics", "update", "report"]:
             assert expected in all_names, f"Grupo '{expected}' não registrado na CLI"
+
+
+# ---------------------------------------------------------------------------
+# Testes: PluginManager — plugin adulterável não é importado
+# ---------------------------------------------------------------------------
+
+class TestPluginPermissions:
+    GOOD = (
+        "from ekprotection.plugins.manager import EKPlugin\n"
+        "class Good(EKPlugin):\n"
+        "    name = 'good'\n"
+    )
+
+    @staticmethod
+    def _payload(marker: Path) -> str:
+        return (
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).write_text('x')\n"
+            "from ekprotection.plugins.manager import EKPlugin\n"
+            "class Evil(EKPlugin):\n"
+            "    name = 'evil'\n"
+        )
+
+    @pytest.fixture
+    def env(self, cfg: ConfigManager, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("EKP_CONFIG_STRICT", raising=False)
+        base = tmp_dir / "root"
+        base.mkdir(mode=0o755)
+        os.chmod(base, 0o755)
+        pdir = base / "plugins"
+        pdir.mkdir()
+        os.chmod(pdir, 0o755)
+        cfg.set("plugins.enabled", True)
+        cfg.set("plugins.dir", str(pdir))
+        return cfg, base, pdir
+
+    @staticmethod
+    def _plugin(pdir: Path, name: str, code: str, mode: int = 0o644, dmode: int = 0o755) -> Path:
+        d = pdir / name
+        d.mkdir()
+        os.chmod(d, dmode)
+        p = d / "plugin.py"
+        p.write_text(code)
+        os.chmod(p, mode)
+        return p
+
+    @staticmethod
+    def _names(mgr: PluginManager) -> list[str]:
+        return sorted(p.name for p in mgr._plugins)
+
+    def test_benign_plugin_loads(self, env) -> None:
+        cfg, _, pdir = env
+        self._plugin(pdir, "good", self.GOOD)
+        mgr = PluginManager(cfg)
+        assert mgr.load_all() == 1
+        assert type(mgr._plugins[0]).__module__ == "ekp_plugin_good"
+
+    @pytest.mark.parametrize("mode", [0o777, 0o1777, 0o757])
+    def test_plugins_dir_writable_by_others_refused(self, env, tmp_dir: Path, mode: int, caplog) -> None:
+        cfg, _, pdir = env
+        marker = tmp_dir / "MARKER"
+        self._plugin(pdir, "evil", self._payload(marker))
+        os.chmod(pdir, mode)
+        with caplog.at_level("CRITICAL"):
+            assert PluginManager(cfg).load_all() == 0
+        assert not marker.exists()
+        assert "nenhum plugin carregado" in caplog.text
+
+    def test_plugins_parent_writable_without_sticky_refused(self, env) -> None:
+        cfg, base, pdir = env
+        self._plugin(pdir, "good", self.GOOD)
+        os.chmod(base, 0o777)
+        assert PluginManager(cfg).load_all() == 0
+
+    def test_plugins_parent_writable_with_sticky_ok(self, env) -> None:
+        cfg, base, pdir = env
+        self._plugin(pdir, "good", self.GOOD)
+        os.chmod(base, 0o1777)
+        assert PluginManager(cfg).load_all() == 1
+
+    def test_plugin_file_writable_by_others_skipped_others_load(self, env, tmp_dir: Path, caplog) -> None:
+        cfg, _, pdir = env
+        marker = tmp_dir / "MARKER"
+        self._plugin(pdir, "evil", self._payload(marker), mode=0o666)
+        self._plugin(pdir, "good", self.GOOD)
+        mgr = PluginManager(cfg)
+        with caplog.at_level("CRITICAL"):
+            assert mgr.load_all() == 1
+        assert self._names(mgr) == ["good"]
+        assert not marker.exists()
+        assert "plugin 'evil' ignorado" in caplog.text
+
+    def test_plugin_subdir_writable_by_others_skipped(self, env, tmp_dir: Path) -> None:
+        cfg, _, pdir = env
+        marker = tmp_dir / "MARKER"
+        self._plugin(pdir, "evil", self._payload(marker), dmode=0o777)
+        assert PluginManager(cfg).load_all() == 0
+        assert not marker.exists()
+
+    def test_plugin_file_symlink_refused(self, env, tmp_dir: Path) -> None:
+        cfg, base, pdir = env
+        marker = tmp_dir / "MARKER"
+        p = self._plugin(pdir, "evil", self.GOOD)
+        target = base / "fora.py"
+        target.write_text(self._payload(marker))
+        p.unlink()
+        p.symlink_to(target)
+        assert PluginManager(cfg).load_all() == 0
+        assert not marker.exists()
+
+    def test_plugin_subdir_symlink_refused(self, env, tmp_dir: Path) -> None:
+        cfg, base, pdir = env
+        marker = tmp_dir / "MARKER"
+        outside = base / "outside"
+        outside.mkdir()
+        (outside / "plugin.py").write_text(self._payload(marker))
+        os.chmod(outside / "plugin.py", 0o644)
+        (pdir / "evil").symlink_to(outside)
+        assert PluginManager(cfg).load_all() == 0
+        assert not marker.exists()
+
+    def test_poisoned_pyc_not_executed(self, env, tmp_dir: Path) -> None:
+        import importlib.util as ilu, marshal, sys
+        cfg, _, pdir = env
+        marker = tmp_dir / "MARKER"
+        src = self._plugin(pdir, "good", self.GOOD)
+        cache = src.parent / "__pycache__"
+        cache.mkdir()
+        st = src.stat()
+        hdr = (ilu.MAGIC_NUMBER + (0).to_bytes(4, "little")
+               + int(st.st_mtime).to_bytes(4, "little") + (st.st_size & 0xFFFFFFFF).to_bytes(4, "little"))
+        code = compile(self._payload(marker), str(src), "exec")
+        (cache / f"plugin.{sys.implementation.cache_tag}.pyc").write_bytes(hdr + marshal.dumps(code))
+        mgr = PluginManager(cfg)
+        assert mgr.load_all() == 1
+        assert self._names(mgr) == ["good"]
+        assert not marker.exists()
+
+    def test_no_pyc_written(self, env) -> None:
+        cfg, _, pdir = env
+        src = self._plugin(pdir, "good", self.GOOD)
+        PluginManager(cfg).load_all()
+        assert not (src.parent / "__pycache__").exists()
+
+    def test_fifo_skipped_without_hanging(self, env) -> None:
+        cfg, _, pdir = env
+        d = pdir / "fifo"
+        d.mkdir()
+        os.chmod(d, 0o755)
+        os.mkfifo(d / "plugin.py", 0o644)
+        self._plugin(pdir, "good", self.GOOD)
+        mgr = PluginManager(cfg)
+        assert mgr.load_all() == 1
+        assert self._names(mgr) == ["good"]
+
+    def test_foreign_owner_refused(self, env, monkeypatch: pytest.MonkeyPatch) -> None:
+        import ekprotection.plugins.manager as pm
+        cfg, _, pdir = env
+        self._plugin(pdir, "good", self.GOOD)
+        monkeypatch.setattr(pm, "_trusted_uid", lambda uid: False)
+        assert PluginManager(cfg).load_all() == 0
+
+    def test_private_group_write_ok(self, env, monkeypatch: pytest.MonkeyPatch) -> None:
+        import ekprotection.config.manager as cm
+        cfg, _, pdir = env
+        monkeypatch.setattr(cm, "_private_group", lambda gid, uid: True)
+        os.chmod(pdir, 0o775)
+        self._plugin(pdir, "good", self.GOOD, mode=0o664, dmode=0o775)
+        assert PluginManager(cfg).load_all() == 1
+
+    def test_shared_group_write_refused(self, env, monkeypatch: pytest.MonkeyPatch) -> None:
+        import ekprotection.config.manager as cm
+        cfg, _, pdir = env
+        monkeypatch.setattr(cm, "_private_group", lambda gid, uid: False)
+        self._plugin(pdir, "good", self.GOOD, mode=0o664)
+        assert PluginManager(cfg).load_all() == 0
+
+    def test_strict_off_warns_and_loads(self, env, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+        cfg, _, pdir = env
+        monkeypatch.setenv("EKP_CONFIG_STRICT", "0")
+        self._plugin(pdir, "good", self.GOOD, mode=0o666)
+        with caplog.at_level("CRITICAL"):
+            assert PluginManager(cfg).load_all() == 1
+        assert "carregando mesmo assim" in caplog.text

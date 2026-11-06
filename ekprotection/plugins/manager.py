@@ -33,17 +33,50 @@ Segurança:
   - Erros em plugins são isolados — nunca derrubam o daemon
   - Plugins não têm acesso direto ao banco de dados
   - Cada plugin roda em contexto sandboxado via try/except
+  - Plugin adulterável por outro usuário não é importado (o daemon roda
+    como root): dir de plugins, dir do plugin e plugin.py precisam ser do
+    root/euid e sem escrita de grupo/outros. plugin.py é lido de um fd
+    aberto com O_NOFOLLOW e compilado direto, sem __pycache__ (um .pyc
+    forjado com mtime/tamanho do fonte seria executado no lugar dele).
 """
 
 from __future__ import annotations
 
 import importlib.util
 import logging
-import sys
+import os
+import stat
 from pathlib import Path
 from typing  import Any, Optional
 
+from ekprotection.config.manager import _STRICT_ENV, _trusted_uid, _writable_by_others
+
 logger = logging.getLogger(__name__)
+
+
+def _owner_mode_issues(what: str, path: Path, st: os.stat_result) -> list[str]:
+    issues = []
+    if not _trusted_uid(st.st_uid):
+        issues.append(f"{what} {path} pertence ao uid {st.st_uid} (esperado root ou {os.geteuid()})")
+    if _writable_by_others(st):
+        issues.append(f"{what} {path} gravável por grupo/outros (modo {stat.S_IMODE(st.st_mode):04o})")
+    return issues
+
+
+def plugin_dir_issues(plugin_dir: Path) -> list[str]:
+    """
+    Problemas que deixam outro usuário pôr código no dir de plugins.
+    Sticky bit não basta aqui (diferente do config): com ele ninguém apaga
+    o plugin alheio, mas qualquer um cria um plugin novo.
+    """
+    real = plugin_dir.resolve()
+    issues = _owner_mode_issues("dir de plugins", real, real.stat())
+    pst = real.parent.stat()
+    if not _trusted_uid(pst.st_uid):
+        issues.append(f"dir {real.parent} pertence ao uid {pst.st_uid} (dir de plugins pode ser trocado)")
+    if _writable_by_others(pst) and not stat.S_IMODE(pst.st_mode) & stat.S_ISVTX:
+        issues.append(f"dir {real.parent} gravável por grupo/outros sem sticky bit (dir de plugins pode ser trocado)")
+    return issues
 
 
 class PluginResult:
@@ -123,10 +156,14 @@ class PluginManager:
             logger.debug("Diretório de plugins não existe: %s", plugin_dir)
             return 0
 
+        strict = os.environ.get(_STRICT_ENV, "1") != "0"
+        if self._refused(plugin_dir_issues(plugin_dir), strict, "nenhum plugin carregado"):
+            return 0
+
         loaded = 0
         for plugin_path in sorted(plugin_dir.glob("*/plugin.py")):
             name = plugin_path.parent.name
-            if self._load_plugin(name, plugin_path):
+            if self._load_plugin(name, plugin_path, strict):
                 loaded += 1
 
         logger.info("Plugins carregados: %d", loaded)
@@ -172,14 +209,50 @@ class PluginManager:
     # Internos
     # ------------------------------------------------------------------
 
-    def _load_plugin(self, name: str, path: Path) -> bool:
+    @staticmethod
+    def _refused(issues: list[str], strict: bool, consequence: str) -> bool:
+        for issue in issues:
+            logger.critical(
+                "Plugin adulterável: %s — %s. Corrija com chown root:root + chmod go-w.",
+                issue, consequence if strict else f"carregando mesmo assim ({_STRICT_ENV}=0)",
+            )
+        return bool(issues) and strict
+
+    def _read_plugin_source(self, name: str, path: Path, strict: bool) -> Optional[bytes]:
+        """Lê plugin.py checando permissão no próprio fd (sem corrida stat/open)."""
+        # O_NONBLOCK: um FIFO no lugar do plugin.py travaria o open() do daemon.
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | (os.O_NOFOLLOW if strict else 0)
+        if strict and path.parent.is_symlink():
+            logger.critical("Plugin '%s' ignorado: dir do plugin é symlink (%s).", name, path.parent)
+            return None
+        issues = _owner_mode_issues("dir do plugin", path.parent, path.parent.stat())
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            logger.critical("Plugin '%s' ignorado: %s não abriu (%s; symlink é recusado).", name, path, exc)
+            return None
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                logger.critical("Plugin '%s' ignorado: %s não é arquivo regular.", name, path)
+                return None
+            issues += _owner_mode_issues("plugin", path, st)
+            if self._refused(issues, strict, f"plugin '{name}' ignorado"):
+                return None
+            return fh.read()
+
+    def _load_plugin(self, name: str, path: Path, strict: bool = True) -> bool:
         """Carrega um plugin pelo caminho. Retorna True se bem-sucedido."""
         try:
-            spec   = importlib.util.spec_from_file_location(
-                f"ekp_plugin_{name}", str(path)
-            )
+            source = self._read_plugin_source(name, path, strict)
+            if source is None:
+                return False
+            # Compila do fonte já checado: exec_module() leria __pycache__/*.pyc
+            # se existir, e esse arquivo não passou por checagem nenhuma.
+            spec   = importlib.util.spec_from_loader(f"ekp_plugin_{name}", loader=None, origin=str(path))
             module = importlib.util.module_from_spec(spec)   # type: ignore[arg-type]
-            spec.loader.exec_module(module)                   # type: ignore[union-attr]
+            module.__file__ = str(path)
+            exec(compile(source, str(path), "exec"), module.__dict__)
 
             # Procura subclasse de EKPlugin no módulo
             plugin_cls = None
