@@ -635,6 +635,8 @@ def run_daemon(config_path: str | None = None) -> None:
         logger.critical("Config adulterável: %s", issue)
     if cfg.rejected:
         logger.critical("Config %s IGNORADA, daemon rodando com defaults.", cfg.config_path)
+    for issue in cfg.exposure_issues:
+        logger.warning("Config exposta: %s (corrija com `chmod 600 %s`).", issue, cfg.config_path)
 
     try:
         asyncio.run(_daemon_loop(cfg))

@@ -391,3 +391,106 @@ class TestDaemonRelogsIssues:
         daemon.run_daemon(str(evil_config))
         assert any("IGNORADA" in m for m in seen)
         assert any("gravável" in m for m in seen)
+
+
+_CANARY = "monitor:\n  canary_paths: [/root/.ssh/id_backup]\n"
+
+
+@pytest.fixture
+def exposed_config(tmp_path: Path):
+    d = tmp_path / "etc"
+    d.mkdir(mode=0o755)
+    p = d / "config.yaml"
+    p.write_text(_CANARY)
+    os.chmod(p, 0o644)
+    yield p
+    os.chmod(d, 0o755)
+
+
+class TestConfigExposure:
+    """Config legível por outros com isca/exceção: avisa, não recusa."""
+
+    @pytest.mark.parametrize("body,key", [
+        (_CANARY, "monitor.canary_paths"),
+        ("exceptions:\n  paths: [/opt/x]\n", "exceptions.paths"),
+        ("exceptions:\n  hashes: [abc]\n", "exceptions.hashes"),
+        ("exceptions:\n  processes: [miner]\n", "exceptions.processes"),
+    ])
+    def test_world_readable_with_secret_warns(self, exposed_config: Path, body, key) -> None:
+        exposed_config.write_text(body)
+        c = ConfigManager(exposed_config).load()
+        assert len(c.exposure_issues) == 1
+        assert key in c.exposure_issues[0]
+        assert "0644" in c.exposure_issues[0]
+        assert not c.rejected
+
+    def test_still_loads_values(self, exposed_config: Path) -> None:
+        c = ConfigManager(exposed_config).load()
+        assert c.get("monitor.canary_paths") == ["/root/.ssh/id_backup"]
+
+    def test_lists_all_present_keys(self, exposed_config: Path) -> None:
+        exposed_config.write_text(_CANARY + "exceptions:\n  paths: [/opt/x]\n")
+        c = ConfigManager(exposed_config).load()
+        assert "monitor.canary_paths, exceptions.paths" in c.exposure_issues[0]
+
+    def test_mode_600_is_ok(self, exposed_config: Path) -> None:
+        os.chmod(exposed_config, 0o600)
+        assert ConfigManager(exposed_config).load().exposure_issues == []
+
+    def test_no_secret_is_ok(self, exposed_config: Path) -> None:
+        exposed_config.write_text("daemon:\n  log_level: INFO\n")
+        assert ConfigManager(exposed_config).load().exposure_issues == []
+
+    def test_empty_lists_are_ok(self, exposed_config: Path) -> None:
+        exposed_config.write_text("monitor:\n  canary_paths: []\nexceptions:\n  paths: []\n")
+        assert ConfigManager(exposed_config).load().exposure_issues == []
+
+    def test_default_extensions_not_counted(self, exposed_config: Path) -> None:
+        # exceptions.extensions vem do default público, não é segredo
+        exposed_config.write_text("exceptions:\n  extensions: [.iso]\n")
+        assert ConfigManager(exposed_config).load().exposure_issues == []
+
+    def test_untraversable_parent_is_ok(self, exposed_config: Path) -> None:
+        os.chmod(exposed_config.parent, 0o700)
+        assert ConfigManager(exposed_config).load().exposure_issues == []
+
+    def test_group_readable_private_group_ok(self, exposed_config: Path, monkeypatch) -> None:
+        from ekprotection.config import manager
+        os.chmod(exposed_config, 0o640)
+        monkeypatch.setattr(manager, "_private_group", lambda gid, uid: True)
+        assert ConfigManager(exposed_config).load().exposure_issues == []
+
+    def test_group_readable_shared_group_warns(self, exposed_config: Path, monkeypatch) -> None:
+        from ekprotection.config import manager
+        os.chmod(exposed_config, 0o640)
+        monkeypatch.setattr(manager, "_private_group", lambda gid, uid: False)
+        assert len(ConfigManager(exposed_config).load().exposure_issues) == 1
+
+    def test_logs_warning_with_fix(self, exposed_config: Path, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="ekprotection"):
+            ConfigManager(exposed_config).load()
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("Config exposta" in m and "chmod 600" in m for m in msgs)
+
+    def test_save_fixes_exposure(self, exposed_config: Path) -> None:
+        c = ConfigManager(exposed_config).load()
+        os.chmod(exposed_config, 0o600)
+        c.save()
+        assert ConfigManager(exposed_config).load().exposure_issues == []
+
+    def test_reload_clears_issues(self, exposed_config: Path) -> None:
+        c = ConfigManager(exposed_config).load()
+        assert c.exposure_issues
+        os.chmod(exposed_config, 0o600)
+        assert c.load().exposure_issues == []
+
+    def test_daemon_relogs_exposure(self, exposed_config: Path, monkeypatch) -> None:
+        from ekprotection import daemon
+        seen: list[str] = []
+        monkeypatch.setattr(daemon, "_setup_logging", lambda *a: None)
+        monkeypatch.setattr(daemon.logger, "warning", lambda msg, *a, **k: seen.append(msg % a))
+        def stop(coro):
+            coro.close()
+        monkeypatch.setattr(daemon.asyncio, "run", stop)
+        daemon.run_daemon(str(exposed_config))
+        assert any("Config exposta" in m and "canary_paths" in m for m in seen)

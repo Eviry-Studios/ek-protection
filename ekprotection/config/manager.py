@@ -130,6 +130,51 @@ def config_permission_issues(path: Path) -> list[str]:
     return issues
 
 
+# Config legível por outro usuário não é adulterável, então não é recusada,
+# mas entrega o mapa da defesa: quem lê `canary_paths` sabe quais chaves são
+# isca e evita, quem lê `exceptions.*` sabe onde o scanner não olha. Só
+# avisa quando há algo desses no arquivo e ele é alcançável (dir pai com
+# travessia pra outros). Chave existente no default público não conta.
+_SENSITIVE_KEYS = (
+    ("monitor", "canary_paths"),
+    ("exceptions", "paths"),
+    ("exceptions", "hashes"),
+    ("exceptions", "processes"),
+)
+
+
+def _readable_by_others(st: os.stat_result, bits: tuple[int, int]) -> bool:
+    other, group = bits
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & other:
+        return True
+    return bool(mode & group) and not _private_group(st.st_gid, st.st_uid)
+
+
+def config_exposure_issues(path: Path, user_cfg: dict) -> list[str]:
+    """
+    Chaves sensíveis de `user_cfg` que outro usuário consegue ler em `path`.
+    Lista vazia = ok.
+    """
+    present = [
+        f"{sec}.{key}" for sec, key in _SENSITIVE_KEYS
+        if isinstance(user_cfg.get(sec), dict) and user_cfg[sec].get(key)
+    ]
+    if not present:
+        return []
+    try:
+        st = path.stat()
+        pst = path.resolve().parent.stat()
+    except OSError:
+        return []
+    if not _readable_by_others(st, (stat.S_IROTH, stat.S_IRGRP)):
+        return []
+    if not _readable_by_others(pst, (stat.S_IXOTH, stat.S_IXGRP)):
+        return []
+    mode = stat.S_IMODE(st.st_mode)
+    return [f"{path} legível por grupo/outros (modo {mode:04o}) expõe {', '.join(present)}"]
+
+
 # ---------------------------------------------------------------------------
 # ConfigManager
 # ---------------------------------------------------------------------------
@@ -154,6 +199,7 @@ class ConfigManager:
         self._data: dict[str, Any] = {}
         self._loaded = False
         self.permission_issues: list[str] = []
+        self.exposure_issues: list[str] = []
         self.rejected = False
 
     # ------------------------------------------------------------------
@@ -182,6 +228,7 @@ class ConfigManager:
         """
         base = copy.deepcopy(DEFAULT_CONFIG)
         self.permission_issues = config_permission_issues(self._config_path)
+        self.exposure_issues = []
         self.rejected = False
 
         if self.permission_issues:
@@ -205,6 +252,13 @@ class ConfigManager:
                     user_cfg = yaml.safe_load(fh) or {}
                 self._data = _deep_merge(base, user_cfg)
                 logger.debug("Configuração carregada de %s", self._config_path)
+                if isinstance(user_cfg, dict):
+                    self.exposure_issues = config_exposure_issues(self._config_path, user_cfg)
+                for issue in self.exposure_issues:
+                    logger.warning(
+                        "Config exposta: %s (corrija com `chmod 600 %s`).",
+                        issue, self._config_path,
+                    )
             except yaml.YAMLError as exc:
                 logger.error("Erro ao parsear YAML: %s — usando defaults.", exc)
                 self._data = base
