@@ -1487,3 +1487,210 @@ class TestCanary:
         calls = log.get_source.return_value.event.call_args_list
         crit = [c for c in calls if c.args[0] == EventType.CANARY_ACCESSED]
         assert len(crit) == 1 and crit[0].kwargs["level"] == LogLevel.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# Testes: isca cega/barulhenta + CLI `ekp canary` — 2026-11-08
+# ---------------------------------------------------------------------------
+
+import json as _json  # noqa: E402
+import logging as _logging  # noqa: E402
+import stat  # noqa: E402
+
+from typer.testing import CliRunner  # noqa: E402
+
+from ekprotection.cli.app import app as _ekp_app  # noqa: E402
+from ekprotection.config.manager import ConfigManager  # noqa: E402
+from ekprotection.monitor import canary as _canary_mod  # noqa: E402
+from ekprotection.monitor.canary import (  # noqa: E402
+    CANARY_KINDS, bait_content, canary_issues, create_canary,
+)
+
+
+class TestCanaryIssuesAndCli:
+    """Abertura com EACCES não gera IN_OPEN: isca ilegível pro dono da home
+    (root 0600, modo 000) nunca alertava, e nome padrão do ssh alertava a
+    cada conexão. Nenhum dos dois avisava (medido 2026-11-08). Isca era
+    feita à mão, editando o YAML."""
+
+    @staticmethod
+    def _file(tmp_path: Path, name: str = "backup_prod.pem", mode: int = 0o600) -> Path:
+        p = tmp_path / name
+        p.write_text("FAKE\n")
+        os.chmod(p, mode)
+        return p
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root lê modo 000")
+    @pytest.mark.parametrize("mode", [0o000, 0o200, 0o044])
+    def test_unreadable_by_dir_owner_flagged(self, tmp_path, mode):
+        p = self._file(tmp_path, mode=mode)
+        issues = canary_issues(p)
+        os.chmod(p, 0o600)
+        assert len(issues) == 1 and "EACCES" in issues[0] and "chown" in issues[0]
+
+    @pytest.mark.parametrize("mode", [0o600, 0o400, 0o644])
+    def test_readable_ok(self, tmp_path, mode):
+        assert canary_issues(self._file(tmp_path, mode=mode)) == []
+
+    def test_other_owner_not_readable_flagged(self, tmp_path, monkeypatch):
+        """Simula isca de root 0600 em dir do usuário (sem precisar de root)."""
+        p = self._file(tmp_path)
+        real = os.stat_result
+        me = os.getuid()
+
+        orig_stat = Path.stat
+        def fake_stat(self, *a, **k):
+            st = orig_stat(self, *a, **k)
+            if self == p:
+                return real((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, me + 1, st.st_gid,
+                             st.st_size, 0, 0, 0))
+            return st
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        monkeypatch.setattr(_canary_mod.grp, "getgrgid", lambda gid: (_ for _ in ()).throw(KeyError()))
+        assert any("EACCES" in i for i in canary_issues(p))
+
+    @pytest.mark.parametrize("name", ["id_rsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519.pub",
+                                      "known_hosts", "authorized_keys", "config"])
+    def test_ssh_auto_opened_name_flagged(self, tmp_path, name):
+        issues = canary_issues(self._file(tmp_path, name))
+        assert len(issues) == 1 and "ssh" in issues[0]
+
+    @pytest.mark.parametrize("name", ["id_ed25519_old", "backup_prod.pem", "id_rsa.bak", "wallet.dat"])
+    def test_good_names_ok(self, tmp_path, name):
+        assert canary_issues(self._file(tmp_path, name)) == []
+
+    def test_missing_file_only_name_check(self, tmp_path):
+        assert canary_issues(tmp_path / "nope.pem") == []
+        assert len(canary_issues(tmp_path / "id_rsa")) == 1
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root lê modo 000")
+    def test_resolve_logs_warning(self, tmp_path, caplog):
+        p = self._file(tmp_path, mode=0o000)
+        with caplog.at_level(_logging.WARNING, logger="ekprotection.monitor.canary"):
+            out = resolve_canaries([str(p)])
+        os.chmod(p, 0o600)
+        assert list(out.values()) == [str(p)]   # continua vigiada
+        assert any("EACCES" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("kind", CANARY_KINDS)
+    def test_create_canary_kinds(self, tmp_path, kind):
+        p = create_canary(tmp_path / f"bait_{kind}", kind)
+        st = p.stat()
+        assert stat.S_IMODE(st.st_mode) == 0o600 and st.st_uid == os.getuid()
+        assert p.read_text() and canary_issues(p) == []
+        if kind == "wallet":
+            assert _json.loads(p.read_text())["version"] == 3
+        if kind == "seed":
+            assert len(p.read_text().split()) == 12
+
+    def test_bait_is_random(self):
+        assert bait_content("ssh") != bait_content("ssh")
+        with pytest.raises(ValueError):
+            bait_content("nope")
+
+    def test_create_never_overwrites_or_follows_symlink(self, tmp_path):
+        real = self._file(tmp_path, "real.txt")
+        with pytest.raises(FileExistsError):
+            create_canary(real, "generic")
+        assert real.read_text() == "FAKE\n"
+        link = tmp_path / "link.pem"
+        link.symlink_to(tmp_path / "target_absent")
+        with pytest.raises(OSError):
+            create_canary(link, "generic")
+        assert not (tmp_path / "target_absent").exists()
+
+    # ---- CLI ---------------------------------------------------------
+
+    @staticmethod
+    def _run(*args):
+        return CliRunner().invoke(_ekp_app, list(args))
+
+    def test_cli_add_list_remove(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("EKP_DATA_DIR", str(tmp_path / "data"))
+        cfgp = tmp_path / "cfg.yaml"
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        bait = home / "backup_prod.pem"
+        r = self._run("canary", "add", str(bait), "-k", "ssh", "-c", str(cfgp))
+        assert r.exit_code == 0, r.output
+        assert "BEGIN OPENSSH PRIVATE KEY" in bait.read_text()
+        assert stat.S_IMODE(cfgp.stat().st_mode) == 0o600
+        cfg = ConfigManager(cfgp).load()
+        assert cfg.get("monitor.canary_paths") == [str(bait)]
+        assert cfg.exposure_issues == []
+
+        r = self._run("canary", "list", "-c", str(cfgp))
+        assert r.exit_code == 0 and "ok" in r.output
+
+        r = self._run("canary", "add", str(bait), "-c", str(cfgp))
+        assert r.exit_code == 1 and "já é isca" in r.output
+
+        r = self._run("canary", "remove", str(bait), "-c", str(cfgp))
+        assert r.exit_code == 0
+        assert ConfigManager(cfgp).load().get("monitor.canary_paths") == []
+        assert bait.exists()
+
+    def test_cli_add_refuses_ssh_name_unless_force(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("EKP_DATA_DIR", str(tmp_path / "data"))
+        cfgp = tmp_path / "cfg.yaml"
+        r = self._run("canary", "add", str(tmp_path / "id_ed25519"), "-c", str(cfgp))
+        assert r.exit_code == 1 and not (tmp_path / "id_ed25519").exists()
+        r = self._run("canary", "add", str(tmp_path / "id_ed25519"), "--force", "-c", str(cfgp))
+        assert r.exit_code == 0 and (tmp_path / "id_ed25519").exists()
+
+    def test_cli_add_refuses_existing_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("EKP_DATA_DIR", str(tmp_path / "data"))
+        cfgp = tmp_path / "cfg.yaml"
+        f = self._file(tmp_path, "wallet.dat")
+        r = self._run("canary", "add", str(f), "-c", str(cfgp))
+        assert r.exit_code == 1 and f.read_text() == "FAKE\n"
+        r = self._run("canary", "add", str(f), "--existing", "-c", str(cfgp))
+        assert r.exit_code == 0
+        assert ConfigManager(cfgp).load().get("monitor.canary_paths") == [str(f)]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root lê modo 000")
+    def test_cli_existing_unreadable_refused_and_list_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("EKP_DATA_DIR", str(tmp_path / "data"))
+        cfgp = tmp_path / "cfg.yaml"
+        f = self._file(tmp_path, "wallet.dat", mode=0o000)
+        try:
+            r = self._run("canary", "add", str(f), "--existing", "-c", str(cfgp))
+            assert r.exit_code == 1
+            assert self._run("canary", "add", str(f), "--existing", "--force", "-c", str(cfgp)).exit_code == 0
+            r = self._run("canary", "list", "-c", str(cfgp))
+            assert r.exit_code == 1 and "EACCES" in r.output.replace("\n", " ")
+        finally:
+            os.chmod(f, 0o600)
+
+    def test_cli_refuses_write_on_rejected_config(self, tmp_path, monkeypatch):
+        """Config recusada (11-05) carrega defaults; save() apagaria o do usuário."""
+        monkeypatch.setenv("EKP_DATA_DIR", str(tmp_path / "data"))
+        cfgp = tmp_path / "cfg.yaml"
+        cfgp.write_text("daemon:\n  log_level: DEBUG\n")
+        os.chmod(cfgp, 0o666)
+        before = cfgp.read_text()
+        r = self._run("canary", "add", str(tmp_path / "backup.pem"), "-c", str(cfgp))
+        assert r.exit_code == 1 and cfgp.read_text() == before
+        assert not (tmp_path / "backup.pem").exists()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root lê modo 000")
+    def test_e2e_unreadable_canary_is_blind_but_warned(self, tmp_path, caplog):
+        """Documenta o limite real: o alerta não sai, mas o aviso sim."""
+        p = self._file(tmp_path, mode=0o000)
+
+        async def go():
+            q: asyncio.Queue = asyncio.Queue()
+            with caplog.at_level(_logging.WARNING, logger="ekprotection.monitor.canary"):
+                w = CanaryWatcher([str(p)], q, asyncio.get_running_loop())
+            w.start()
+            await asyncio.sleep(0.3)
+            with pytest.raises(PermissionError):
+                open(p).close()
+            await asyncio.sleep(0.5)
+            w.stop()
+            return q.qsize()
+        try:
+            assert asyncio.run(go()) == 0
+        finally:
+            os.chmod(p, 0o600)
+        assert any("EACCES" in r.getMessage() for r in caplog.records)

@@ -32,6 +32,7 @@ from .scan_commands          import scan_app
 from .heuristic_commands     import heur_app
 from .update_commands        import update_app
 from .report_commands        import report_app
+from .canary_commands        import canary_app
 
 app = typer.Typer(
     name="ekp",
@@ -52,6 +53,7 @@ app.add_typer(scan_app,    name="scan")
 app.add_typer(heur_app,    name="heuristics")
 app.add_typer(update_app,  name="update")
 app.add_typer(report_app,  name="report")
+app.add_typer(canary_app,  name="canary")
 
 
 def _load_config(p: str | None = None) -> ConfigManager:

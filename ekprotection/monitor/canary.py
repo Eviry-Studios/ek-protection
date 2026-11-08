@@ -34,8 +34,14 @@ Limites:
 from __future__ import annotations
 
 import asyncio
+import base64
+import grp
+import json
 import logging
 import os
+import pwd
+import secrets
+import stat
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -48,6 +54,120 @@ from .events import FileEvent, FileEventKind
 logger = logging.getLogger(__name__)
 
 _COOLDOWN_S = 60.0
+
+# Arquivos que o cliente/servidor ssh abre sozinho (``ssh -G``, sshd_config
+# padrão). Isca com esse nome alerta a cada ``ssh``/``git push``.
+_SSH_AUTO_OPENED = frozenset(
+    [f"{k}{suf}" for k in ("id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519",
+                           "id_ed25519_sk", "id_dsa", "id_xmss")
+     for suf in ("", ".pub", "-cert.pub")]
+    + ["config", "known_hosts", "known_hosts2", "authorized_keys", "authorized_keys2"]
+)
+
+CANARY_KINDS = ("ssh", "wallet", "seed", "aws", "generic")
+
+_SEED_WORDS = (
+    "abandon", "ability", "absorb", "access", "action", "adjust", "agent", "alarm",
+    "anchor", "april", "artist", "audit", "badge", "basket", "beach", "border",
+    "bridge", "cabin", "canvas", "carbon", "castle", "cherry", "circle", "coffee",
+    "coral", "cousin", "danger", "desert", "dragon", "eagle", "empire", "fabric",
+    "garden", "harbor", "island", "jungle", "lemon", "marble", "orbit", "planet",
+)
+
+
+def _readable_by(st: os.stat_result, uid: int) -> bool:
+    if uid == 0:
+        return True
+    if st.st_uid == uid:
+        return bool(st.st_mode & stat.S_IRUSR)
+    if st.st_mode & stat.S_IRGRP:
+        try:
+            pw = pwd.getpwuid(uid)
+            if st.st_gid == pw.pw_gid or pw.pw_name in grp.getgrgid(st.st_gid).gr_mem:
+                return True
+        except KeyError:
+            pass
+    return bool(st.st_mode & stat.S_IROTH)
+
+
+def canary_issues(path: str | Path) -> list[str]:
+    """Problemas que deixam a isca cega ou barulhenta. Vazio = ok.
+
+    O "invasor provável" é o dono do diretório da isca (stealer rodando
+    como o usuário daquela home)."""
+    p = Path(path).expanduser()
+    issues: list[str] = []
+    if p.name in _SSH_AUTO_OPENED:
+        issues.append(
+            f"nome '{p.name}' é aberto sozinho pelo ssh/sshd: alerta a cada conexão "
+            "(use algo como backup_prod.pem ou id_ed25519_old)")
+    try:
+        st = p.stat()
+        dir_uid = p.resolve().parent.stat().st_uid
+    except OSError:
+        return issues
+    if not _readable_by(st, dir_uid):
+        try:
+            who = pwd.getpwuid(dir_uid).pw_name
+        except KeyError:
+            who = str(dir_uid)
+        issues.append(
+            f"ilegível por {who} (dono do diretório): abertura falha com EACCES e o "
+            f"inotify não gera evento (corrija com `chown {who}: {p} && chmod 600 {p}`)")
+    return issues
+
+
+def bait_content(kind: str) -> str:
+    """Conteúdo falso com cara de segredo. Bytes aleatórios, não é chave válida."""
+    if kind == "ssh":
+        body = secrets.token_bytes(300)
+        b64 = base64.b64encode(b"openssh-key-v1\0" + body).decode()
+        lines = [b64[i:i + 70] for i in range(0, len(b64), 70)]
+        return ("-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(lines)
+                + "\n-----END OPENSSH PRIVATE KEY-----\n")
+    if kind == "wallet":
+        return json.dumps({
+            "address": secrets.token_hex(20),
+            "crypto": {
+                "cipher": "aes-128-ctr",
+                "cipherparams": {"iv": secrets.token_hex(16)},
+                "ciphertext": secrets.token_hex(32),
+                "kdf": "scrypt",
+                "kdfparams": {"dklen": 32, "n": 262144, "p": 1, "r": 8,
+                              "salt": secrets.token_hex(32)},
+                "mac": secrets.token_hex(32),
+            },
+            "id": "-".join(secrets.token_hex(n) for n in (4, 2, 2, 2, 6)),
+            "version": 3,
+        }) + "\n"
+    if kind == "seed":
+        return " ".join(secrets.choice(_SEED_WORDS) for _ in range(12)) + "\n"
+    if kind == "aws":
+        return ("[default]\n"
+                "aws_access_key_id = AKIA" + secrets.token_hex(8).upper() + "\n"
+                "aws_secret_access_key = " + secrets.token_urlsafe(30)[:40] + "\n")
+    if kind == "generic":
+        return secrets.token_hex(32) + "\n"
+    raise ValueError(f"tipo de isca desconhecido: {kind} (use {', '.join(CANARY_KINDS)})")
+
+
+def create_canary(path: str | Path, kind: str) -> Path:
+    """Cria a isca 0600, dona = dono do diretório. Não sobrescreve nada."""
+    p = Path(path).expanduser()
+    content = bait_content(kind)
+    parent_st = p.parent.stat()           # dir tem que existir
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        if os.geteuid() == 0 and parent_st.st_uid != 0:
+            os.fchown(fd, parent_st.st_uid, parent_st.st_gid)
+        os.write(fd, content.encode())
+    except BaseException:
+        os.close(fd)
+        p.unlink(missing_ok=True)
+        raise
+    os.close(fd)
+    return p
 
 
 def find_openers(path: str, proc_root: str = "/proc") -> list[str]:
@@ -89,6 +209,8 @@ def resolve_canaries(paths: list[str]) -> dict[str, str]:
         if not p.is_file():
             logger.warning("Arquivo-isca não existe (ignorado): %s", raw)
             continue
+        for issue in canary_issues(p):
+            logger.warning("Arquivo-isca %s: %s", raw, issue)
         out[str(p.resolve())] = str(p)
     return out
 
