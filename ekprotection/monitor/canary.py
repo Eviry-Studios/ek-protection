@@ -260,26 +260,57 @@ class CanaryWatcher:
         self._queue    = queue
         self._loop     = loop
         self._observer: Optional[Observer] = None
+        # Cooldown por isca, compartilhado entre observers (ver update()).
+        self._last: dict[str, float] = {}
 
     def _emit(self, ev: FileEvent) -> None:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, ev)
 
-    def start(self) -> None:
-        if not self._canaries:
-            return
+    def _build_observer(self, canaries: dict[str, str]) -> Optional[Observer]:
+        if not canaries:
+            return None
         from watchdog.observers.inotify import InotifyObserver
-        self._observer = InotifyObserver()
-        handler = _CanaryHandler(self._canaries, self._emit)
+        observer = InotifyObserver()
+        handler = _CanaryHandler(canaries, self._emit)
+        handler._last = self._last
         # Watch no dir pai (não recursivo), filtrado só pra IN_OPEN. O
         # handler descarta abertura de qualquer outro arquivo do dir.
-        for parent in sorted({os.path.dirname(p) for p in self._canaries}):
+        for parent in sorted({os.path.dirname(p) for p in canaries}):
             try:
-                self._observer.schedule(handler, parent, recursive=False,
-                                        event_filter=[FileOpenedEvent])
+                observer.schedule(handler, parent, recursive=False,
+                                  event_filter=[FileOpenedEvent])
             except OSError as exc:
                 logger.error("Não foi possível vigiar arquivos-isca em %s: %s", parent, exc)
-        self._observer.start()
-        logger.info("CanaryWatcher: %d arquivo(s)-isca vigiado(s).", len(self._canaries))
+        observer.start()
+        return observer
+
+    def start(self) -> None:
+        self._observer = self._build_observer(self._canaries)
+        if self._observer:
+            logger.info("CanaryWatcher: %d arquivo(s)-isca vigiado(s).", len(self._canaries))
+
+    def update(self, paths: list[str]) -> dict[str, list[str]]:
+        """Troca a lista de iscas sem reiniciar o daemon (SIGHUP / IPC reload).
+
+        O observer novo sobe **antes** de parar o antigo: não há janela em que
+        nenhuma isca é vigiada. Abertura no meio da troca pode chegar pelos
+        dois, por isso o cooldown (`_last`) é o mesmo dict nos dois handlers.
+        """
+        new = resolve_canaries(paths)
+        old_paths, new_paths = set(self._canaries.values()), set(new.values())
+        old_observer = self._observer
+        self._observer = self._build_observer(new)
+        self._canaries = new
+        if old_observer and old_observer.is_alive():
+            old_observer.stop()
+            old_observer.join(timeout=5)
+        for real in list(self._last):
+            if real not in new:
+                del self._last[real]
+        diff = {"added": sorted(new_paths - old_paths), "removed": sorted(old_paths - new_paths)}
+        logger.info("CanaryWatcher recarregado: %d isca(s) (+%d, -%d).",
+                    len(new), len(diff["added"]), len(diff["removed"]))
+        return diff
 
     def stop(self) -> None:
         if self._observer and self._observer.is_alive():

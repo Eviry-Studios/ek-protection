@@ -76,6 +76,11 @@ class EKEngine:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self._handle_signal)
+        # SIGHUP é o que `systemctl reload` manda (ExecReload do
+        # deploy/ek-protection.service). Sem handler, a ação padrão do kernel
+        # mata o processo, sem log, e o systemd não reinicia: Restart=on-failure
+        # conta morte por SIGHUP como saída limpa (achado 2026-11-09).
+        loop.add_signal_handler(signal.SIGHUP, self._handle_reload_signal)
 
         await self._init_logs()        # Patch 3
         await self._init_auth()        # Patch 2
@@ -366,6 +371,50 @@ class EKEngine:
         logger.info("Sinal de parada recebido.")
         if self._stop_event:
             self._stop_event.set()
+
+    def _handle_reload_signal(self) -> None:
+        logger.info("SIGHUP recebido: recarregando config.")
+        try:
+            self.reload()
+        except Exception as exc:
+            logger.error("Falha ao recarregar config: %s", exc, exc_info=True)
+
+    def reload(self) -> dict[str, Any]:
+        """Relê o config do disco e aplica o que dá pra aplicar a quente.
+
+        Hoje só `monitor.canary_paths`. O resto (paths do monitor, scanner,
+        heurística...) é listado em `restart_required` e segue com o valor do
+        boot. Config recusada (adulterável, ver config_permission_issues) não é
+        aplicada: as iscas atuais continuam, senão quem consegue deixar o
+        arquivo gravável desligaria todas as iscas com um reload.
+        """
+        fresh = ConfigManager(self.config.config_path).load()
+        if fresh.rejected:
+            msg = (f"Reload recusado: config {self.config.config_path} adulterável "
+                   f"({'; '.join(fresh.permission_issues)}). Mantendo a config atual.")
+            logger.critical(msg)
+            self._log_sys("CONFIG_CHANGE", msg)
+            return {"applied": False, "reason": "rejected", "issues": fresh.permission_issues}
+
+        key = "monitor.canary_paths"
+        new_canaries = list(fresh.get(key, []) or [])
+        self.config.set(key, new_canaries)
+        diff: dict[str, list[str]] = {"added": [], "removed": []}
+        if self.monitor:
+            diff = self.monitor.reload_canaries(new_canaries)
+
+        restart = sorted(
+            sec for sec in set(fresh.data) | set(self.config.data)
+            if fresh.data.get(sec) != self.config.data.get(sec)
+        )
+        if restart:
+            logger.warning("Reload: mudança em %s só vale depois de reiniciar o daemon.",
+                           ", ".join(restart))
+        msg = (f"Config recarregada: iscas +{len(diff['added'])} -{len(diff['removed'])}"
+               + (f"; exige restart: {', '.join(restart)}" if restart else ""))
+        self._log_sys("CONFIG_CHANGE", msg)
+        return {"applied": True, "canaries": diff, "restart_required": restart,
+                "exposure_issues": fresh.exposure_issues}
 
     @staticmethod
     def _get_pid() -> int:

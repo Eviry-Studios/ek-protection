@@ -1015,3 +1015,84 @@ class TestAutoScanWiring:
             assert any(e.original_path == str(evil) for e in active)
         finally:
             await engine.stop()
+
+
+class TestEngineReload:
+    """EKEngine.reload / SIGHUP (2026-11-09)."""
+
+    @staticmethod
+    def _write(path: Path, canaries: list[str], extra: str = "", mode: int = 0o600) -> None:
+        s = "monitor:\n  canary_paths:\n" + "".join(f"    - {c}\n" for c in canaries) if canaries else "monitor: {}\n"
+        path.write_text(s + extra)
+        os.chmod(path, mode)
+
+    @staticmethod
+    def _engine(path: Path):
+        from unittest.mock import MagicMock
+        cfg = ConfigManager(path).load()
+        eng = EKEngine(cfg)
+        eng.monitor = MagicMock()
+        eng.monitor.reload_canaries.side_effect = lambda p: {"added": list(p), "removed": []}
+        return eng
+
+    def test_reload_applies_canaries(self, tmp_path: Path) -> None:
+        cp = tmp_path / "config.yaml"
+        self._write(cp, [])
+        eng = self._engine(cp)
+        self._write(cp, ["/x/isca"])
+        r = eng.reload()
+        assert r["applied"] and r["restart_required"] == []
+        eng.monitor.reload_canaries.assert_called_once_with(["/x/isca"])
+        assert eng.config.get("monitor.canary_paths") == ["/x/isca"]
+
+    def test_reload_rejects_tampered_config_and_keeps_canaries(self, tmp_path: Path, caplog) -> None:
+        cp = tmp_path / "config.yaml"
+        self._write(cp, ["/x/isca"])
+        eng = self._engine(cp)
+        self._write(cp, [], mode=0o666)
+        with caplog.at_level("CRITICAL"):
+            r = eng.reload()
+        assert r["applied"] is False and r["reason"] == "rejected"
+        eng.monitor.reload_canaries.assert_not_called()
+        assert eng.config.get("monitor.canary_paths") == ["/x/isca"]
+        assert any("Reload recusado" in m for m in caplog.messages)
+
+    def test_reload_lists_sections_needing_restart(self, tmp_path: Path) -> None:
+        cp = tmp_path / "config.yaml"
+        self._write(cp, [])
+        eng = self._engine(cp)
+        self._write(cp, ["/x/isca"], extra="scanner:\n  max_file_size_mb: 7\n")
+        r = eng.reload()
+        assert r["applied"] and r["restart_required"] == ["scanner"]
+        assert eng.config.get("scanner.max_file_size_mb") != 7
+
+    def test_sighup_handler_does_not_raise(self, tmp_path: Path) -> None:
+        cp = tmp_path / "config.yaml"
+        self._write(cp, [])
+        eng = self._engine(cp)
+        eng.monitor.reload_canaries.side_effect = RuntimeError("boom")
+        eng._handle_reload_signal()  # loga, não derruba o loop
+
+    @pytest.mark.asyncio
+    async def test_start_installs_sighup_handler(self, tmp_path: Path) -> None:
+        import signal
+        from unittest.mock import AsyncMock, patch
+        cp = tmp_path / "config.yaml"
+        self._write(cp, [])
+        eng = EKEngine(ConfigManager(cp).load())
+        loop = asyncio.get_running_loop()
+        with patch.object(EKEngine, "_init_logs", AsyncMock()), \
+             patch.object(EKEngine, "_init_auth", AsyncMock()), \
+             patch.object(EKEngine, "_init_exceptions", AsyncMock()), \
+             patch.object(EKEngine, "_init_monitor", AsyncMock()), \
+             patch.object(EKEngine, "_init_quarantine", AsyncMock()), \
+             patch.object(EKEngine, "_init_heuristics", AsyncMock()), \
+             patch.object(EKEngine, "_init_scanner", AsyncMock()), \
+             patch.object(EKEngine, "_init_updater", AsyncMock()):
+            await eng.start()
+        try:
+            assert signal.SIGHUP in loop._signal_handlers  # type: ignore[attr-defined]
+        finally:
+            for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                loop.remove_signal_handler(s)
+            await eng.stop()

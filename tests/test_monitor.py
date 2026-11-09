@@ -1694,3 +1694,130 @@ class TestCanaryIssuesAndCli:
         finally:
             os.chmod(p, 0o600)
         assert any("EACCES" in r.getMessage() for r in caplog.records)
+
+
+class TestCanaryReload:
+    """SIGHUP (o ExecReload do deploy/ek-protection.service) matava o daemon
+    sem log e o systemd não reiniciava (Restart=on-failure trata SIGHUP como
+    saída limpa). E isca nova só valia depois de restart (medido 2026-11-09)."""
+
+    @staticmethod
+    def _decoy(tmp_path: Path, name: str = "wallet_backup.json") -> str:
+        p = tmp_path / name
+        p.write_text("FAKE\n")
+        os.chmod(p, 0o600)
+        return str(p)
+
+    @staticmethod
+    def _drain(q: asyncio.Queue) -> list:
+        out = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+    @staticmethod
+    async def _cat(path: str) -> None:
+        import subprocess
+        subprocess.run(["cat", path], stdout=subprocess.DEVNULL, check=True)
+        await asyncio.sleep(0.6)
+
+    @pytest.mark.asyncio
+    async def test_e2e_added_canary_alerts_after_update(self, tmp_path: Path) -> None:
+        a = self._decoy(tmp_path, "a.pem")
+        sub = tmp_path / "outro"; sub.mkdir()
+        b = self._decoy(sub, "b.json")
+        q: asyncio.Queue = asyncio.Queue()
+        w = CanaryWatcher([a], q, asyncio.get_running_loop())
+        w.start()
+        try:
+            await asyncio.sleep(0.3)
+            diff = w.update([a, b])
+            await asyncio.sleep(0.3)
+            await self._cat(b)
+        finally:
+            w.stop()
+        assert diff == {"added": [b], "removed": []}
+        assert [e.path for e in self._drain(q)] == [b]
+
+    @pytest.mark.asyncio
+    async def test_e2e_removed_canary_stops_alerting(self, tmp_path: Path) -> None:
+        a = self._decoy(tmp_path, "a.pem")
+        b = self._decoy(tmp_path, "b.json")
+        q: asyncio.Queue = asyncio.Queue()
+        w = CanaryWatcher([a, b], q, asyncio.get_running_loop())
+        w.start()
+        try:
+            await asyncio.sleep(0.3)
+            assert w.update([a]) == {"added": [], "removed": [b]}
+            await asyncio.sleep(0.3)
+            await self._cat(b)
+            await self._cat(a)
+        finally:
+            w.stop()
+        assert [e.path for e in self._drain(q)] == [a]
+
+    @pytest.mark.asyncio
+    async def test_e2e_update_from_empty_watcher(self, tmp_path: Path) -> None:
+        a = self._decoy(tmp_path)
+        q: asyncio.Queue = asyncio.Queue()
+        w = CanaryWatcher([], q, asyncio.get_running_loop())
+        w.start()
+        try:
+            assert not w.is_running
+            w.update([a])
+            assert w.is_running
+            await asyncio.sleep(0.3)
+            await self._cat(a)
+        finally:
+            w.stop()
+        assert len(self._drain(q)) == 1
+
+    @pytest.mark.asyncio
+    async def test_update_to_empty_stops_observer(self, tmp_path: Path) -> None:
+        a = self._decoy(tmp_path)
+        w = CanaryWatcher([a], asyncio.Queue(), asyncio.get_running_loop())
+        w.start()
+        w.update([])
+        assert not w.is_running and w.paths == []
+
+    def test_new_observer_starts_before_old_stops(self, tmp_path: Path) -> None:
+        """Sem janela em que nenhuma isca é vigiada."""
+        a = self._decoy(tmp_path)
+        w = CanaryWatcher([a], asyncio.Queue(), asyncio.new_event_loop())
+        order: list[str] = []
+        old = MagicMock(); old.is_alive.return_value = True
+        old.stop.side_effect = lambda: order.append("old.stop")
+        w._observer = old
+        w._build_observer = lambda c: order.append("new.start") or MagicMock()
+        w.update([a])
+        assert order == ["new.start", "old.stop"]
+
+    def test_cooldown_survives_update(self, tmp_path: Path) -> None:
+        """Abertura logo depois do reload não duplica o alerta da isca mantida."""
+        a = self._decoy(tmp_path)
+        real = str(Path(a).resolve())
+        w = CanaryWatcher([a], asyncio.Queue(), asyncio.new_event_loop())
+        w._last[real] = 123.0
+        w._build_observer = lambda c: None
+        w.update([a])
+        assert w._last == {real: 123.0}
+        w.update([])
+        assert w._last == {}
+
+    @pytest.mark.asyncio
+    async def test_manager_reload_creates_watcher_when_started_without(
+        self, cfg: ConfigManager, tmp_path: Path
+    ) -> None:
+        a = self._decoy(tmp_path)
+        mgr = MonitorManager(cfg, MagicMock())
+        await mgr.start()
+        try:
+            assert "canary" not in mgr.status()
+            assert mgr.reload_canaries([a]) == {"added": [a], "removed": []}
+            assert mgr.status()["canary"]["canaries"] == [a]
+        finally:
+            await mgr.stop()
+
+    def test_manager_reload_noop_when_not_running(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        mgr = MonitorManager(cfg, MagicMock())
+        assert mgr.reload_canaries([self._decoy(tmp_path)]) == {"added": [], "removed": []}

@@ -199,6 +199,11 @@ class IPCServer:
             asyncio.create_task(self._delayed_stop())
             return _ok("stopping")
 
+        if cmd == "reload":
+            # Só relê o config do disco (com a mesma recusa de arquivo
+            # adulterável do boot), não aceita valor vindo do cliente.
+            return _ok(self._engine.reload())
+
         if cmd == "scan_file":
             return await self._cmd_scan_file(req)
 

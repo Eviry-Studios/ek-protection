@@ -359,3 +359,71 @@ class TestQuarantineInfoStatsViaIPC:
         )
         assert stats.returncode == 0, stats.stdout + stats.stderr
         assert json.loads(stats.stdout)["active"] == 1
+
+
+class TestDaemonReload:
+    """SIGHUP matava o daemon (ação padrão do kernel) sem log; com
+    Restart=on-failure o systemd não reiniciava. Isca nova só valia no
+    próximo start (medido 2026-11-09)."""
+
+    @staticmethod
+    def _client(env: dict):
+        from ekprotection.daemon import IPCClient
+        return IPCClient(f"{env['EKP_DATA_DIR']}/run/daemon.sock")
+
+    @staticmethod
+    def _daemon_pid(env: dict) -> int:
+        return int(Path(f"{env['EKP_DATA_DIR']}/run/daemon.pid").read_text().strip())
+
+    @staticmethod
+    def _canary_hits(client) -> int:
+        return client.send("log_search", event="file.canary_accessed", limit=50)["data"]["total"]
+
+    def test_sighup_keeps_daemon_alive_and_applies_new_canary(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> None:
+        import signal
+        env = running_daemon
+        cfg_path = Path(env["EKP_CONFIG_PATH_FOR_TEST"])
+        bait = tmp_path / "home"; bait.mkdir()
+        bait = bait / "wallet_backup.json"
+        bait.write_text("FAKE\n"); os.chmod(bait, 0o600)
+        cfg_path.write_text(cfg_path.read_text().replace(
+            "monitor:\n", f"monitor:\n  canary_paths:\n    - {bait}\n", 1))
+        os.chmod(cfg_path, 0o600)
+
+        os.kill(self._daemon_pid(env), signal.SIGHUP)
+        time.sleep(1.5)
+        client = self._client(env)
+        assert client.is_alive(), "daemon morreu com SIGHUP"
+        assert client.send("status")["data"]["monitor"]["canary"]["canaries"] == [str(bait)]
+        bait.read_text()
+        time.sleep(1.5)
+        assert self._canary_hits(client) == 1
+
+    def test_cli_canary_add_reloads_running_daemon(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> None:
+        env = running_daemon
+        cfg_path = env["EKP_CONFIG_PATH_FOR_TEST"]
+        os.chmod(cfg_path, 0o600)
+        d = tmp_path / "home"; d.mkdir()
+        bait = d / "seed_backup.txt"
+        r = _run_cli("canary", "add", str(bait), "--kind", "seed", "--config", cfg_path, env=env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Daemon recarregado: iscas +1 -0" in r.stdout
+        client = self._client(env)
+        assert client.send("status")["data"]["monitor"]["canary"]["canaries"] == [str(bait)]
+        bait.read_text()
+        time.sleep(1.5)
+        assert self._canary_hits(client) == 1
+
+        r = _run_cli("canary", "remove", str(bait), "--config", cfg_path, env=env)
+        assert r.returncode == 0 and "iscas +0 -1" in r.stdout, r.stdout
+
+    def test_ipc_reload_refuses_tampered_config(self, running_daemon: dict) -> None:
+        env = running_daemon
+        os.chmod(env["EKP_CONFIG_PATH_FOR_TEST"], 0o666)
+        data = self._client(env).send("reload")["data"]
+        assert data["applied"] is False and data["reason"] == "rejected"
+        assert self._client(env).is_alive()

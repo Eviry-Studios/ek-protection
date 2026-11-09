@@ -10,7 +10,8 @@ Comandos CLI para arquivos-isca (``monitor.canary_paths``).
 Antes (2026-11-04 a 11-07) a isca era feita à mão: editar o YAML (que nasce
 0644 no ``vim``, ver config_exposure_issues) e criar o arquivo, muitas vezes
 como root 0600 na home do usuário, o que deixa a isca cega (ver
-canary_issues). O daemon não recarrega o config: reinicie depois.
+canary_issues). Depois de gravar, add/remove pedem ``reload`` ao daemon via
+IPC (mesmo efeito de ``systemctl reload ek-protection``); sem daemon, só grava.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from rich.table import Table
 
 from ekprotection.config.manager import ConfigManager
 from ekprotection.monitor.canary import CANARY_KINDS, canary_issues, create_canary
+from ._ipc_or_direct import ipc_client
 from .display import console, print_error, print_info, print_success, print_warning
 
 canary_app = typer.Typer(help="Gerenciar arquivos-isca (canary) de credencial/wallet")
@@ -44,6 +46,24 @@ def _load_for_write(config_path: Optional[str]) -> ConfigManager:
         print_error(f"Config {cfg.config_path} foi recusada (adulterável); corrija as permissões antes.")
         raise typer.Exit(1)
     return cfg
+
+
+def _reload_daemon(cfg: ConfigManager) -> None:
+    client = ipc_client(cfg)
+    if client is None:
+        print_info("Daemon não está rodando; a lista nova vale no próximo start.")
+        return
+    try:
+        resp = client.send("reload")
+    except Exception as exc:
+        print_warning(f"Daemon não recarregou ({exc}); rode `systemctl reload ek-protection`.")
+        return
+    data = resp.get("data") or {}
+    if not resp.get("ok") or not data.get("applied"):
+        print_warning(f"Daemon recusou o reload: {data.get('reason') or resp.get('error')}.")
+        return
+    c = data.get("canaries", {})
+    print_success(f"Daemon recarregado: iscas +{len(c.get('added', []))} -{len(c.get('removed', []))}.")
 
 
 def _same(a: str, b: str) -> bool:
@@ -133,7 +153,7 @@ def cmd_add(
     cfg.set(_KEY, paths)
     cfg.save()
     print_success(f"Isca registrada: {p}")
-    print_info("Reinicie o daemon pra começar a vigiar (o config não é recarregado).")
+    _reload_daemon(cfg)
 
 
 @canary_app.command("remove")
@@ -151,3 +171,4 @@ def cmd_remove(
     cfg.set(_KEY, kept)
     cfg.save()
     print_success(f"Isca removida do config: {path} (arquivo mantido).")
+    _reload_daemon(cfg)

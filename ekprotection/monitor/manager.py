@@ -179,6 +179,14 @@ class MonitorManager:
 
         logger.info("MonitorManager encerrado.")
 
+    def reload_canaries(self, paths: list[str]) -> dict[str, list[str]]:
+        """Aplica nova lista de iscas no watcher que já está rodando."""
+        if not self._running or not self.config.get("monitor.enabled", True):
+            return {"added": [], "removed": []}
+        if self._canary is None:
+            self._canary = CanaryWatcher([], self._queue, asyncio.get_running_loop())
+        return self._canary.update(paths or [])
+
     # ------------------------------------------------------------------
     # Registro de callbacks
     # ------------------------------------------------------------------
