@@ -284,6 +284,159 @@ class TestQuarantineVaultOperations:
             vault.quarantine("/nonexistent/path/file.sh", "someid")
 
 
+class TestRestoreHardening:
+    """
+    restore() roda como root e usa o nome original do arquivo, que o autor
+    do arquivo quarentenado conhece. Antes (2026-11-10) seguia symlink
+    plantado no destino, no .restored e no próprio diretório, e o arquivo
+    nascia com o umask (0644 como root).
+    """
+
+    PAYLOAD = b"* * * * * root echo marker\n"
+
+    @pytest.fixture
+    def qid(self, vault_noenc: QuarantineVault, tmp_path: Path) -> str:
+        src = tmp_path / "miner"
+        src.write_bytes(self.PAYLOAD)
+        vault_noenc.quarantine(src, "q1")
+        return "q1"
+
+    @pytest.fixture
+    def dest(self, tmp_path: Path) -> Path:
+        d = tmp_path / "restored"
+        d.mkdir()
+        return d
+
+    def test_dangling_symlink_not_followed(self, vault_noenc, qid, dest, tmp_path) -> None:
+        victim = tmp_path / "cron_d" / "evil"
+        victim.parent.mkdir()
+        (dest / "miner").symlink_to(victim)
+        out = vault_noenc.restore(qid, dest / "miner")
+        assert not victim.exists()
+        assert out == dest / "miner.restored"
+        assert out.read_bytes() == self.PAYLOAD
+        assert (dest / "miner").is_symlink()
+
+    def test_symlink_to_existing_file_not_overwritten(self, vault_noenc, qid, dest, tmp_path) -> None:
+        victim = tmp_path / "bashrc"
+        victim.write_text("original\n")
+        (dest / "miner").symlink_to(victim)
+        vault_noenc.restore(qid, dest / "miner")
+        assert victim.read_text() == "original\n"
+
+    def test_restored_suffix_symlink_not_followed(self, vault_noenc, qid, dest, tmp_path) -> None:
+        victim = tmp_path / "bashrc"
+        victim.write_text("original\n")
+        (dest / "miner").write_text("existente")
+        (dest / "miner.restored").symlink_to(victim)
+        out = vault_noenc.restore(qid, dest / "miner")
+        assert victim.read_text() == "original\n"
+        assert out == dest / "miner.restored.1"
+        assert (dest / "miner").read_text() == "existente"
+
+    def test_existing_file_kept_and_suffix_used(self, vault_noenc, qid, dest) -> None:
+        (dest / "miner").write_text("existente")
+        out = vault_noenc.restore(qid, dest / "miner")
+        assert out == dest / "miner.restored"
+        assert (dest / "miner").read_text() == "existente"
+
+    def test_successive_restores_get_distinct_names(self, vault_noenc, qid, dest) -> None:
+        outs = [vault_noenc.restore(qid, dest / "miner") for _ in range(4)]
+        assert [o.name for o in outs] == [
+            "miner", "miner.restored", "miner.restored.1", "miner.restored.2",
+        ]
+
+    def test_gives_up_when_no_free_name(self, vault_noenc, qid, dest) -> None:
+        from ekprotection.quarantine.vault import _RESTORE_MAX_SUFFIX
+        for _ in range(_RESTORE_MAX_SUFFIX + 2):
+            vault_noenc.restore(qid, dest / "miner")
+        with pytest.raises(VaultError, match="Nenhum nome livre"):
+            vault_noenc.restore(qid, dest / "miner")
+
+    def test_dest_dir_symlink_refused(self, vault_noenc, qid, tmp_path) -> None:
+        real = tmp_path / "cron_d"
+        real.mkdir()
+        link = tmp_path / "restored"
+        link.symlink_to(real)
+        with pytest.raises(VaultError, match="passa por symlink"):
+            vault_noenc.restore(qid, link / "miner")
+        assert list(real.iterdir()) == []
+
+    def test_ancestor_symlink_refused(self, vault_noenc, qid, tmp_path) -> None:
+        real = tmp_path / "real"
+        (real / "sub").mkdir(parents=True)
+        (tmp_path / "home").symlink_to(real)
+        with pytest.raises(VaultError, match="passa por symlink"):
+            vault_noenc.restore(qid, tmp_path / "home" / "sub" / "miner")
+        assert list((real / "sub").iterdir()) == []
+
+    def test_real_path_accepted(self, vault_noenc, qid, tmp_path) -> None:
+        (tmp_path / "real").mkdir()
+        (tmp_path / "home").symlink_to(tmp_path / "real")
+        out = vault_noenc.restore(qid, tmp_path / "real" / "miner")
+        assert out.read_bytes() == self.PAYLOAD
+
+    def test_relative_dest_resolved_from_cwd(self, vault_noenc, qid, dest, monkeypatch) -> None:
+        monkeypatch.chdir(dest)
+        out = vault_noenc.restore(qid, Path("miner"))
+        assert out == dest / "miner"
+        assert out.is_absolute()
+
+    def test_missing_dest_dir_created(self, vault_noenc, qid, tmp_path) -> None:
+        out = vault_noenc.restore(qid, tmp_path / "a" / "b" / "miner")
+        assert out.read_bytes() == self.PAYLOAD
+
+    @pytest.mark.parametrize("umask", [0o000, 0o022, 0o002])
+    def test_restored_file_is_0600(self, vault_noenc, qid, dest, umask) -> None:
+        old = os.umask(umask)
+        try:
+            out = vault_noenc.restore(qid, dest / "miner")
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+    def test_invalid_name_refused(self, vault_noenc, qid, dest) -> None:
+        for bad in (Path(str(dest) + "/.."), Path("/")):
+            with pytest.raises(VaultError, match="Nome de destino inválido"):
+                vault_noenc.restore(qid, bad)
+
+    def test_encrypted_roundtrip_still_works(self, vault: QuarantineVault, tmp_file: Path, dest: Path) -> None:
+        original = tmp_file.read_bytes()
+        vault.quarantine(tmp_file, "enc")
+        out = vault.restore("enc", dest / tmp_file.name)
+        assert out.read_bytes() == original
+
+    def test_ekpq_born_0600(self, vault: QuarantineVault, tmp_file: Path) -> None:
+        old = os.umask(0o000)
+        try:
+            p = vault.quarantine(tmp_file, "m")
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+    def test_key_created_without_chmod_window(self, tmp_path: Path) -> None:
+        """A chave já nasce 0600 no open(); não depende de chmod depois."""
+        old = os.umask(0o000)
+        try:
+            with patch("ekprotection.quarantine.vault.os.chmod") as chmod:
+                v = QuarantineVault(tmp_path / "v", tmp_path / "k")
+                v.initialize()
+        finally:
+            os.umask(old)
+        chmod.assert_not_called()
+        assert stat.S_IMODE((tmp_path / "k" / "quarantine.key").stat().st_mode) == 0o600
+
+    def test_manager_restore_into_symlinked_dir_refused(self, mgr, tmp_file, tmp_path) -> None:
+        entry = mgr.quarantine_file(str(tmp_file), "a" * 64, QuarantineReason.USER_MANUAL)
+        real = tmp_path / "cron_d"
+        real.mkdir()
+        (tmp_path / "restored").symlink_to(real)
+        with pytest.raises(QuarantineError, match="passa por symlink"):
+            mgr.restore(entry.quarantine_id, tmp_path / "restored")
+        assert mgr.get(entry.quarantine_id).status == QuarantineStatus.ACTIVE
+        assert list(real.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # Testes: QuarantineStore
 # ---------------------------------------------------------------------------

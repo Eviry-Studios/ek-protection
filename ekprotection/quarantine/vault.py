@@ -13,7 +13,9 @@ Design de segurança:
   - Sem a chave, os arquivos .ekpq são dados aleatórios ilegíveis
   - O vault nunca apaga o original até confirmar que a cópia cifrada
     foi gravada com sucesso (write → verify → delete)
-  - Restauração preserva permissões e dono originais quando possível
+  - Restauração cria arquivo novo 0600 (dono = quem restaura), nunca segue
+    symlink nem sobrescreve, e recusa diretório de destino que passa por
+    symlink (2026-11-10). Modo/dono originais NÃO são preservados.
 
 Estrutura do arquivo .ekpq:
   [4 bytes: magic "EKPQ"] + [Fernet token cifrado]
@@ -35,6 +37,61 @@ logger = logging.getLogger(__name__)
 
 MAGIC    = b"EKPQ"
 KEY_FILE = "quarantine.key"
+
+# Criação exclusiva: falha se o nome já existe (inclusive symlink pendente)
+# e nunca segue symlink no último componente.
+_O_NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+
+# Tentativas de nome livre no restore: nome, nome.restored, nome.restored.1..N
+_RESTORE_MAX_SUFFIX = 20
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def _write_new_file(path: Path, data: bytes) -> None:
+    """Grava arquivo novo 0600 sem janela com modo mais aberto."""
+    fd = os.open(path, _O_NEW_FILE, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        _write_all(fd, data)
+    except BaseException:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    os.close(fd)
+
+
+def _open_dest_dir(directory: Path) -> int:
+    """
+    Abre o diretório de destino do restore e devolve o fd.
+
+    O restore roda como root (`sudo ekp quarantine restore`) e o nome do
+    arquivo é o nome original, que o autor do arquivo quarentenado conhece.
+    Se o caminho pedido passa por symlink, quem controla um dos diretórios
+    do caminho pode desviar a escrita (ex: ~/restored -> /etc/cron.d). Por
+    isso o caminho real do fd aberto tem que ser igual ao pedido.
+    """
+    requested = os.path.normpath(os.path.abspath(directory))
+    try:
+        fd = os.open(requested, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        raise VaultError(f"Diretório de destino inválido {requested}: {exc}") from exc
+    try:
+        real = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        real = os.path.realpath(requested)
+    if real != requested:
+        os.close(fd)
+        raise VaultError(
+            f"Diretório de destino {requested} passa por symlink (aponta para "
+            f"{real}). Restauração recusada; use o caminho real se for intencional."
+        )
+    return fd
 
 
 class VaultError(Exception):
@@ -80,16 +137,16 @@ class QuarantineVault:
     def initialize(self) -> None:
         """Cria diretórios e gera chave mestra se não existir."""
         self._vault_dir.mkdir(parents=True, exist_ok=True)
-        self._key_dir.mkdir(parents=True, exist_ok=True)
+        self._key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         if not self._key_path.exists():
-            key = Fernet.generate_key()
-            self._key_path.write_bytes(key)
+            # Nasce 0600: write_bytes + chmod deixava a chave legível pelo
+            # umask (0644 como root) até o chmod.
             try:
-                os.chmod(self._key_path, 0o600)
-            except OSError:
-                logger.warning("Não foi possível definir chmod 600 em %s", self._key_path)
-            logger.info("Chave do vault de quarentena gerada: %s", self._key_path)
+                _write_new_file(self._key_path, Fernet.generate_key())
+                logger.info("Chave do vault de quarentena gerada: %s", self._key_path)
+            except FileExistsError:
+                pass   # outro processo criou ao mesmo tempo; _load_key lê a dele
 
         self._load_key()
 
@@ -164,11 +221,8 @@ class QuarantineVault:
             payload = MAGIC + data   # modo sem criptografia (testes / sem chave)
 
         try:
-            dest.write_bytes(payload)
-            # Permissões restritas no arquivo de quarentena
-            os.chmod(dest, 0o600)
+            _write_new_file(dest, payload)
         except OSError as exc:
-            dest.unlink(missing_ok=True)
             raise VaultError(f"Erro ao gravar vault: {exc}") from exc
 
         # Verifica integridade do que foi escrito
@@ -209,16 +263,54 @@ class QuarantineVault:
         else:
             data = raw
 
+        if dest.name in ("", ".", ".."):
+            raise VaultError(f"Nome de destino inválido: {dest}")
+
         dest.parent.mkdir(parents=True, exist_ok=True)
+        dir_fd = _open_dest_dir(dest.parent)
+        try:
+            name = self._create_restored(dir_fd, dest.name, data)
+        finally:
+            os.close(dir_fd)
 
-        # Evita sobrescrever arquivo existente silenciosamente
-        if dest.exists():
-            dest = dest.with_suffix(dest.suffix + ".restored")
-            logger.warning("Destino existia; restaurando para: %s", dest)
+        restored = Path(os.path.normpath(os.path.abspath(dest.parent))) / name
+        if name != dest.name:
+            logger.warning("Destino existia; restaurando para: %s", restored)
+        logger.info("Arquivo restaurado: %s → %s", src, restored)
+        return restored
 
-        dest.write_bytes(data)
-        logger.info("Arquivo restaurado: %s → %s", src, dest)
-        return dest
+    @staticmethod
+    def _create_restored(dir_fd: int, name: str, data: bytes) -> str:
+        """
+        Cria o arquivo restaurado dentro de dir_fd e devolve o nome usado.
+
+        Nunca sobrescreve e nunca segue symlink: nome ocupado (arquivo,
+        symlink, mesmo pendente) passa pro próximo sufixo. Sempre 0600, porque
+        o arquivo pode ser wallet/chave pega por falso positivo e o umask do
+        root deixaria 0644.
+        """
+        candidates = [name, f"{name}.restored"] + [
+            f"{name}.restored.{i}" for i in range(1, _RESTORE_MAX_SUFFIX + 1)
+        ]
+        for candidate in candidates:
+            try:
+                fd = os.open(candidate, _O_NEW_FILE, 0o600, dir_fd=dir_fd)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise VaultError(f"Não foi possível criar {candidate}: {exc}") from exc
+            try:
+                os.fchmod(fd, 0o600)
+                _write_all(fd, data)
+            except OSError as exc:
+                os.close(fd)
+                os.unlink(candidate, dir_fd=dir_fd)
+                raise VaultError(f"Erro ao gravar {candidate}: {exc}") from exc
+            os.close(fd)
+            return candidate
+        raise VaultError(
+            f"Nenhum nome livre para restaurar {name} ({len(candidates)} tentativas)."
+        )
 
     def delete_file(self, quarantine_id: str) -> bool:
         """
