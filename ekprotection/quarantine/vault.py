@@ -13,6 +13,9 @@ Design de segurança:
   - Sem a chave, os arquivos .ekpq são dados aleatórios ilegíveis
   - O vault nunca apaga o original até confirmar que a cópia cifrada
     foi gravada com sucesso (write → verify → delete)
+  - Quarentena lê a origem pelo diretório real aberto uma vez (recusa
+    symlink no caminho e no arquivo, só arquivo regular) e só remove o
+    original se ainda for o mesmo inode cifrado (2026-11-11).
   - Restauração cria arquivo novo 0600 (dono = quem restaura), nunca segue
     symlink nem sobrescreve, e recusa diretório de destino que passa por
     symlink (2026-11-10). Modo/dono originais NÃO são preservados.
@@ -23,6 +26,7 @@ Estrutura do arquivo .ekpq:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import logging
 import os
@@ -53,6 +57,15 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[n:]
 
 
+def _read_all(fd: int) -> bytes:
+    chunks = []
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def _write_new_file(path: Path, data: bytes) -> None:
     """Grava arquivo novo 0600 sem janela com modo mais aberto."""
     fd = os.open(path, _O_NEW_FILE, 0o600)
@@ -66,21 +79,19 @@ def _write_new_file(path: Path, data: bytes) -> None:
     os.close(fd)
 
 
-def _open_dest_dir(directory: Path) -> int:
+def _open_pinned_dir(directory: Path | str, what: str) -> int:
     """
-    Abre o diretório de destino do restore e devolve o fd.
+    Abre um diretório e devolve o fd, recusando caminho que passa por symlink.
 
-    O restore roda como root (`sudo ekp quarantine restore`) e o nome do
-    arquivo é o nome original, que o autor do arquivo quarentenado conhece.
-    Se o caminho pedido passa por symlink, quem controla um dos diretórios
-    do caminho pode desviar a escrita (ex: ~/restored -> /etc/cron.d). Por
-    isso o caminho real do fd aberto tem que ser igual ao pedido.
+    O caminho real do fd aberto tem que ser igual ao pedido (absoluto,
+    normalizado). Pega symlink em qualquer componente e não tem corrida,
+    porque toda operação seguinte é feita nesse mesmo fd (`dir_fd=`).
     """
     requested = os.path.normpath(os.path.abspath(directory))
     try:
         fd = os.open(requested, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as exc:
-        raise VaultError(f"Diretório de destino inválido {requested}: {exc}") from exc
+        raise VaultError(f"Diretório {what} inválido {requested}: {exc}") from exc
     try:
         real = os.readlink(f"/proc/self/fd/{fd}")
     except OSError:
@@ -88,10 +99,76 @@ def _open_dest_dir(directory: Path) -> int:
     if real != requested:
         os.close(fd)
         raise VaultError(
-            f"Diretório de destino {requested} passa por symlink (aponta para "
-            f"{real}). Restauração recusada; use o caminho real se for intencional."
+            f"Diretório {what} {requested} passa por symlink (aponta para "
+            f"{real}). Operação recusada; use o caminho real se for intencional."
         )
     return fd
+
+
+def _open_dest_dir(directory: Path) -> int:
+    """
+    Diretório de destino do restore.
+
+    O restore roda como root (`sudo ekp quarantine restore`) e o nome do
+    arquivo é o nome original, que o autor do arquivo quarentenado conhece.
+    Se o caminho pedido passa por symlink, quem controla um dos diretórios
+    do caminho pode desviar a escrita (ex: ~/restored -> /etc/cron.d).
+    """
+    return _open_pinned_dir(directory, "de destino")
+
+
+class QuarantineSource:
+    """
+    Origem de uma quarentena, presa ao diretório real e ao inode lido.
+
+    A quarentena roda como root (auto-quarentena do daemon) sobre arquivo
+    num diretório que o autor do arquivo controla. Entre a detecção e o
+    `unlink`, ele pode trocar o diretório por symlink (`dl -> /etc`) e o
+    root apagaria `/etc/<nome>` (2026-11-11). Por isso o diretório é aberto
+    uma vez (recusando symlink), o arquivo é lido por `openat` com
+    O_NOFOLLOW nesse fd, e o `remove()` só apaga se o nome ainda aponta
+    pro mesmo inode que foi cifrado, também via `unlinkat` no mesmo fd.
+    """
+
+    def __init__(self, dir_fd: int, name: str, st: os.stat_result,
+                 real_path: str, sha256: str, dest: Path) -> None:
+        self._dir_fd   = dir_fd
+        self.name      = name
+        self.size      = st.st_size
+        self._dev_ino  = (st.st_dev, st.st_ino)
+        self.real_path = real_path
+        self.sha256    = sha256      # sha do conteúdo que foi cifrado
+        self.dest      = dest
+
+    def remove(self) -> None:
+        """Remove o original se ainda for o mesmo inode cifrado."""
+        if self._dir_fd < 0:
+            raise VaultError("Origem já fechada.")
+        try:
+            cur = os.stat(self.name, dir_fd=self._dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise VaultError(f"Original sumiu antes da remoção: {exc}") from exc
+        if (cur.st_dev, cur.st_ino) != self._dev_ino:
+            raise VaultError(
+                f"{self.real_path} foi trocado depois de cifrado; original NÃO removido."
+            )
+        # Mesmo que o nome seja trocado entre o stat e o unlink, o unlinkat
+        # só remove uma entrada deste diretório (já verificado como real).
+        os.unlink(self.name, dir_fd=self._dir_fd)
+
+    def close(self) -> None:
+        if self._dir_fd >= 0:
+            os.close(self._dir_fd)
+            self._dir_fd = -1
+
+    def __enter__(self) -> "QuarantineSource":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+_O_READ_SRC = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 
 class VaultError(Exception):
@@ -192,46 +269,84 @@ class QuarantineVault:
 
     def quarantine(self, source_path: str | Path, quarantine_id: str) -> Path:
         """
-        Copia e cifra um arquivo para o vault.
+        Copia e cifra um arquivo para o vault. NÃO remove o original.
+
+        Atalho de `quarantine_open()` que já fecha a origem. Quem precisa
+        remover o original depois (QuarantineManager) usa `quarantine_open`.
+        """
+        with self.quarantine_open(source_path, quarantine_id) as src:
+            return src.dest
+
+    def quarantine_open(self, source_path: str | Path, quarantine_id: str) -> QuarantineSource:
+        """
+        Cifra um arquivo para o vault e devolve a origem presa (ver
+        QuarantineSource) pra remoção segura. Quem chama fecha (`close()`
+        ou `with`).
 
         Fluxo seguro:
-          1. Lê o arquivo original
-          2. Cifra com Fernet
-          3. Escreve o .ekpq no vault
-          4. Verifica que o arquivo foi gravado corretamente
+          1. Abre o diretório real (recusa caminho com symlink)
+          2. Abre o arquivo com O_NOFOLLOW|O_NONBLOCK nesse fd; só arquivo regular
+          3. Lê pelo fd (sha256 calculado do que foi lido), cifra com Fernet
+          4. Escreve o .ekpq no vault e verifica
           5. NÃO remove o original (responsabilidade do QuarantineManager)
 
-        Retorna o Path do arquivo .ekpq criado.
         Lança VaultError se qualquer passo falhar.
         """
-        source = Path(source_path)
-        if not source.exists():
-            raise VaultError(f"Arquivo não encontrado: {source}")
-
-        dest = self._vault_path(quarantine_id)
-
-        try:
-            data = source.read_bytes()
-        except (OSError, PermissionError) as exc:
-            raise VaultError(f"Não foi possível ler {source}: {exc}") from exc
-
-        if self._encrypt and self._fernet:
-            payload = MAGIC + self._fernet.encrypt(data)
-        else:
-            payload = MAGIC + data   # modo sem criptografia (testes / sem chave)
+        absolute = os.path.normpath(os.path.abspath(source_path))
+        parent, name = os.path.split(absolute)
+        if not name or name in (".", ".."):
+            raise VaultError(f"Caminho de origem inválido: {source_path}")
 
         try:
-            _write_new_file(dest, payload)
-        except OSError as exc:
-            raise VaultError(f"Erro ao gravar vault: {exc}") from exc
+            dir_fd = _open_pinned_dir(parent, "de origem")
+        except VaultError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                raise VaultError(f"Arquivo não encontrado: {absolute}") from exc
+            raise
+        try:
+            try:
+                fd = os.open(name, _O_READ_SRC, dir_fd=dir_fd)
+            except FileNotFoundError as exc:
+                raise VaultError(f"Arquivo não encontrado: {absolute}") from exc
+            except OSError as exc:
+                # ELOOP = último componente é symlink (O_NOFOLLOW)
+                kind = "é symlink" if exc.errno == errno.ELOOP else str(exc)
+                raise VaultError(
+                    f"Não foi possível abrir {absolute} ({kind}). Quarentena recusada, "
+                    f"nada foi lido nem removido."
+                ) from exc
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise VaultError(f"{absolute} não é arquivo regular. Quarentena recusada.")
+                data = _read_all(fd)
+            except OSError as exc:
+                raise VaultError(f"Não foi possível ler {absolute}: {exc}") from exc
+            finally:
+                os.close(fd)
 
-        # Verifica integridade do que foi escrito
-        if not dest.exists() or dest.stat().st_size == 0:
-            dest.unlink(missing_ok=True)
-            raise VaultError("Verificação pós-escrita falhou: arquivo vazio.")
+            dest = self._vault_path(quarantine_id)
+            if self._encrypt and self._fernet:
+                payload = MAGIC + self._fernet.encrypt(data)
+            else:
+                payload = MAGIC + data   # modo sem criptografia (testes / sem chave)
 
-        logger.debug("Arquivo quarentenado: %s → %s", source, dest)
-        return dest
+            try:
+                _write_new_file(dest, payload)
+            except OSError as exc:
+                raise VaultError(f"Erro ao gravar vault: {exc}") from exc
+
+            # Verifica integridade do que foi escrito
+            if not dest.exists() or dest.stat().st_size == 0:
+                dest.unlink(missing_ok=True)
+                raise VaultError("Verificação pós-escrita falhou: arquivo vazio.")
+        except BaseException:
+            os.close(dir_fd)
+            raise
+
+        logger.debug("Arquivo quarentenado: %s → %s", absolute, dest)
+        return QuarantineSource(dir_fd, name, st, absolute,
+                                hashlib.sha256(data).hexdigest(), dest)
 
     def restore(self, quarantine_id: str, dest_path: str | Path) -> Path:
         """

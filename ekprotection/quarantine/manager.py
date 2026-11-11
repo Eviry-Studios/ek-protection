@@ -131,48 +131,58 @@ class QuarantineManager:
         Restaurar é que requer auth.
         """
         assert self._store and self._vault
-        src = Path(path)
-
-        if not src.exists():
-            raise QuarantineError(f"Arquivo não encontrado: {path}")
-
-        # Tamanho original
-        try:
-            file_size = src.stat().st_size
-        except OSError:
-            file_size = None
 
         # Gera ID único para este item
         quarantine_id = secrets.token_hex(16)
 
-        # 1. Cifra e copia para o vault
+        # 1. Cifra e copia para o vault. A origem fica presa ao diretório
+        # real e ao inode lido (ver QuarantineSource): sem isso, trocar o
+        # diretório por symlink entre a detecção e o unlink fazia o root
+        # apagar /etc/<nome> (2026-11-11).
         try:
-            self._vault.quarantine(src, quarantine_id)
+            src = self._vault.quarantine_open(path, quarantine_id)
         except VaultError as exc:
+            self._audit(
+                EventType.QUARANTINE_ADD,
+                f"Quarentena recusada: {path}: {exc}",
+                level=LogLevel.CRITICAL, file_path=path, sha256=sha256,
+            )
             raise QuarantineError(f"Erro ao mover para vault: {exc}") from exc
 
-        # 2. Persiste metadados
-        entry = QuarantineEntry(
-            quarantine_id  = quarantine_id,
-            original_path  = str(src.resolve()),
-            sha256         = sha256,
-            reason         = reason,
-            status         = QuarantineStatus.ACTIVE,
-            file_size      = file_size,
-            threat_type    = threat_type,
-            risk_level     = risk_level,
-            process_name   = process_name,
-            comment        = comment,
-        )
-        saved = self._store.add(entry)
+        with src:
+            # O que vai pro registro é o sha do que foi cifrado. Se difere do
+            # detectado, o arquivo mudou entre a detecção e a quarentena.
+            if sha256 and src.sha256 != sha256:
+                logger.warning(
+                    "Conteúdo de %s mudou desde a detecção (sha detectado %s, cifrado %s)",
+                    path, sha256, src.sha256,
+                )
+                note = f"sha256 na detecção: {sha256} (arquivo mudou antes da quarentena)"
+                comment = f"{comment} | {note}" if comment else note
 
-        # 3. Remove original SOMENTE após confirmar que o vault gravou
-        if remove_original:
-            try:
-                src.unlink()
-                logger.info("Original removido após quarentena: %s", path)
-            except OSError as exc:
-                logger.warning("Não foi possível remover original %s: %s", path, exc)
+            # 2. Persiste metadados
+            entry = QuarantineEntry(
+                quarantine_id  = quarantine_id,
+                original_path  = src.real_path,
+                sha256         = src.sha256,
+                reason         = reason,
+                status         = QuarantineStatus.ACTIVE,
+                file_size      = src.size,
+                threat_type    = threat_type,
+                risk_level     = risk_level,
+                process_name   = process_name,
+                comment        = comment,
+            )
+            saved = self._store.add(entry)
+
+            # 3. Remove original SOMENTE após confirmar que o vault gravou,
+            # e só se o nome ainda aponta pro inode cifrado
+            if remove_original:
+                try:
+                    src.remove()
+                    logger.info("Original removido após quarentena: %s", path)
+                except (OSError, VaultError) as exc:
+                    logger.warning("Não foi possível remover original %s: %s", path, exc)
 
         # 4. Auditoria
         self._audit(

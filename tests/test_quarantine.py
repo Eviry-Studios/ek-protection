@@ -16,6 +16,7 @@ Cobre:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import stat
@@ -646,9 +647,10 @@ class TestQuarantineManager:
         assert active[0].quarantine_id == e2.quarantine_id
 
     def test_find_by_hash(self, mgr: QuarantineManager, tmp_file: Path, tmp_path: Path) -> None:
-        sha = "cafecafe" * 8
+        # o registro guarda o sha do conteúdo cifrado (2026-11-11): mesmo conteúdo
+        sha = hashlib.sha256(tmp_file.read_bytes()).hexdigest()
         mgr.quarantine_file(str(tmp_file), sha, QuarantineReason.SIGNATURE_MATCH, remove_original=False)
-        f2 = tmp_path / "c.sh"; f2.write_bytes(b"other")
+        f2 = tmp_path / "c.sh"; f2.write_bytes(tmp_file.read_bytes())
         mgr.quarantine_file(str(f2), sha, QuarantineReason.HEURISTIC, remove_original=False)
         results = mgr.find_by_hash(sha)
         assert len(results) == 2
@@ -708,3 +710,165 @@ class TestQuarantineManager:
         )
         removed = mgr.purge_old()
         assert removed == 1
+
+
+class TestQuarantineSourceHardening:
+    """
+    quarantine_file roda como root (auto-quarentena) sobre arquivo num
+    diretório que o autor do arquivo controla. Antes (2026-11-11): trocar o
+    diretório por symlink entre a detecção e o unlink fazia o root apagar
+    /etc/<nome>; symlink no arquivo cifrava o alvo e só removia o link; FIFO
+    travava a leitura; o sha gravado era o detectado, não o cifrado.
+    """
+
+    SYS = b"root:x:0:0:FAKE\n"
+    MARK = b"EKP-HARMLESS-MARKER\n"
+
+    @pytest.fixture
+    def layout(self, tmp_path: Path) -> tuple[Path, Path]:
+        etc = tmp_path / "etc"; etc.mkdir()
+        (etc / "passwd").write_bytes(self.SYS)
+        dl = tmp_path / "home_u" / "dl"; dl.mkdir(parents=True)
+        return etc, dl
+
+    @staticmethod
+    def _fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    def test_dir_swapped_to_symlink_refused(self, mgr, layout) -> None:
+        etc, dl = layout
+        dl.rmdir(); dl.symlink_to(etc)
+        with pytest.raises(QuarantineError, match="passa por symlink"):
+            mgr.quarantine_file(str(dl / "passwd"), "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+        assert (etc / "passwd").read_bytes() == self.SYS
+        assert mgr.list_active() == []
+
+    def test_ancestor_symlink_refused(self, mgr, layout, tmp_path) -> None:
+        etc, _ = layout
+        (etc / "sub").mkdir(); (etc / "sub" / "f").write_bytes(self.SYS)
+        (tmp_path / "home_u" / "link").symlink_to(etc)
+        with pytest.raises(QuarantineError, match="passa por symlink"):
+            mgr.quarantine_file(str(tmp_path / "home_u" / "link" / "sub" / "f"),
+                                "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+        assert (etc / "sub" / "f").exists()
+
+    def test_file_symlink_refused_target_and_link_kept(self, mgr, layout) -> None:
+        etc, dl = layout
+        (dl / "miner").symlink_to(etc / "passwd")
+        with pytest.raises(QuarantineError, match="é symlink"):
+            mgr.quarantine_file(str(dl / "miner"), "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+        assert (etc / "passwd").read_bytes() == self.SYS
+        assert (dl / "miner").is_symlink()
+        assert mgr.list_active() == []
+
+    def test_no_ekpq_left_on_refusal(self, vault_noenc, layout) -> None:
+        etc, dl = layout
+        (dl / "miner").symlink_to(etc / "passwd")
+        with pytest.raises(VaultError):
+            vault_noenc.quarantine(dl / "miner", "q1")
+        assert not vault_noenc.file_exists("q1")
+
+    def test_fifo_refused_without_hanging(self, vault_noenc, layout) -> None:
+        import signal
+        _, dl = layout
+        os.mkfifo(dl / "pipe")
+        def boom(*_):  # pragma: no cover - só dispara se travar
+            raise TimeoutError("quarantine travou no FIFO")
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(3)
+        try:
+            with pytest.raises(VaultError, match="não é arquivo regular"):
+                vault_noenc.quarantine(dl / "pipe", "q1")
+        finally:
+            signal.alarm(0); signal.signal(signal.SIGALRM, old)
+
+    def test_directory_source_refused(self, vault_noenc, layout) -> None:
+        _, dl = layout
+        (dl / "d").mkdir()
+        with pytest.raises(VaultError, match="não é arquivo regular"):
+            vault_noenc.quarantine(dl / "d", "q1")
+
+    def test_recorded_sha_is_of_encrypted_content(self, mgr, layout) -> None:
+        _, dl = layout
+        f = dl / "miner"; f.write_bytes(b"trocado depois da deteccao\n")
+        detected = hashlib.sha256(self.MARK).hexdigest()
+        e = mgr.quarantine_file(str(f), detected, QuarantineReason.SIGNATURE_MATCH)
+        assert e.sha256 == hashlib.sha256(b"trocado depois da deteccao\n").hexdigest()
+        assert detected in e.comment
+
+    def test_matching_sha_no_note(self, mgr, layout) -> None:
+        _, dl = layout
+        f = dl / "miner"; f.write_bytes(self.MARK)
+        sha = hashlib.sha256(self.MARK).hexdigest()
+        e = mgr.quarantine_file(str(f), sha, QuarantineReason.SIGNATURE_MATCH, comment="c")
+        assert e.sha256 == sha and e.comment == "c"
+
+    def test_happy_path_removes_original(self, mgr, layout) -> None:
+        _, dl = layout
+        f = dl / "miner"; f.write_bytes(self.MARK)
+        e = mgr.quarantine_file(str(f), "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+        assert not f.exists()
+        assert e.original_path == str(f)
+        assert e.file_size == len(self.MARK)
+
+    def test_relative_path_from_cwd(self, mgr, layout, monkeypatch) -> None:
+        _, dl = layout
+        (dl / "miner").write_bytes(self.MARK)
+        monkeypatch.chdir(dl)
+        e = mgr.quarantine_file("miner", "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+        assert e.original_path == str(dl / "miner")
+        assert not (dl / "miner").exists()
+
+    def test_remove_refuses_swapped_inode(self, vault_noenc, layout) -> None:
+        _, dl = layout
+        f = dl / "miner"; f.write_bytes(self.MARK)
+        with vault_noenc.quarantine_open(f, "q1") as src:
+            other = dl / "other"; other.write_bytes(b"inocente\n")
+            os.replace(other, f)
+            with pytest.raises(VaultError, match="trocado"):
+                src.remove()
+        assert f.read_bytes() == b"inocente\n"
+
+    def test_remove_uses_pinned_dir_after_swap(self, vault_noenc, layout) -> None:
+        # dir trocado por symlink DEPOIS de aberto: remove() continua no dir real
+        etc, dl = layout
+        (dl / "passwd").write_bytes(self.MARK)
+        with vault_noenc.quarantine_open(dl / "passwd", "q1") as src:
+            moved = dl.parent / "dl_old"
+            dl.rename(moved); dl.symlink_to(etc)
+            src.remove()
+        assert (etc / "passwd").read_bytes() == self.SYS
+        assert not (moved / "passwd").exists()
+
+    def test_manager_keeps_swapped_original_and_entry(self, mgr, layout, monkeypatch) -> None:
+        _, dl = layout
+        f = dl / "miner"; f.write_bytes(self.MARK)
+        real_open = mgr._vault.quarantine_open
+        def swapping(path, qid):
+            src = real_open(path, qid)
+            other = dl / "other"; other.write_bytes(b"inocente\n"); os.replace(other, f)
+            return src
+        monkeypatch.setattr(mgr._vault, "quarantine_open", swapping)
+        e = mgr.quarantine_file(str(f), "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+        assert f.read_bytes() == b"inocente\n"
+        assert mgr.get(e.quarantine_id).status == QuarantineStatus.ACTIVE
+
+    def test_no_fd_leak(self, mgr, vault_noenc, layout) -> None:
+        etc, dl = layout
+        before = self._fds()
+        for i in range(5):
+            (dl / f"m{i}").write_bytes(self.MARK)
+            mgr.quarantine_file(str(dl / f"m{i}"), "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+            vault_noenc.quarantine(etc / "passwd", f"q{i}")
+        (dl / "lnk").symlink_to(etc / "passwd")
+        with pytest.raises(QuarantineError):
+            mgr.quarantine_file(str(dl / "lnk"), "0" * 64, QuarantineReason.SIGNATURE_MATCH)
+        assert self._fds() == before
+
+    def test_closed_source_remove_refused(self, vault_noenc, layout) -> None:
+        _, dl = layout
+        (dl / "m").write_bytes(self.MARK)
+        src = vault_noenc.quarantine_open(dl / "m", "q1"); src.close()
+        with pytest.raises(VaultError, match="fechada"):
+            src.remove()
+        assert (dl / "m").exists()
