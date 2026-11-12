@@ -60,6 +60,56 @@ _SKIP_EXTENSIONS = {
 }
 
 
+def _trusted_link(path: str, depth: int = 0) -> Optional[str]:
+    """
+    Caminho real de `path` se todo symlink no caminho (inclusive dentro dos
+    alvos) for do root ou do próprio daemon. Senão None.
+
+    Quem controla o link pode trocar o alvo depois, por isso só link de dono
+    confiável vira prefixo de tradução (ver ScanEngine._quarantine_path).
+    """
+    if depth > 40:
+        return None
+    trusted = {0, os.geteuid()}
+    cur = "/"
+    for part in Path(os.path.abspath(path)).parts[1:]:
+        nxt = os.path.join(cur, part)
+        try:
+            st = os.lstat(nxt)
+        except OSError:
+            return None
+        if stat_mod.S_ISLNK(st.st_mode):
+            if st.st_uid not in trusted:
+                return None
+            target = os.path.join(cur, os.readlink(nxt))
+            real = _trusted_link(target, depth + 1)
+            if real is None:
+                return None
+            cur = real
+        else:
+            cur = nxt
+    return os.path.normpath(cur)
+
+
+def _monitor_root_map(paths: list[str]) -> list[tuple[str, str]]:
+    """Pares (configurado, real) dos `monitor.paths` que são/contêm symlink confiável."""
+    out = []
+    for raw in paths:
+        configured = os.path.normpath(os.path.abspath(os.path.expanduser(raw)))
+        real = _trusted_link(configured)
+        if real is None:
+            if os.path.realpath(configured) != configured:
+                logger.warning(
+                    "monitor.paths %s passa por symlink de dono não confiável; "
+                    "ameaças lá dentro não serão auto-quarentenadas", configured,
+                )
+            continue
+        if real != configured:
+            out.append((configured, real))
+    # prefixo mais longo primeiro (/home/x antes de /home)
+    return sorted(out, key=lambda kv: len(kv[0]), reverse=True)
+
+
 class ScanEngine:
     """
     Motor de scanner sob demanda do EK-Protection.
@@ -89,6 +139,12 @@ class ScanEngine:
         # Arquivo-isca: abrir pra escanear disparava o próprio alerta.
         self._canaries    = {os.path.realpath(os.path.expanduser(c))
                              for c in (config.get("monitor.canary_paths", []) or [])}
+        # O FSWatcher reescreve os eventos pro prefixo configurado (/bin, não
+        # /usr/bin) e a quarentena recusa caminho com symlink (2026-11-11).
+        # Resolvido uma vez aqui, com a config já validada, pra traduzir só o
+        # prefixo configurado. O resto do caminho é do dono do arquivo e
+        # continua tendo que ser real (2026-11-12).
+        self._root_map    = _monitor_root_map(config.get("monitor.paths", []) or [])
 
     # ------------------------------------------------------------------
     # Scan de arquivo único
@@ -367,6 +423,14 @@ class ScanEngine:
     # Auto-quarentena
     # ------------------------------------------------------------------
 
+    def _quarantine_path(self, path: str) -> str:
+        """Troca o prefixo configurado (symlink confiável) pelo real."""
+        norm = os.path.normpath(os.path.abspath(path))
+        for configured, real in self._root_map:
+            if norm == configured or norm.startswith(configured + os.sep):
+                return real + norm[len(configured):]
+        return path
+
     def _auto_quarantine(self, result: FileScanResult) -> None:
         """Quarentena automática para ameaças críticas (modo crítico)."""
         if not self._quar or not result.sha256:
@@ -376,7 +440,7 @@ class ScanEngine:
             reason_kind = (QuarantineReason.HEURISTIC if result.threat_type == "Heuristic"
                            else QuarantineReason.SIGNATURE_MATCH)
             self._quar.quarantine_file(
-                path         = result.path,
+                path         = self._quarantine_path(result.path),
                 sha256       = result.sha256,
                 reason       = reason_kind,
                 threat_type  = result.threat_type,

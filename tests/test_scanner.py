@@ -730,3 +730,140 @@ class TestScanEnginePaths:
         mock_quar.quarantine_file.assert_called_once()
         _, kwargs = mock_quar.quarantine_file.call_args
         assert kwargs["reason"] == QuarantineReason.HEURISTIC
+
+
+# ---------------------------------------------------------------------------
+# Auto-quarentena com monitor.paths que é symlink (2026-11-12)
+# ---------------------------------------------------------------------------
+
+_MARK = b"EKP-HARMLESS-TEST-MARKER (nao executa)\n"
+
+
+class TestAutoQuarantineSymlinkRoot:
+    """
+    O FSWatcher reescreve os eventos pro prefixo configurado (/bin no Ubuntu,
+    onde /bin -> usr/bin) e desde 2026-11-11 a quarentena recusa caminho com
+    symlink. Resultado: nada em /bin nem /usr/bin era auto-quarentenado.
+    O scanner traduz só o prefixo configurado. Abaixo dele, symlink continua
+    recusado.
+    """
+
+    @pytest.fixture
+    def base(self, tmp_path: Path) -> Path:
+        base = Path(os.path.realpath(tmp_path))
+        (base / "usr_bin").mkdir()
+        (base / "bin").symlink_to("usr_bin")
+        (base / "etc").mkdir()
+        (base / "etc" / "passwd").write_bytes(b"root:x:0:0:FAKE\n")
+        return base
+
+    def _engine(self, cfg: ConfigManager, sig_db: SignatureDB, paths: list[Path]):
+        from ekprotection.quarantine.manager import QuarantineManager
+        cfg.set("quarantine.auto_quarantine_critical", True)
+        cfg.set("monitor.paths", [str(p) for p in paths])
+        sig_db.add(hashlib.sha256(_MARK).hexdigest(), "Lab.Marker", "Trojan", "crítico")
+        quar = QuarantineManager(cfg).open()
+        return ScanEngine(cfg, sig_db=sig_db, quar_manager=quar), quar
+
+    def test_root_symlink_is_quarantined(self, cfg, sig_db, base) -> None:
+        eng, quar = self._engine(cfg, sig_db, [base / "bin"])
+        (base / "usr_bin" / "miner").write_bytes(_MARK)
+        r = eng.scan_file(base / "bin" / "miner")
+        assert r.is_critical
+        assert not (base / "usr_bin" / "miner").exists()
+        [e] = quar.list_active()
+        assert e.original_path == str(base / "usr_bin" / "miner")
+        quar.close()
+
+    def test_ubuntu_default_real_and_link(self, cfg, sig_db, base) -> None:
+        # monitor.paths padrão tem /usr/bin e /bin: o evento sai como /bin/x
+        eng, quar = self._engine(cfg, sig_db, [base / "usr_bin", base / "bin"])
+        (base / "usr_bin" / "miner").write_bytes(_MARK)
+        eng.scan_file(base / "bin" / "miner")
+        assert not (base / "usr_bin" / "miner").exists()
+        assert len(quar.list_active()) == 1
+        quar.close()
+
+    def test_real_root_unchanged(self, cfg, sig_db, base) -> None:
+        eng, quar = self._engine(cfg, sig_db, [base / "usr_bin"])
+        (base / "usr_bin" / "miner").write_bytes(_MARK)
+        eng.scan_file(base / "usr_bin" / "miner")
+        assert len(quar.list_active()) == 1
+        quar.close()
+
+    def test_dir_swapped_below_root_still_refused(self, cfg, sig_db, base) -> None:
+        # ataque de 11-11 dentro de uma raiz symlink: dl trocado por link pra etc
+        eng, quar = self._engine(cfg, sig_db, [base / "bin"])
+        (base / "usr_bin" / "dl").symlink_to(base / "etc")
+        with patch("ekprotection.scanner.engine.sha256_file",
+                   return_value=hashlib.sha256(_MARK).hexdigest()):
+            eng.scan_file(base / "bin" / "dl" / "passwd")
+        assert (base / "etc" / "passwd").read_bytes() == b"root:x:0:0:FAKE\n"
+        assert quar.list_active() == []
+        quar.close()
+
+    def test_file_symlink_below_root_still_refused(self, cfg, sig_db, base) -> None:
+        eng, quar = self._engine(cfg, sig_db, [base / "bin"])
+        (base / "usr_bin" / "miner").symlink_to(base / "etc" / "passwd")
+        with patch("ekprotection.scanner.engine.sha256_file",
+                   return_value=hashlib.sha256(_MARK).hexdigest()):
+            eng.scan_file(base / "bin" / "miner")
+        assert (base / "etc" / "passwd").exists()
+        assert os.path.islink(base / "usr_bin" / "miner")
+        assert quar.list_active() == []
+        quar.close()
+
+    def test_untrusted_link_owner_not_translated(self, cfg, sig_db, base, caplog) -> None:
+        # link do próprio usuário de teste, daemon "rodando" com outro euid
+        with patch("ekprotection.scanner.engine.os.geteuid", return_value=987654):
+            with caplog.at_level("WARNING", logger="ekprotection.scanner.engine"):
+                eng, quar = self._engine(cfg, sig_db, [base / "bin"])
+        assert eng._root_map == []
+        assert "não confiável" in caplog.text
+        (base / "usr_bin" / "miner").write_bytes(_MARK)
+        eng.scan_file(base / "bin" / "miner")
+        assert (base / "usr_bin" / "miner").exists()
+        assert quar.list_active() == []
+        quar.close()
+
+    def test_chained_links(self, cfg, sig_db, base) -> None:
+        (base / "sbin").symlink_to("bin")        # sbin -> bin -> usr_bin
+        eng, quar = self._engine(cfg, sig_db, [base / "sbin"])
+        assert eng._root_map == [(str(base / "sbin"), str(base / "usr_bin"))]
+        (base / "usr_bin" / "miner").write_bytes(_MARK)
+        eng.scan_file(base / "sbin" / "miner")
+        assert len(quar.list_active()) == 1
+        quar.close()
+
+    def test_link_in_middle_component(self, cfg, sig_db, base) -> None:
+        (base / "usr_bin" / "sub").mkdir()
+        eng, quar = self._engine(cfg, sig_db, [base / "bin" / "sub"])
+        assert eng._root_map == [(str(base / "bin" / "sub"), str(base / "usr_bin" / "sub"))]
+        quar.close()
+
+    def test_longest_prefix_first(self, cfg, sig_db, base) -> None:
+        (base / "usr_bin" / "sub").mkdir()
+        (base / "other").mkdir()
+        (base / "usr_bin" / "sub2").symlink_to(base / "other")
+        eng, quar = self._engine(cfg, sig_db, [base / "bin", base / "bin" / "sub2"])
+        assert eng._quarantine_path(str(base / "bin" / "sub2" / "x")) == str(base / "other" / "x")
+        assert eng._quarantine_path(str(base / "bin" / "x")) == str(base / "usr_bin" / "x")
+        quar.close()
+
+    def test_prefix_boundary(self, cfg, sig_db, base) -> None:
+        (base / "binx").mkdir()
+        eng, quar = self._engine(cfg, sig_db, [base / "bin"])
+        assert eng._quarantine_path(str(base / "binx" / "m")) == str(base / "binx" / "m")
+        assert eng._quarantine_path(str(base / "bin")) == str(base / "usr_bin")
+        quar.close()
+
+    def test_path_outside_monitor_paths_unchanged(self, cfg, sig_db, base) -> None:
+        eng, quar = self._engine(cfg, sig_db, [base / "bin"])
+        p = str(base / "etc" / "passwd")
+        assert eng._quarantine_path(p) == p
+        quar.close()
+
+    def test_missing_monitor_path_ignored(self, cfg, sig_db, base) -> None:
+        eng, quar = self._engine(cfg, sig_db, [base / "nope", base / "bin"])
+        assert eng._root_map == [(str(base / "bin"), str(base / "usr_bin"))]
+        quar.close()
