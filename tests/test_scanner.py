@@ -867,3 +867,79 @@ class TestAutoQuarantineSymlinkRoot:
         eng, quar = self._engine(cfg, sig_db, [base / "nope", base / "bin"])
         assert eng._root_map == [(str(base / "bin"), str(base / "usr_bin"))]
         quar.close()
+
+
+def _no_hang(fn, *args, timeout: float = 5.0):
+    """Roda fn numa thread daemon. Falha se travar (FIFO sem escritor)."""
+    import threading
+    out: dict = {}
+
+    def run() -> None:
+        try:
+            out["ret"] = fn(*args)
+        except BaseException as exc:   # noqa: BLE001 - o teste confere o tipo
+            out["exc"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    assert not t.is_alive(), f"{getattr(fn, '__name__', fn)} travou em FIFO"
+    return out
+
+
+class TestFifoNoHang:
+    """
+    `open()` de FIFO sem escritor bloqueia. O `is_elf()` do auto-scan rodava
+    no event loop sem checar o tipo, e `mkfifo /tmp/a.png && mv` travava o
+    daemon inteiro (IPC, iscas). No scan, o `is_file()` vinha antes do open,
+    mas o arquivo podia ser trocado por FIFO no meio (2026-11-14).
+    """
+
+    @pytest.fixture
+    def fifo(self, tmp_path: Path) -> Path:
+        f = tmp_path / "update.png"
+        os.mkfifo(f)
+        return f
+
+    def test_open_regular_refuses_fifo(self, fifo: Path) -> None:
+        from ekprotection.scanner.hasher import open_regular
+        out = _no_hang(open_regular, fifo)
+        assert isinstance(out.get("exc"), OSError)
+
+    def test_open_regular_reads_regular_blocking(self, tmp_path: Path) -> None:
+        import fcntl
+        from ekprotection.scanner.hasher import open_regular
+        f = tmp_path / "a.bin"; f.write_bytes(b"abc" * 1000)
+        with open_regular(f) as fh:
+            assert not fcntl.fcntl(fh.fileno(), fcntl.F_GETFL) & os.O_NONBLOCK
+            assert fh.read() == b"abc" * 1000
+
+    def test_open_regular_follows_file_symlink(self, tmp_path: Path) -> None:
+        # semântica de antes mantida: o scanner segue link de arquivo
+        from ekprotection.scanner.hasher import open_regular
+        (tmp_path / "real").write_bytes(b"\x7fELF")
+        (tmp_path / "link").symlink_to("real")
+        with open_regular(tmp_path / "link") as fh:
+            assert fh.read() == b"\x7fELF"
+
+    def test_open_regular_refuses_directory(self, tmp_path: Path) -> None:
+        from ekprotection.scanner.hasher import open_regular
+        with pytest.raises(OSError):
+            open_regular(tmp_path)
+
+    def test_helpers_on_fifo_return(self, fifo: Path) -> None:
+        assert _no_hang(is_elf, fifo)["ret"] is False
+        assert _no_hang(is_script, fifo)["ret"] is False
+        assert _no_hang(file_entropy, fifo)["ret"] == 0.0
+        assert isinstance(_no_hang(sha256_file, fifo).get("exc"), OSError)
+
+    def test_heuristics_on_fifo_return(self, cfg: ConfigManager, fifo: Path) -> None:
+        from ekprotection.heuristics.engine import HeuristicEngine
+        out = _no_hang(HeuristicEngine(cfg).analyze, fifo)
+        assert "exc" not in out, out
+
+    def test_scan_file_swapped_to_fifo_after_is_file(self, engine: ScanEngine, fifo: Path) -> None:
+        # simula a troca entre o is_file() e o open (corrida)
+        with patch.object(Path, "is_file", lambda self: True):
+            out = _no_hang(engine.scan_file, fifo)
+        assert out["ret"].verdict in (ScanVerdict.ERROR, ScanVerdict.SKIPPED), out

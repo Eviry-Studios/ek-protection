@@ -295,9 +295,12 @@ class EKEngine:
         # polling só vê o arquivo depois que ele já tem conteúdo.)
         if event.kind == FileEventKind.CREATED and event.size == 0:
             return
+        loop = asyncio.get_running_loop()
         if event.is_executable_extension:
             rules = None
-        elif is_elf(event.path):  # só 4 bytes lidos
+        # No executor, não no loop: I/O aqui parava IPC/iscas/dispatch inteiros
+        # (FIFO `x.png` travou o daemon, 2026-11-14). Só 4 bytes lidos.
+        elif await loop.run_in_executor(None, is_elf, event.path):
             # ELF com extensão de imagem/texto/config (`/tmp/update.png`,
             # `x.json`): pela extensão nunca era escaneado, ou só com H024,
             # e o H022 (disfarce) nunca rodava em tempo real (2026-10-26).
@@ -312,7 +315,6 @@ class EKEngine:
             return
 
         self._remember_exec_state(event.path)
-        loop = asyncio.get_running_loop()
         scan = (functools.partial(self.scanner.scan_file, event.path, heuristic_rules=rules)
                 if rules is not None else functools.partial(self.scanner.scan_file, event.path))
         try:

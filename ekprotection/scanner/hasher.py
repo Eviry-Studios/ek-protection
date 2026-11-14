@@ -9,16 +9,44 @@ Fornece:
   - is_elf()       — detecta binários ELF pelo magic number
   - is_script()    — detecta scripts pelo shebang
   - file_entropy() — entropia de Shannon (detecta packed/cifrado)
+  - open_regular() — open() que não trava em FIFO e recusa o que não é arquivo regular
 """
 
 from __future__ import annotations
 
+import fcntl
 import math
 import os
+import stat
 from pathlib import Path
 from typing  import Optional
 
 CHUNK_SIZE = 65_536   # 64 KB por chunk
+
+
+def open_regular(path: str | Path):
+    """
+    Abre `path` pra leitura binária só se for arquivo regular, conferido no
+    próprio fd. Lança OSError se não for.
+
+    `open()` de um FIFO sem escritor bloqueia até alguém abrir pra escrita.
+    O `is_file()` que os chamadores fazem antes não protege: o arquivo pode
+    ser trocado por um FIFO entre a checagem e o open, e o `is_elf()` do
+    auto-scan nem tinha checagem. Um `mkfifo /tmp/a.png && mv /tmp/a.png
+    /tmp/b.png` por qualquer usuário travava o event loop do daemon (IPC,
+    iscas e auto-scan mudos, processo vivo pro systemd), medido em
+    2026-11-14. O_NONBLOCK faz o open de FIFO voltar na hora; num arquivo
+    regular não muda nada, e é tirado de novo depois do fstat.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"não é arquivo regular: {path}")
+        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def sha256_file(path: str | Path, max_bytes: Optional[int] = None) -> str:
@@ -37,7 +65,7 @@ def sha256_file(path: str | Path, max_bytes: Optional[int] = None) -> str:
     h       = hashlib.sha256()
     read    = 0
 
-    with open(path, "rb") as fh:
+    with open_regular(path) as fh:
         while True:
             remaining = (max_bytes - read) if max_bytes else CHUNK_SIZE
             chunk     = fh.read(min(CHUNK_SIZE, remaining))
@@ -63,7 +91,7 @@ def is_elf(path: str | Path) -> bool:
     Não lança exceção — retorna False se não puder ler.
     """
     try:
-        with open(path, "rb") as fh:
+        with open_regular(path) as fh:
             return fh.read(4) == b"\x7fELF"
     except (OSError, PermissionError):
         return False
@@ -74,7 +102,7 @@ def is_script(path: str | Path) -> bool:
     Retorna True se o arquivo começa com shebang (#!).
     """
     try:
-        with open(path, "rb") as fh:
+        with open_regular(path) as fh:
             return fh.read(2) == b"#!"
     except (OSError, PermissionError):
         return False
@@ -135,13 +163,13 @@ def file_entropy(path: str | Path, sample_bytes: int = 65_536) -> float:
 
     try:
         if size <= sample_bytes:
-            with open(path, "rb") as fh:
+            with open_regular(path) as fh:
                 data = fh.read(sample_bytes)
         else:
             chunk_size = max(1, sample_bytes // _N_ENTROPY_CHUNKS)
             span       = size - chunk_size
             buf        = bytearray()
-            with open(path, "rb") as fh:
+            with open_regular(path) as fh:
                 for i in range(_N_ENTROPY_CHUNKS):
                     offset = (span * i) // (_N_ENTROPY_CHUNKS - 1)
                     fh.seek(offset)

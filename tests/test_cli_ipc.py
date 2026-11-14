@@ -427,3 +427,43 @@ class TestDaemonReload:
         data = self._client(env).send("reload")["data"]
         assert data["applied"] is False and data["reason"] == "rejected"
         assert self._client(env).is_alive()
+
+
+class TestDaemonFifo:
+    """`mkfifo x.png` + `mv` dentro de um monitor.path (/tmp é padrão, qualquer
+    usuário grava) travava o event loop no `is_elf()` do auto-scan: IPC e
+    iscas mudos, processo vivo pro systemd. Abrir o FIFO pra escrita gerava
+    outro CLOSED e travava de novo (medido 2026-11-14)."""
+
+    def test_fifo_in_watch_does_not_wedge_daemon(self, running_daemon: dict, tmp_path: Path) -> None:
+        import signal
+        env = running_daemon
+        cfg_path = Path(env["EKP_CONFIG_PATH_FOR_TEST"])
+        home = tmp_path / "home"; home.mkdir()
+        bait = home / "wallet_backup.json"
+        bait.write_text("FAKE\n"); os.chmod(bait, 0o600)
+        cfg_path.write_text(cfg_path.read_text().replace(
+            "monitor:\n", f"monitor:\n  canary_paths:\n    - {bait}\n", 1))
+        os.chmod(cfg_path, 0o600)
+        pid = int(Path(f"{env['EKP_DATA_DIR']}/run/daemon.pid").read_text().strip())
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(1.5)
+
+        from ekprotection.daemon import IPCClient
+        client = IPCClient(f"{env['EKP_DATA_DIR']}/run/daemon.sock", timeout=3.0)
+        watch = tmp_path / "watch"
+        (watch / "sub").mkdir()
+        os.mkfifo(watch / "sub" / "x.png")
+        time.sleep(0.5)
+        os.rename(watch / "sub" / "x.png", watch / "x.png")   # MOVED
+        time.sleep(2)
+        try:
+            # escritor abre e fecha: CLOSED no FIFO
+            os.close(os.open(watch / "x.png", os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass   # ENXIO = ninguém lendo, que é o esperado
+        time.sleep(1.5)
+        assert client.send("status")["data"]["monitor"], "daemon travou com FIFO no monitor.path"
+        bait.read_text()
+        time.sleep(1.5)
+        assert client.send("log_search", event="file.canary_accessed", limit=50)["data"]["total"] == 1

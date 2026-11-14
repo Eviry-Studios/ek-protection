@@ -38,7 +38,7 @@ from typing      import Any, Optional
 
 from ekprotection.config.manager import ConfigManager
 from ekprotection.logs.models    import EventType, LogLevel
-from ekprotection.scanner.hasher import file_entropy
+from ekprotection.scanner.hasher import file_entropy, open_regular
 
 from .rules import (
     ALL_RULES, RULES_BY_ID,
@@ -245,7 +245,7 @@ class HeuristicEngine:
         # Leitura de conteúdo (limitada a CONTENT_SAMPLE_SIZE)
         content: Optional[bytes] = None
         try:
-            with open(path, "rb") as fh:
+            with open_regular(path) as fh:
                 content = fh.read(CONTENT_SAMPLE_SIZE)
         except (OSError, PermissionError):
             pass
