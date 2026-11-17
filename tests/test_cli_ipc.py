@@ -467,3 +467,51 @@ class TestDaemonFifo:
         bait.read_text()
         time.sleep(1.5)
         assert client.send("log_search", event="file.canary_accessed", limit=50)["data"]["total"] == 1
+
+
+class TestDaemonFloodCanary:
+    """Flood de scripts num monitor.path (/tmp é padrão) atrasava o alerta da
+    isca em 45-58s (4s de flood) e perdia dezenas de milhares de eventos sem
+    contar (`dropped` = 0). Medido com daemon real em 2026-11-16."""
+
+    def test_flood_does_not_delay_canary_and_drops_are_counted(
+        self, running_daemon: dict, tmp_path: Path
+    ) -> None:
+        import signal, threading
+        from datetime import datetime, timezone
+        env = running_daemon
+        cfg_path = Path(env["EKP_CONFIG_PATH_FOR_TEST"])
+        home = tmp_path / "home"; home.mkdir()
+        bait = home / "wallet_backup.json"
+        bait.write_text("FAKE\n"); os.chmod(bait, 0o600)
+        cfg_path.write_text(cfg_path.read_text().replace(
+            "monitor:\n", f"monitor:\n  canary_paths:\n    - {bait}\n", 1))
+        os.chmod(cfg_path, 0o600)
+        pid = int(Path(f"{env['EKP_DATA_DIR']}/run/daemon.pid").read_text().strip())
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(1.5)
+
+        from ekprotection.daemon import IPCClient
+        client = IPCClient(f"{env['EKP_DATA_DIR']}/run/daemon.sock", timeout=30.0)
+        watch = tmp_path / "watch"
+        stop = time.monotonic() + 3.0
+
+        def flood() -> None:
+            i = 0
+            while time.monotonic() < stop:
+                (watch / f"s{i % 500}.sh").write_text("#!/bin/sh\necho oi\n")
+                i += 1
+        for i in range(3000):
+            (watch / f"s{i % 500}.sh").write_text("#!/bin/sh\necho oi\n")
+        th = threading.Thread(target=flood); th.start()
+        time.sleep(1.0)
+        bait.read_text(); opened = time.time()
+        th.join()
+        time.sleep(1.0)
+        res = client.send("log_search", event="file.canary_accessed", limit=5)["data"]
+        assert res["total"] == 1
+        entries = res.get("entries") or res.get("results")
+        ts = datetime.fromisoformat(entries[0]["timestamp"]).replace(tzinfo=timezone.utc).timestamp()
+        assert ts - opened < 3.0, f"alerta da isca atrasou {ts - opened:.1f}s atrás do flood"
+        assert client.send("status")["data"]["monitor"]["counters"]["dropped"] > 0
+        assert client.send("log_search", event="monitor.overflow", limit=5)["data"]["total"] >= 1

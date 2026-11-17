@@ -1821,3 +1821,174 @@ class TestCanaryReload:
     def test_manager_reload_noop_when_not_running(self, cfg: ConfigManager, tmp_path: Path) -> None:
         mgr = MonitorManager(cfg, MagicMock())
         assert mgr.reload_canaries([self._decoy(tmp_path)]) == {"added": [], "removed": []}
+
+
+class TestCanaryQueueIsolation:
+    """Alerta de isca ia na mesma fila (2048) que todo evento de FS. Flood em
+    /tmp (qualquer usuário) atrasava o alerta em 45-58s com 4s de flood, e com
+    a fila cheia o QueueFull estourava no call_soon_threadsafe: o evento sumia
+    e o contador `dropped` ficava 0 (medido 2026-11-16)."""
+
+    @staticmethod
+    def _decoy(tmp_path: Path, name: str = "wallet.json") -> str:
+        p = tmp_path / name
+        p.write_text("FAKE\n")
+        os.chmod(p, 0o600)
+        return str(p)
+
+    def test_drop_counting_queue_never_raises(self) -> None:
+        from ekprotection.monitor.manager import _DropCountingQueue
+        lost: list = []
+        q = _DropCountingQueue(1, lost.append)
+        q.put_nowait("a")
+        q.put_nowait("b")
+        assert q.qsize() == 1 and lost == ["b"]
+
+    @pytest.mark.asyncio
+    async def test_drop_counting_queue_await_put_keeps_backpressure(self) -> None:
+        from ekprotection.monitor.manager import _DropCountingQueue
+        lost: list = []
+        q = _DropCountingQueue(1, lost.append)
+        await q.put("a")
+        t = asyncio.create_task(q.put("b"))
+        await asyncio.sleep(0.05)
+        assert not t.done()
+        assert q.get_nowait() == "a"
+        await asyncio.wait_for(t, 1)
+        assert q.get_nowait() == "b" and lost == []
+
+    @pytest.mark.asyncio
+    async def test_full_queue_via_thread_counts_drop_no_loop_exception(self, cfg: ConfigManager) -> None:
+        import threading
+        from ekprotection.monitor import manager as mm
+        mon = MonitorManager(cfg, MagicMock())
+        loop = asyncio.get_running_loop()
+        errors: list = []
+        loop.set_exception_handler(lambda _l, ctx: errors.append(ctx))
+        try:
+            for i in range(mm._QUEUE_MAXSIZE):
+                mon._queue.put_nowait(i)
+            th = threading.Thread(target=lambda: [loop.call_soon_threadsafe(mon._queue.put_nowait, "x")
+                                                  for _ in range(5)])
+            th.start(); th.join()
+            await asyncio.sleep(0.05)
+        finally:
+            loop.set_exception_handler(None)
+        assert errors == []
+        assert mon.status()["counters"]["dropped"] == 5
+
+    def test_drop_warning_rate_limited_and_aggregated(self, cfg: ConfigManager) -> None:
+        from ekprotection.logs.models import EventType, LogLevel
+        log = MagicMock()
+        mon = MonitorManager(cfg, log)
+        now = [1000.0]
+        mon._clock = lambda: now[0]
+        for _ in range(3):
+            mon._on_drop(object())
+        now[0] += 61
+        mon._on_drop(object())
+        calls = [c for c in log.get_source.return_value.event.call_args_list
+                 if c.args[0] == EventType.MONITOR_OVERFLOW]
+        assert len(calls) == 2
+        assert all(c.kwargs["level"] == LogLevel.WARNING for c in calls)
+        assert ": 1 evento" in calls[0].args[1]
+        assert ": 3 evento" in calls[1].args[1] and "total 4" in calls[1].args[1]
+        assert mon.status()["counters"]["dropped"] == 4
+
+    def test_canary_drop_is_logged_critical(self, cfg: ConfigManager) -> None:
+        from ekprotection.logs.models import EventType, LogLevel
+        log = MagicMock()
+        mon = MonitorManager(cfg, log)
+        mon._on_canary_drop(FileEvent(kind=FileEventKind.ACCESSED, path="/h/wallet.json"))
+        c = log.get_source.return_value.event.call_args
+        assert c.args[0] == EventType.CANARY_ACCESSED and c.kwargs["level"] == LogLevel.CRITICAL
+        assert "PERDIDO" in c.args[1] and c.kwargs["file_path"] == "/h/wallet.json"
+        assert mon.status()["counters"]["canary_dropped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_canary_watcher_uses_own_queue(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        cfg.set("monitor.canary_paths", [self._decoy(tmp_path)])
+        mon = MonitorManager(cfg, MagicMock())
+        with patch.object(ProcWatcher, "run", AsyncMock()):
+            await mon.start()
+            try:
+                assert mon._canary._queue is mon._canary_queue
+                assert mon._canary_queue is not mon._queue
+                assert mon.reload_canaries([]) is not None
+            finally:
+                await mon.stop()
+        mon2 = MonitorManager(cfg, MagicMock())
+        cfg.set("monitor.canary_paths", [])
+        await mon2.start()
+        try:
+            mon2.reload_canaries([self._decoy(tmp_path, "b.pem")])
+            assert mon2._canary._queue is mon2._canary_queue
+        finally:
+            await mon2.stop()
+
+    @pytest.mark.asyncio
+    async def test_canary_alert_not_blocked_by_slow_fs_callback(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        """Callback lento (auto-scan) preso num evento de FS não segura o alerta."""
+        import subprocess
+        from ekprotection.logs.models import EventType, LogLevel
+        key = self._decoy(tmp_path)
+        cfg.set("monitor.canary_paths", [key])
+        log = MagicMock()
+        mon = MonitorManager(cfg, log)
+        release = asyncio.Event()
+        stuck: list = []
+
+        async def slow(ev):
+            if isinstance(ev, FileEvent) and ev.kind != FileEventKind.ACCESSED:
+                stuck.append(ev)
+                await release.wait()
+        mon.add_callback(slow)
+        with patch.object(ProcWatcher, "run", AsyncMock()):
+            await mon.start()
+            try:
+                await asyncio.sleep(0.3)
+                mon._queue.put_nowait(FileEvent(kind=FileEventKind.CREATED, path="/tmp/x.sh", size=10))
+                await asyncio.sleep(0.1)
+                assert stuck, "dispatch comum devia estar preso no callback lento"
+                subprocess.run(["cat", key], stdout=subprocess.DEVNULL, check=True)
+                crit = []
+                for _ in range(30):
+                    await asyncio.sleep(0.1)
+                    crit = [c for c in log.get_source.return_value.event.call_args_list
+                            if c.args[0] == EventType.CANARY_ACCESSED]
+                    if crit:
+                        break
+            finally:
+                release.set()
+                await mon.stop()
+        assert len(crit) == 1 and crit[0].kwargs["level"] == LogLevel.CRITICAL
+
+    @pytest.mark.asyncio
+    async def test_canary_alert_survives_full_main_queue(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        import subprocess
+        from ekprotection.logs.models import EventType
+        from ekprotection.monitor import manager as mm
+        key = self._decoy(tmp_path)
+        cfg.set("monitor.canary_paths", [key])
+        log = MagicMock()
+        mon = MonitorManager(cfg, log)
+        release = asyncio.Event()
+
+        async def slow(ev):
+            if isinstance(ev, FileEvent) and ev.kind != FileEventKind.ACCESSED:
+                await release.wait()
+        mon.add_callback(slow)
+        with patch.object(ProcWatcher, "run", AsyncMock()):
+            await mon.start()
+            try:
+                await asyncio.sleep(0.3)
+                for i in range(mm._QUEUE_MAXSIZE + 2):
+                    mon._queue.put_nowait(FileEvent(kind=FileEventKind.CREATED, path=f"/tmp/{i}.sh", size=1))
+                subprocess.run(["cat", key], stdout=subprocess.DEVNULL, check=True)
+                await asyncio.sleep(1.0)
+                calls = log.get_source.return_value.event.call_args_list
+            finally:
+                release.set()
+                await mon.stop()
+        assert len([c for c in calls if c.args[0] == EventType.CANARY_ACCESSED]) == 1
+        assert mon.status()["counters"]["dropped"] >= 1

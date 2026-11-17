@@ -15,6 +15,11 @@ Arquitetura de eventos:
   FSWatcher (thread)  ──►┐
                          ├──► asyncio.Queue ──► _dispatch_loop ──► callbacks
   ProcWatcher (task)  ──►┘
+  CanaryWatcher (thread) ──► fila própria ──► _canary_loop ──► log CRITICAL + callbacks
+
+As iscas têm fila e loop próprios: na fila comum o alerta esperava atrás de
+todo o backlog de FS/auto-scan, e um flood em /tmp (qualquer usuário) atrasava
+o alerta em ~1 min ou fazia ele sumir com a fila cheia (2026-11-16).
 
 Callbacks registrados por outros subsistemas (scanner, heuristics, alerts)
 recebem MonitorEvent e podem retornar corrotinas.
@@ -24,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 from ekprotection.config.manager import ConfigManager
@@ -45,6 +51,32 @@ EventCallback = Callable[[MonitorEvent], Optional[Awaitable[None]]]
 
 # Tamanho máximo da fila — descarta eventos se cheia (evita consumo de memória)
 _QUEUE_MAXSIZE = 2048
+# Iscas: cooldown de 60s por isca, então isso nunca enche na prática.
+_CANARY_QUEUE_MAXSIZE = 256
+# Aviso de fila cheia no máximo 1x a cada N segundos (o flood não vira flood de log).
+_DROP_WARN_INTERVAL_S = 60.0
+
+
+class _DropCountingQueue(asyncio.Queue):
+    """asyncio.Queue cujo put_nowait não estoura QueueFull: conta e avisa.
+
+    Os watchers rodam em thread e empurram com
+    `loop.call_soon_threadsafe(queue.put_nowait, ev)`. Com a fila cheia o
+    QueueFull estourava dentro do callback do loop, ia só pro "Exception in
+    callback" do asyncio e o evento sumia sem passar pelo contador `dropped`
+    (que ficava 0). `await put()` segue com backpressure normal (só chama
+    put_nowait depois que há espaço).
+    """
+
+    def __init__(self, maxsize: int, on_drop: Callable[[Any], None]) -> None:
+        super().__init__(maxsize=maxsize)
+        self._on_drop = on_drop
+
+    def put_nowait(self, item: Any) -> None:
+        try:
+            super().put_nowait(item)
+        except asyncio.QueueFull:
+            self._on_drop(item)
 
 
 class MonitorManager:
@@ -66,7 +98,13 @@ class MonitorManager:
     ) -> None:
         self.config      = config
         self._log        = log_manager
-        self._queue:     asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
+        self._queue: asyncio.Queue = _DropCountingQueue(_QUEUE_MAXSIZE, self._on_drop)
+        self._canary_queue: asyncio.Queue = _DropCountingQueue(
+            _CANARY_QUEUE_MAXSIZE, self._on_canary_drop)
+        self._canary_task:   Optional[asyncio.Task] = None
+        self._drops_unreported = 0
+        self._last_drop_warn: Optional[float] = None
+        self._clock: Callable[[], float] = time.monotonic
         self._callbacks: list[EventCallback] = []
         self._fs_watcher:   Optional[FSWatcher]   = None
         self._canary:       Optional[CanaryWatcher] = None
@@ -85,6 +123,7 @@ class MonitorManager:
             "proc_suspicious":0,
             "canary_accessed":0,
             "dropped":        0,
+            "canary_dropped": 0,
         }
 
     # ------------------------------------------------------------------
@@ -117,7 +156,7 @@ class MonitorManager:
 
             canaries = self.config.get("monitor.canary_paths", [])
             if canaries:
-                self._canary = CanaryWatcher(canaries, self._queue, loop)
+                self._canary = CanaryWatcher(canaries, self._canary_queue, loop)
                 try:
                     self._canary.start()
                 except Exception as exc:
@@ -137,10 +176,14 @@ class MonitorManager:
                 name="ekp-proc-watcher",
             )
 
-        # --- Loop de despacho ---
+        # --- Loops de despacho (iscas separadas, ver docstring do módulo) ---
         self._dispatch_task = asyncio.create_task(
             self._dispatch_loop(),
             name="ekp-monitor-dispatch",
+        )
+        self._canary_task = asyncio.create_task(
+            self._dispatch_loop(self._canary_queue),
+            name="ekp-monitor-canary",
         )
 
         logger.info("MonitorManager iniciado.")
@@ -169,13 +212,14 @@ class MonitorManager:
         if self._canary:
             self._canary.stop()
 
-        # Para dispatch loop
-        if self._dispatch_task and not self._dispatch_task.done():
-            self._dispatch_task.cancel()
-            try:
-                await self._dispatch_task
-            except asyncio.CancelledError:
-                pass
+        # Para dispatch loops
+        for task in (self._dispatch_task, self._canary_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         logger.info("MonitorManager encerrado.")
 
@@ -184,7 +228,7 @@ class MonitorManager:
         if not self._running or not self.config.get("monitor.enabled", True):
             return {"added": [], "removed": []}
         if self._canary is None:
-            self._canary = CanaryWatcher([], self._queue, asyncio.get_running_loop())
+            self._canary = CanaryWatcher([], self._canary_queue, asyncio.get_running_loop())
         return self._canary.update(paths or [])
 
     # ------------------------------------------------------------------
@@ -205,16 +249,18 @@ class MonitorManager:
     # Loop de despacho
     # ------------------------------------------------------------------
 
-    async def _dispatch_loop(self) -> None:
+    async def _dispatch_loop(self, queue: Optional[asyncio.Queue] = None) -> None:
         """
         Consome eventos da fila e os despacha para todos os callbacks.
-        Roda como asyncio.Task — não bloqueia o event loop.
+        Roda como asyncio.Task — não bloqueia o event loop. Uma instância
+        pra fila comum e outra pra fila das iscas.
         """
+        queue = self._queue if queue is None else queue
         logger.debug("Dispatch loop iniciado.")
         while self._running:
             try:
                 event: MonitorEvent = await asyncio.wait_for(
-                    self._queue.get(), timeout=1.0
+                    queue.get(), timeout=1.0
                 )
             except asyncio.TimeoutError:
                 continue
@@ -232,9 +278,36 @@ class MonitorManager:
                 except Exception as exc:
                     logger.error("Erro em callback de monitor: %s", exc)
 
-            self._queue.task_done()
+            queue.task_done()
 
         logger.debug("Dispatch loop encerrado.")
+
+    # ------------------------------------------------------------------
+    # Fila cheia
+    # ------------------------------------------------------------------
+
+    def _on_drop(self, event: Any) -> None:
+        """Evento que não coube na fila comum. Roda no thread do loop."""
+        self._counters["dropped"] += 1
+        self._drops_unreported += 1
+        now = self._clock()
+        if (self._last_drop_warn is not None
+                and now - self._last_drop_warn < _DROP_WARN_INTERVAL_S):
+            return
+        self._last_drop_warn = now
+        n, self._drops_unreported = self._drops_unreported, 0
+        msg = (f"Fila do monitor cheia ({_QUEUE_MAXSIZE}): {n} evento(s) descartado(s) "
+               f"(total {self._counters['dropped']}). Arquivos criados nesse intervalo "
+               "não foram auto-escaneados. Flood de arquivos pode ser tentativa de cegar o monitor.")
+        logger.warning(msg)
+        self._log_event(EventType.MONITOR_OVERFLOW, msg, LogLevel.WARNING)
+
+    def _on_canary_drop(self, event: Any) -> None:
+        self._counters["canary_dropped"] += 1
+        path = getattr(event, "path", "?")
+        msg = f"Alerta de arquivo-isca PERDIDO (fila das iscas cheia): {path}"
+        logger.critical(msg)
+        self._log_event(EventType.CANARY_ACCESSED, msg, LogLevel.CRITICAL, file_path=path)
 
     # ------------------------------------------------------------------
     # Logging de eventos
@@ -317,6 +390,7 @@ class MonitorManager:
             "running":  self._running,
             "counters": dict(self._counters),
             "queue_size": self._queue.qsize(),
+            "canary_queue_size": self._canary_queue.qsize(),
         }
         if self._fs_watcher:
             result["fs_watcher"] = self._fs_watcher.status()

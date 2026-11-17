@@ -64,6 +64,7 @@ class EventType(str, Enum):
     FILE_EXECUTED  = "file.executed"
     PROC_SUSPICIOUS = "process.suspicious"
     CANARY_ACCESSED = "file.canary_accessed"
+    MONITOR_OVERFLOW = "monitor.overflow"
 
     # Ameaças
     THREAT_DETECTED  = "threat.detected"
