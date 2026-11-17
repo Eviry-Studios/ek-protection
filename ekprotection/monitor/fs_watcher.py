@@ -202,6 +202,7 @@ class FSWatcher:
         self._ignores   = ignores or []
         self._observer: Optional[Observer] = None
         self._active_paths: list[str] = []
+        self._handler: Optional[_EKPEventHandler] = None
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -231,6 +232,7 @@ class FSWatcher:
                 path_remap[str(resolved)] = str(path)
 
         handler = _EKPEventHandler(self._queue, self._loop, self._ignores, path_remap)
+        self._handler = handler
 
         for raw_path in self._paths:
             path = Path(raw_path)
@@ -270,6 +272,53 @@ class FSWatcher:
     @property
     def active_paths(self) -> list[str]:
         return list(self._active_paths)
+
+    def sweep_since(self, since: float, max_entries: int = 50_000) -> tuple[list[str], bool]:
+        """Arquivos regulares nos paths ativos com ctime >= ``since``.
+
+        Usado depois de um overflow da fila (2026-11-17): eventos que caíram
+        não foram auto-escaneados, e um flood de arquivos inofensivos pode ser
+        cortina pra um binário malicioso. ctime (não mtime) porque mtime é
+        forjável com ``touch -d``. Não segue symlink, respeita os mesmos
+        ignores do handler e devolve paths no prefixo configurado.
+        Retorna (paths, truncado) — truncado se passou de ``max_entries``
+        entradas visitadas.
+        """
+        found: list[str] = []
+        visited = 0
+        for raw in self._active_paths:
+            root = Path(raw).resolve()
+            stack = [str(root)]
+            while stack:
+                d = stack.pop()
+                try:
+                    it = os.scandir(d)
+                except OSError:
+                    continue
+                with it:
+                    for entry in it:
+                        visited += 1
+                        if visited > max_entries:
+                            return found, True
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if self._recursive:
+                                    stack.append(entry.path)
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if st.st_ctime < since:
+                            continue
+                        path = entry.path
+                        if self._handler is not None:
+                            path = self._handler._unresolve(path)
+                            if self._handler._should_ignore(path):
+                                continue
+                        found.append(path)
+        return found, False
 
     def status(self) -> dict:
         return {

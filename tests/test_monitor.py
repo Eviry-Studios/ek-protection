@@ -1992,3 +1992,101 @@ class TestCanaryQueueIsolation:
                 await mon.stop()
         assert len([c for c in calls if c.args[0] == EventType.CANARY_ACCESSED]) == 1
         assert mon.status()["counters"]["dropped"] >= 1
+
+
+class TestOverflowRecovery:
+    """Evento descartado por fila cheia nunca era auto-escaneado: um evil.sh
+    no meio de 3000 scripts inofensivos ficava no disco sem scan (medido
+    2026-11-17). Agora os paths que caíram voltam pra fila quando ela esvazia,
+    e se forem muitos, uma varredura por ctime cobre o resto."""
+
+    @staticmethod
+    def _ev(path: str, kind=None):
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+        return FileEvent(kind=kind or FileEventKind.CLOSED, path=path)
+
+    def test_drop_keeps_path_coalesced_and_skips_deleted(self, cfg: ConfigManager) -> None:
+        from ekprotection.monitor.events import FileEventKind
+        mon = MonitorManager(cfg, MagicMock())
+        mon._on_drop(self._ev("/w/a.sh", FileEventKind.CREATED))
+        mon._on_drop(self._ev("/w/a.sh"))
+        mon._on_drop(self._ev("/w/gone.sh", FileEventKind.DELETED))
+        mon._on_drop(object())
+        assert list(mon._pending) == ["/w/a.sh"]
+        assert mon._overflow_since is not None and not mon._sweep_needed
+
+    def test_pending_cap_switches_to_sweep(self, cfg: ConfigManager, monkeypatch) -> None:
+        from ekprotection.monitor import manager as mm
+        monkeypatch.setattr(mm, "_PENDING_MAX", 2)
+        mon = MonitorManager(cfg, MagicMock())
+        for n in ("a", "b", "c"):
+            mon._on_drop(self._ev(f"/w/{n}.sh"))
+        assert len(mon._pending) == 2 and mon._sweep_needed
+
+    @pytest.mark.asyncio
+    async def test_recover_requeues_existing_files_only(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        from ekprotection.monitor.events import FileEventKind
+        f = tmp_path / "evil.sh"; f.write_text("x")
+        mon = MonitorManager(cfg, MagicMock())
+        mon._on_drop(self._ev(str(f)))
+        mon._on_drop(self._ev(str(tmp_path / "sumiu.sh")))
+        await mon._recover_overflow()
+        ev = mon._queue.get_nowait()
+        assert ev.path == str(f) and ev.kind == FileEventKind.CLOSED and ev.detail == "overflow-recovery"
+        assert mon._queue.qsize() == 0 and not mon._pending and mon._overflow_since is None
+        assert mon.status()["counters"]["recovered"] == 1
+
+    @pytest.mark.asyncio
+    async def test_recover_does_not_drop_again_when_queue_refills(
+            self, cfg: ConfigManager, tmp_path: Path, monkeypatch) -> None:
+        from ekprotection.monitor import manager as mm
+        mon = MonitorManager(cfg, MagicMock())
+        mon._queue = mm._DropCountingQueue(2, mon._on_drop)
+        files = []
+        for i in range(5):
+            p = tmp_path / f"s{i}.sh"; p.write_text("x"); files.append(str(p))
+            mon._on_drop(self._ev(str(p)))
+        dropped = mon.status()["counters"]["dropped"]
+        await mon._recover_overflow()
+        assert mon._queue.qsize() == 2
+        assert list(mon._pending) == files[2:]
+        assert mon.status()["counters"]["dropped"] == dropped
+        assert mon._overflow_since is not None
+
+    def test_sweep_since_uses_ctime_ignores_and_symlinks(self, tmp_path: Path) -> None:
+        import time as _t
+        from ekprotection.monitor.fs_watcher import FSWatcher
+        w = tmp_path / "w"; (w / "sub").mkdir(parents=True)
+        (w / "old.sh").write_text("x")
+        since = _t.time() + 0.5
+        _t.sleep(1.0)
+        (w / "new.sh").write_text("x")
+        (w / "sub" / "deep.sh").write_text("x")
+        (w / "skip.tmp").write_text("x")
+        (w / "link.sh").symlink_to("/etc/passwd")
+        fw = FSWatcher([str(w)], MagicMock(), MagicMock(), recursive=True, ignores=["*.tmp"])
+        fw._active_paths = [str(w)]
+        from ekprotection.monitor.fs_watcher import _EKPEventHandler
+        fw._handler = _EKPEventHandler(MagicMock(), MagicMock(), ["*.tmp"], {})
+        found, trunc = fw.sweep_since(since)
+        assert sorted(found) == sorted([str(w / "new.sh"), str(w / "sub" / "deep.sh")]) and not trunc
+        _, trunc = fw.sweep_since(since, max_entries=2)
+        assert trunc
+
+    @pytest.mark.asyncio
+    async def test_dispatch_loop_recovers_when_queue_empties(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        f = tmp_path / "evil.sh"; f.write_text("x")
+        mon = MonitorManager(cfg, MagicMock())
+        seen: list = []
+        mon.add_callback(lambda ev: seen.append(ev.path))
+        mon._running = True
+        mon._on_drop(self._ev(str(f)))
+        task = asyncio.create_task(mon._dispatch_loop())
+        try:
+            for _ in range(50):
+                if seen: break
+                await asyncio.sleep(0.05)
+        finally:
+            mon._running = False
+            await asyncio.wait_for(task, 3)
+        assert seen == [str(f)]

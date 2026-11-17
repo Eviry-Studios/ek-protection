@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import stat as stat_mod
 import time
+from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
 
 from ekprotection.config.manager import ConfigManager
@@ -55,6 +58,13 @@ _QUEUE_MAXSIZE = 2048
 _CANARY_QUEUE_MAXSIZE = 256
 # Aviso de fila cheia no máximo 1x a cada N segundos (o flood não vira flood de log).
 _DROP_WARN_INTERVAL_S = 60.0
+# Recuperação pós-overflow (2026-11-17): paths que caíram ficam guardados (um
+# por path, coalescido) e voltam pra fila quando ela esvazia. Passou disso,
+# vira varredura dos monitor.paths por ctime desde o 1º descarte.
+_PENDING_MAX = 4096
+_SWEEP_MAX_ENTRIES = 50_000
+# Margem do ctime: o evento chega na fila um pouco depois do arquivo existir.
+_SWEEP_MARGIN_S = 5.0
 
 
 class _DropCountingQueue(asyncio.Queue):
@@ -105,6 +115,9 @@ class MonitorManager:
         self._drops_unreported = 0
         self._last_drop_warn: Optional[float] = None
         self._clock: Callable[[], float] = time.monotonic
+        self._pending: "OrderedDict[str, None]" = OrderedDict()
+        self._sweep_needed = False
+        self._overflow_since: Optional[float] = None
         self._callbacks: list[EventCallback] = []
         self._fs_watcher:   Optional[FSWatcher]   = None
         self._canary:       Optional[CanaryWatcher] = None
@@ -124,6 +137,7 @@ class MonitorManager:
             "canary_accessed":0,
             "dropped":        0,
             "canary_dropped": 0,
+            "recovered":      0,
         }
 
     # ------------------------------------------------------------------
@@ -258,6 +272,12 @@ class MonitorManager:
         queue = self._queue if queue is None else queue
         logger.debug("Dispatch loop iniciado.")
         while self._running:
+            if (queue is self._queue and queue.qsize() == 0
+                    and (self._pending or self._sweep_needed)):
+                try:
+                    await self._recover_overflow()
+                except Exception as exc:
+                    logger.error("Erro na recuperação pós-overflow: %s", exc)
             try:
                 event: MonitorEvent = await asyncio.wait_for(
                     queue.get(), timeout=1.0
@@ -289,6 +309,14 @@ class MonitorManager:
     def _on_drop(self, event: Any) -> None:
         """Evento que não coube na fila comum. Roda no thread do loop."""
         self._counters["dropped"] += 1
+        if self._overflow_since is None:
+            self._overflow_since = time.time() - _SWEEP_MARGIN_S
+        if (isinstance(event, FileEvent) and not event.is_dir
+                and event.kind != FileEventKind.DELETED):
+            if event.path in self._pending or len(self._pending) < _PENDING_MAX:
+                self._pending[event.path] = None
+            else:
+                self._sweep_needed = True
         self._drops_unreported += 1
         now = self._clock()
         if (self._last_drop_warn is not None
@@ -301,6 +329,70 @@ class MonitorManager:
                "não foram auto-escaneados. Flood de arquivos pode ser tentativa de cegar o monitor.")
         logger.warning(msg)
         self._log_event(EventType.MONITOR_OVERFLOW, msg, LogLevel.WARNING)
+
+    @staticmethod
+    def _recovery_events(paths: list[str]) -> list[FileEvent]:
+        """FileEvent CLOSED pros paths que ainda existem como arquivo regular.
+        Roda no executor (stat de milhares de paths)."""
+        out: list[FileEvent] = []
+        for path in paths:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if not stat_mod.S_ISREG(st.st_mode):
+                continue
+            out.append(FileEvent(
+                kind=FileEventKind.CLOSED, path=path, size=st.st_size,
+                uid=st.st_uid, mode=st.st_mode, detail="overflow-recovery",
+            ))
+        return out
+
+    async def _recover_overflow(self) -> None:
+        """Fila comum esvaziou depois de um overflow: devolve pra ela os
+        arquivos cujo evento caiu, pra passarem pelo auto-scan. Sem isso um
+        binário escondido num flood de 20 mil arquivos inofensivos nunca era
+        escaneado (só contado, 2026-11-16)."""
+        loop = asyncio.get_running_loop()
+        since = self._overflow_since
+        sweep = self._sweep_needed
+        paths = list(self._pending)
+        self._pending.clear()
+        self._sweep_needed = False
+        self._overflow_since = None
+
+        truncated = False
+        if sweep and self._fs_watcher is not None and since is not None:
+            swept, truncated = await loop.run_in_executor(
+                None, self._fs_watcher.sweep_since, since, _SWEEP_MAX_ENTRIES)
+            paths = list(dict.fromkeys(paths + swept))
+
+        events = await loop.run_in_executor(None, self._recovery_events, paths)
+        queued = 0
+        for i, ev in enumerate(events):
+            if self._queue.full():
+                # Não descarta de novo: o resto volta pro pendente e sai na
+                # próxima vez que a fila esvaziar.
+                for rest in events[i:]:
+                    self._pending[rest.path] = None
+                if self._overflow_since is None:
+                    self._overflow_since = since
+                break
+            self._queue.put_nowait(ev)
+            queued += 1
+        self._counters["recovered"] += queued
+
+        msg = (f"Recuperação pós-overflow: {queued} arquivo(s) reenfileirado(s) pro "
+               f"auto-scan ({len(paths)} candidato(s)"
+               f"{', com varredura dos monitor.paths' if sweep else ''}).")
+        if truncated:
+            msg += (f" Varredura TRUNCADA em {_SWEEP_MAX_ENTRIES} entradas: rode "
+                    "`ekp scan` nos monitor.paths.")
+            logger.warning(msg)
+            self._log_event(EventType.MONITOR_OVERFLOW, msg, LogLevel.WARNING)
+        else:
+            logger.info(msg)
+            self._log_event(EventType.MONITOR_OVERFLOW, msg, LogLevel.INFO)
 
     def _on_canary_drop(self, event: Any) -> None:
         self._counters["canary_dropped"] += 1
