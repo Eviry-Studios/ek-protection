@@ -88,7 +88,7 @@ class TestAutoScanWiring:
         engine = EKEngine(cfg)
         await engine.start()
         try:
-            assert engine._on_monitor_event_auto_scan in engine.monitor._callbacks
+            assert engine._on_monitor_event_auto_scan_bg in engine.monitor._callbacks
         finally:
             await engine.stop()
 
@@ -181,7 +181,7 @@ class TestAutoScanWiring:
         engine = EKEngine(manager)
         await engine.start()
         try:
-            assert engine._on_monitor_event_auto_scan not in engine.monitor._callbacks
+            assert engine._on_monitor_event_auto_scan_bg not in engine.monitor._callbacks
         finally:
             await engine.stop()
 
@@ -208,6 +208,9 @@ class TestAutoScanWiring:
             await engine._on_monitor_event_auto_scan(
                 FileEvent(kind=FileEventKind.CREATED, path=str(tmp_path / "run.sh")))
 
+            # O monitor real do engine também vigia /tmp: evento de outro
+            # processo ali chamava o mesmo scan_file monkeypatchado.
+            calls = [c for c in calls if c[0].startswith(str(tmp_path))]
             assert len(calls) == 7
             assert all(r == CONFIG_AUTOSCAN_RULES for _, r in calls[:6])
             assert calls[6] == (str(tmp_path / "run.sh"), None)
@@ -1096,3 +1099,156 @@ class TestEngineReload:
             for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 loop.remove_signal_handler(s)
             await eng.stop()
+
+
+# ---------------------------------------------------------------------------
+# Auto-scan concorrente (2026-11-18): o dispatch não espera cada scan em série
+# ---------------------------------------------------------------------------
+
+class _BlockingScanner:
+    """scan_file bloqueia até `release()`; registra chamadas e pico de concorrência."""
+
+    def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self.gate = threading.Event()
+        self.calls: list[tuple[str, object]] = []
+        self.active = 0
+        self.peak = 0
+
+    def scan_file(self, path, heuristic_rules=None):  # noqa: ANN001
+        with self._lock:
+            self.calls.append((str(path), heuristic_rules))
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        self.gate.wait(10)
+        with self._lock:
+            self.active -= 1
+
+
+async def _until(cond, timeout: float = 5.0) -> None:  # noqa: ANN001
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while not cond():
+        if loop.time() > end:
+            raise AssertionError("condição não atingida")
+        await asyncio.sleep(0.01)
+
+
+class TestAutoScanConcurrent:
+    def _engine(self, cfg: ConfigManager, n: int = 4) -> tuple[EKEngine, _BlockingScanner]:
+        cfg.set("monitor.auto_scan_concurrency", n)
+        engine = EKEngine(cfg)
+        engine.scanner = _BlockingScanner()
+        return engine, engine.scanner
+
+    def _ev(self, tmp_path: Path, name: str, kind=None):  # noqa: ANN001
+        from ekprotection.monitor.events import FileEvent, FileEventKind
+        p = tmp_path / name
+        if not p.exists():
+            p.write_text("#!/bin/sh\necho oi\n")
+        return FileEvent(kind=kind or FileEventKind.CLOSED, path=str(p))
+
+    @pytest.mark.asyncio
+    async def test_bg_callback_does_not_wait_scan(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        engine, sc = self._engine(cfg)
+        await asyncio.wait_for(
+            engine._on_monitor_event_auto_scan_bg(self._ev(tmp_path, "a.sh")), timeout=1.0)
+        await _until(lambda: len(sc.calls) == 1)
+        assert sc.active == 1          # scan ainda em voo e o callback já voltou
+        sc.gate.set()
+        await engine._drain_auto_scans(5)
+        assert not engine._scan_inflight
+
+    @pytest.mark.asyncio
+    async def test_scans_run_in_parallel_up_to_limit(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        engine, sc = self._engine(cfg, n=3)
+        for i in range(3):
+            await engine._on_monitor_event_auto_scan_bg(self._ev(tmp_path, f"p{i}.sh"))
+        await _until(lambda: sc.active == 3)
+        # 4º: sem vaga no semáforo, o callback (e portanto o dispatch) espera.
+        fourth = asyncio.ensure_future(
+            engine._on_monitor_event_auto_scan_bg(self._ev(tmp_path, "p3.sh")))
+        await asyncio.sleep(0.2)
+        assert not fourth.done() and len(sc.calls) == 3
+        sc.gate.set()
+        await asyncio.wait_for(fourth, 5)
+        await engine._drain_auto_scans(5)
+        assert len(sc.calls) == 4 and sc.peak == 3
+
+    @pytest.mark.asyncio
+    async def test_same_path_coalesced_into_one_rescan(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        from ekprotection.monitor.events import FileEventKind
+        engine, sc = self._engine(cfg)
+        await engine._on_monitor_event_auto_scan_bg(self._ev(tmp_path, "x.sh", FileEventKind.CREATED))
+        await _until(lambda: len(sc.calls) == 1)
+        for _ in range(5):   # CLOSED/MOVED do mesmo path durante o scan
+            await engine._on_monitor_event_auto_scan_bg(self._ev(tmp_path, "x.sh"))
+        assert len(sc.calls) == 1      # nunca 2 scans do mesmo path ao mesmo tempo
+        sc.gate.set()
+        await engine._drain_auto_scans(5)
+        assert [c[0] for c in sc.calls] == [str(tmp_path / "x.sh")] * 2
+        assert sc.peak == 1
+
+    @pytest.mark.asyncio
+    async def test_rescan_merges_rules_full_wins(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        from ekprotection.heuristics.rules import CONFIG_AUTOSCAN_RULES
+        engine, sc = self._engine(cfg)
+        # config.json: só H024. Durante o scan vira ELF? Não precisa: um evento
+        # de rescan "completo" (None) ganha de um parcial.
+        cfg_ev = self._ev(tmp_path, "c.json")
+        await engine._on_monitor_event_auto_scan_bg(cfg_ev)
+        await _until(lambda: len(sc.calls) == 1)
+        assert sc.calls[0][1] == CONFIG_AUTOSCAN_RULES
+        engine._scan_inflight[cfg_ev.path] = CONFIG_AUTOSCAN_RULES
+        (tmp_path / "c.json").write_bytes(b"\x7fELF" + b"\0" * 60)   # agora é ELF disfarçado
+        await engine._on_monitor_event_auto_scan_bg(cfg_ev)
+        sc.gate.set()
+        await engine._drain_auto_scans(5)
+        assert sc.calls[1] == (cfg_ev.path, None)
+
+    @pytest.mark.asyncio
+    async def test_wait_mode_returns_after_scan(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        engine, sc = self._engine(cfg)
+        sc.gate.set()
+        await engine._on_monitor_event_auto_scan(self._ev(tmp_path, "w.sh"))
+        assert len(sc.calls) == 1 and sc.active == 0 and not engine._scan_tasks
+
+    @pytest.mark.asyncio
+    async def test_scanner_error_frees_slot_and_path(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        engine, _ = self._engine(cfg, n=1)
+
+        class Boom:
+            n = 0
+            def scan_file(self, path, heuristic_rules=None):  # noqa: ANN001
+                Boom.n += 1
+                raise RuntimeError("falha")
+        engine.scanner = Boom()
+        for name in ("e1.sh", "e2.sh", "e1.sh"):
+            await asyncio.wait_for(engine._on_monitor_event_auto_scan(self._ev(tmp_path, name)), 2)
+        assert Boom.n == 3 and not engine._scan_inflight
+
+    @pytest.mark.asyncio
+    async def test_stop_waits_inflight_scan_before_closing(
+        self, cfg: ConfigManager, tmp_path: Path,
+    ) -> None:
+        engine = EKEngine(cfg)
+        await engine.start()
+        sc = _BlockingScanner()
+        engine.scanner = sc
+        closed_while_scanning: list[bool] = []
+        real_close = engine.quarantine.close if engine.quarantine else None
+
+        def spy_close() -> None:
+            closed_while_scanning.append(sc.active > 0)
+            if real_close:
+                real_close()
+        if engine.quarantine:
+            engine.quarantine.close = spy_close
+        await engine._on_monitor_event_auto_scan_bg(self._ev(tmp_path, "s.sh"))
+        await _until(lambda: sc.active == 1)
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.3, sc.gate.set)
+        await engine.stop()
+        assert sc.active == 0
+        assert closed_while_scanning in ([False], [])

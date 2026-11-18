@@ -30,6 +30,9 @@ from ekprotection.config.manager import ConfigManager
 logger = logging.getLogger(__name__)
 
 
+_NO_RESCAN = object()
+
+
 class EngineState(Enum):
     STOPPED  = auto()
     STARTING = auto()
@@ -60,6 +63,16 @@ class EKEngine:
         # reconhecer o `chmod +x` que vem depois da escrita (ver
         # _is_new_exec_bit). Limitado a _EXEC_SEEN_MAX entradas (LRU).
         self._exec_seen: OrderedDict[str, tuple[int, bool]] = OrderedDict()
+        # Auto-scan concorrente (2026-11-18). Antes o dispatch do monitor
+        # esperava cada scan em série (~25-50 arq/s); sob flood a fila enchia
+        # e a isca/arquivo malicioso esperava atrás de milhares de scans.
+        # path -> regras do rescan pendente (_NO_RESCAN = nenhum). Um path só
+        # tem um scan em voo: evento novo do mesmo path durante o scan vira
+        # 1 rescan no fim (o CREATED com conteúdo parcial + CLOSED final não
+        # rodam juntos nem disputam a quarentena do mesmo arquivo).
+        self._scan_inflight: dict[str, Any] = {}
+        self._scan_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        self._scan_sem: asyncio.Semaphore | None = None
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -115,6 +128,9 @@ class EKEngine:
         if self.monitor:
             try: await self.monitor.stop()
             except Exception as e: logger.warning("Erro ao parar monitor: %s", e)
+
+        # Antes de fechar quarentena/logs: scan em voo ainda pode quarentenar.
+        await self._drain_auto_scans(timeout=15.0)
 
         if self.exceptions:
             try: self.exceptions.close()
@@ -265,9 +281,14 @@ class EKEngine:
             return
         if not self.config.get("monitor.auto_scan_new_executables", True):
             return
-        self.monitor.add_callback(self._on_monitor_event_auto_scan)
+        self.monitor.add_callback(self._on_monitor_event_auto_scan_bg)
 
-    async def _on_monitor_event_auto_scan(self, event: Any) -> None:
+    async def _on_monitor_event_auto_scan_bg(self, event: Any) -> None:
+        """Callback do dispatch: agenda o scan e volta (só espera vaga no
+        semáforo, que é o backpressure). Ver _on_monitor_event_auto_scan."""
+        await self._on_monitor_event_auto_scan(event, wait=False)
+
+    async def _on_monitor_event_auto_scan(self, event: Any, wait: bool = True) -> None:
         from ekprotection.monitor.events import FileEvent, FileEventKind
         from ekprotection.scanner.hasher import is_elf
 
@@ -315,12 +336,75 @@ class EKEngine:
             return
 
         self._remember_exec_state(event.path)
-        scan = (functools.partial(self.scanner.scan_file, event.path, heuristic_rules=rules)
-                if rules is not None else functools.partial(self.scanner.scan_file, event.path))
+        path = event.path
+        if path in self._scan_inflight:
+            prev = self._scan_inflight[path]
+            self._scan_inflight[path] = (
+                rules if prev is _NO_RESCAN
+                else None if prev is None or rules is None
+                else prev | rules
+            )
+            if wait:
+                await self._wait_path_scan(path)
+            return
+        self._scan_inflight[path] = _NO_RESCAN
+        sem = self._auto_scan_semaphore()
         try:
-            await loop.run_in_executor(None, scan)
-        except Exception as exc:
-            logger.error("Erro no auto-scan de %s: %s", event.path, exc)
+            await sem.acquire()
+        except BaseException:
+            self._scan_inflight.pop(path, None)
+            raise
+        task = loop.create_task(self._auto_scan_worker(path, rules, sem))
+        self._scan_tasks.add(task)
+        task.add_done_callback(self._scan_tasks.discard)
+        if wait:
+            await asyncio.shield(task)
+
+    def _auto_scan_semaphore(self) -> asyncio.Semaphore:
+        if self._scan_sem is None:
+            try:
+                n = int(self.config.get("monitor.auto_scan_concurrency", 4))
+            except (TypeError, ValueError):
+                n = 4
+            self._scan_sem = asyncio.Semaphore(max(1, min(n, 16)))
+        return self._scan_sem
+
+    async def _auto_scan_worker(
+        self, path: str, rules: Any, sem: asyncio.Semaphore,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                scan = (functools.partial(self.scanner.scan_file, path, heuristic_rules=rules)
+                        if rules is not None else functools.partial(self.scanner.scan_file, path))
+                try:
+                    await loop.run_in_executor(None, scan)
+                except Exception as exc:
+                    logger.error("Erro no auto-scan de %s: %s", path, exc)
+                pending = self._scan_inflight.get(path, _NO_RESCAN)
+                if pending is _NO_RESCAN:
+                    break
+                rules = pending
+                self._scan_inflight[path] = _NO_RESCAN
+        finally:
+            self._scan_inflight.pop(path, None)
+            sem.release()
+
+    async def _wait_path_scan(self, path: str) -> None:
+        for t in list(self._scan_tasks):
+            # O worker do path é o único em voo pra ele; esperar todos os
+            # tasks atuais é mais simples e só é usado no modo wait=True.
+            await asyncio.shield(t)
+
+    async def _drain_auto_scans(self, timeout: float) -> None:
+        tasks = list(self._scan_tasks)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            logger.warning("%d auto-scan(s) ainda em voo no stop; cancelados.", len(pending))
+            for t in pending:
+                t.cancel()
 
     _EXEC_SEEN_MAX = 4096
     _EXEC_BITS = stat_mod.S_IXUSR | stat_mod.S_IXGRP | stat_mod.S_IXOTH
