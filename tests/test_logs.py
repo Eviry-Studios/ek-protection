@@ -455,3 +455,75 @@ class TestGetLogger:
         log.warning("via global")
         results = log_mgr.query(QueryFilter(search="via global", limit=5))
         assert any(e.message == "via global" for e in results)
+
+
+# ---------------------------------------------------------------------------
+# Testes: espelho logging → SQLite não duplica evento tipado (2026-11-18)
+# ---------------------------------------------------------------------------
+
+class TestNoDuplicatePersist:
+    def _rows(self, mgr: LogManager) -> list[LogEntry]:
+        return mgr.query(QueryFilter(limit=100))
+
+    def test_typed_warning_persisted_once(self, log_mgr: LogManager) -> None:
+        log_mgr.get_source("scanner").event(
+            EventType.SCAN_MATCH, "[SUSPICIOUS] /tmp/x.sh", level=LogLevel.CRITICAL,
+            file_path="/tmp/x.sh", sha256="ab",
+        )
+        rows = [e for e in self._rows(log_mgr) if "/tmp/x.sh" in e.message]
+        assert len(rows) == 1
+        assert rows[0].event_type == EventType.SCAN_MATCH
+        assert rows[0].file_path == "/tmp/x.sh"
+
+    def test_stats_count_critical_once(self, log_mgr: LogManager) -> None:
+        for i in range(3):
+            log_mgr.get_source("heuristics").event(
+                EventType.THREAT_DETECTED, f"ameaça {i}", level=LogLevel.CRITICAL,
+            )
+        assert log_mgr.stats()["by_level"].get("CRITICAL") == 3
+
+    def test_jsonl_line_once(self, log_mgr: LogManager, tmp_path: Path) -> None:
+        log_mgr.get_source("scanner").warning("linha única jsonl")
+        lines = (tmp_path / "logs" / "ekp.jsonl").read_text().splitlines()
+        assert sum("linha única jsonl" in l for l in lines) == 1
+
+    def test_plain_python_error_still_persisted(self, log_mgr: LogManager) -> None:
+        import logging
+        logging.getLogger("ekprotection.qualquer").error("erro python puro")
+        rows = [e for e in self._rows(log_mgr) if e.message == "erro python puro"]
+        assert len(rows) == 1 and rows[0].event_type == EventType.GENERIC
+
+    def test_below_min_level_not_persisted_via_mirror(
+        self, cfg: ConfigManager, tmp_path: Path,
+    ) -> None:
+        # log_level=ERROR: WARNING tipado não vai pro banco, nem pelo espelho.
+        cfg.set("daemon.log_level", "ERROR")
+        cfg.set("logs.db_path", str(tmp_path / "err.db"))
+        mgr = LogManager(cfg).open()
+        try:
+            mgr.get_source("t").warning("abaixo do mínimo")
+            assert not [e for e in self._rows(mgr) if e.message == "abaixo do mínimo"]
+        finally:
+            mgr.close()
+
+    def test_close_removes_root_handlers(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        import logging
+        root = logging.getLogger()
+        before = list(root.handlers)
+        cfg.set("logs.db_path", str(tmp_path / "h.db"))
+        mgr = LogManager(cfg).open()
+        assert len(root.handlers) == len(before) + 2
+        mgr.close()
+        assert root.handlers == before
+
+    def test_reopen_does_not_double_python_logs(self, cfg: ConfigManager, tmp_path: Path) -> None:
+        import logging
+        cfg.set("logs.db_path", str(tmp_path / "a.db"))
+        LogManager(cfg).open().close()
+        cfg.set("logs.db_path", str(tmp_path / "b.db"))
+        mgr = LogManager(cfg).open()
+        try:
+            logging.getLogger("ekprotection.y").error("depois de reabrir")
+            assert len([e for e in self._rows(mgr) if e.message == "depois de reabrir"]) == 1
+        finally:
+            mgr.close()

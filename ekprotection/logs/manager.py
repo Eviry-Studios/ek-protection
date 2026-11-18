@@ -62,6 +62,9 @@ def set_global(manager: "LogManager") -> None:
 # Handler Python logging → LogStore
 # ---------------------------------------------------------------------------
 
+_PERSISTED_ATTR = "ekp_persisted"
+
+
 class _StoreHandler(logging.Handler):
     """
     Handler que redireciona registros do logging padrão do Python
@@ -74,6 +77,12 @@ class _StoreHandler(logging.Handler):
         self._source = source
 
     def emit(self, record: logging.LogRecord) -> None:
+        # Espelho de um LogManager._write: o evento tipado já foi (ou, abaixo
+        # do log_level, deliberadamente não foi) persistido. Gravar de novo
+        # aqui duplicava todo WARNING+ como linha GENERIC sem file_path/sha256
+        # (stats/relatório contavam CRITICAL em dobro, 2026-11-18).
+        if getattr(record, _PERSISTED_ATTR, False):
+            return
         try:
             level_map = {
                 logging.DEBUG:    LogLevel.DEBUG,
@@ -192,6 +201,7 @@ class LogManager:
     def __init__(self, config: ConfigManager) -> None:
         self.config    = config
         self._store:   Optional[LogStore]   = None
+        self._handlers: list[logging.Handler] = []
         self._sources: dict[str, SourceLogger] = {}
         self._min_level = LogLevel.from_str(config.get("daemon.log_level", "INFO"))
 
@@ -234,6 +244,10 @@ class LogManager:
         store_handler = _StoreHandler(self._store, source="python")
         store_handler.setLevel(logging.WARNING)  # só WARNING+ vai ao SQLite via este canal
         root_logger.addHandler(store_handler)
+        # close() tira os dois. Antes ficavam pendurados no root: cada
+        # LogManager aberto no mesmo processo somava um _StoreHandler, os
+        # velhos apontando pra store já fechada.
+        self._handlers = [file_handler, store_handler]
 
         set_global(self)
         logger.info("Sistema de logs iniciado. DB: %s", db_path)
@@ -242,6 +256,14 @@ class LogManager:
     def close(self) -> None:
         """Fecha o LogStore e remove referência global."""
         global _global_log_manager
+        root_logger = logging.getLogger()
+        for h in getattr(self, "_handlers", ()):
+            root_logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        self._handlers = []
         if self._store:
             self._store.close()
             self._store = None
@@ -290,7 +312,9 @@ class LogManager:
         """Grava entry se nível >= mínimo configurado."""
         # Espelha no logging padrão do Python sempre
         py_level = entry.level.numeric
-        logging.getLogger(entry.source).log(py_level, entry.message)
+        logging.getLogger(entry.source).log(
+            py_level, entry.message, extra={_PERSISTED_ATTR: True},
+        )
 
         # Persiste no SQLite apenas se store estiver aberto e nível suficiente
         if self._store and entry.level.numeric >= self._min_level.numeric:
