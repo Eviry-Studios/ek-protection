@@ -146,7 +146,7 @@ def cmd_start(
     _require_root()
     cfg = _load_config(config)
     print_banner()
-    print_info("Iniciando EK-Protection v0.9.0...")
+    print_info(f"Iniciando EK-Protection v{__version__}...")
 
     from ekprotection.daemon import run_daemon
     try:

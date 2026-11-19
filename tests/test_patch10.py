@@ -729,3 +729,22 @@ class TestPluginPermissions:
         with caplog.at_level("CRITICAL"):
             assert PluginManager(cfg).load_all() == 1
         assert "carregando mesmo assim" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Versão hardcoded (2026-11-19): na VPS o log de início dizia "v0.9.0" e o
+# SYSTEM_START "v0.5.0" com o pacote em 1.0.0.
+# ---------------------------------------------------------------------------
+
+def test_no_hardcoded_version_strings() -> None:
+    import re
+    from pathlib import Path as _P
+    import ekprotection
+    from ekprotection.updater.fetcher import DEFAULT_USER_AGENT
+    root = _P(ekprotection.__file__).parent
+    pat = re.compile(r"EK-Protection[^\n\"']{0,20}[v/]\d+\.\d+\.\d+")
+    hits = [f"{p.relative_to(root)}:{i}" for p in root.rglob("*.py")
+            for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+            if pat.search(line) and p.name != "__init__.py"]
+    assert hits == []
+    assert f"EK-Protection/{ekprotection.__version__} " in DEFAULT_USER_AGENT

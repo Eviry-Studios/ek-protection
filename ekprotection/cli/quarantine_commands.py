@@ -79,8 +79,11 @@ def _authenticate(cfg: ConfigManager) -> str:
     if not auth.is_configured:
         print_error("Autenticação não configurada. Execute: ekp auth setup")
         raise typer.Exit(1)
+    if auth.hash_state == "unreadable":
+        print_error("Sem permissão para ler o arquivo de autenticação. Rode como root (sudo).")
+        raise typer.Exit(1)
     password = typer.prompt("Senha", hide_input=True)
-    from ekprotection.auth.manager import AuthFailedError, AuthLockedError
+    from ekprotection.auth.manager import AuthError, AuthFailedError, AuthLockedError
     try:
         return auth.authenticate(password)
     except AuthLockedError as exc:
@@ -88,6 +91,9 @@ def _authenticate(cfg: ConfigManager) -> str:
         raise typer.Exit(1)
     except AuthFailedError:
         print_error("Senha incorreta.")
+        raise typer.Exit(1)
+    except AuthError as exc:
+        print_error(str(exc))
         raise typer.Exit(1)
 
 

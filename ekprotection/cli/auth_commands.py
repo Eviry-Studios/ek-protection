@@ -25,6 +25,7 @@ from rich import box
 
 from ekprotection.auth.manager import (
     AuthManager,
+    AuthError,
     AuthFailedError,
     AuthLockedError,
     AuthNotConfiguredError,
@@ -78,6 +79,16 @@ def _print_password_requirements() -> None:
 # ekp auth setup
 # ---------------------------------------------------------------------------
 
+def _require_readable(auth: AuthManager) -> None:
+    """Sai com erro claro (antes de pedir senha) se o hash existe mas é ilegível."""
+    if auth.hash_state == "unreadable":
+        print_error(
+            "Sem permissão para ler o arquivo de autenticação. "
+            "Rode como root (sudo) ou aponte EKP_AUTH_FILE."
+        )
+        raise typer.Exit(1)
+
+
 @auth_app.command("setup")
 def cmd_auth_setup(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
@@ -88,6 +99,7 @@ def cmd_auth_setup(
     """
     _, auth = _get_auth(config)
 
+    _require_readable(auth)
     if auth.is_configured:
         print_warning("Autenticação já configurada.")
         print_info("Para alterar a senha, use: [cyan]ekp auth change[/cyan]")
@@ -139,6 +151,7 @@ def cmd_auth_verify(
     if not auth.is_configured:
         print_error("Autenticação não configurada. Execute: [cyan]ekp auth setup[/cyan]")
         raise typer.Exit(1)
+    _require_readable(auth)
 
     console.print()
     password = _prompt_password("Senha atual")
@@ -155,6 +168,10 @@ def cmd_auth_verify(
     except AuthFailedError:
         console.print()
         print_error("Senha incorreta.")
+        raise typer.Exit(1)
+    except AuthError as exc:
+        console.print()
+        print_error(str(exc))
         raise typer.Exit(1)
 
 
@@ -175,6 +192,7 @@ def cmd_auth_change(
     if not auth.is_configured:
         print_error("Autenticação não configurada. Execute: [cyan]ekp auth setup[/cyan]")
         raise typer.Exit(1)
+    _require_readable(auth)
 
     console.print()
     console.print("[ekp.brand]Alteração de Senha[/ekp.brand]")
@@ -191,6 +209,10 @@ def cmd_auth_change(
     except AuthFailedError:
         console.print()
         print_error("Senha atual incorreta.")
+        raise typer.Exit(1)
+    except AuthError as exc:
+        console.print()
+        print_error(str(exc))
         raise typer.Exit(1)
 
     console.print()
@@ -248,7 +270,9 @@ def cmd_auth_status(
     configured = status["configured"]
     table.add_row(
         "Senha configurada",
-        "[green]Sim[/green]" if configured else "[red]Não[/red]"
+        "[yellow]Desconhecido (sem permissão de leitura)[/yellow]"
+        if status.get("hash_state") == "unreadable"
+        else ("[green]Sim[/green]" if configured else "[red]Não[/red]")
     )
 
     session_active = status["session_active"]

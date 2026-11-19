@@ -151,9 +151,34 @@ class AuthManager:
     # ------------------------------------------------------------------
 
     @property
+    def hash_state(self) -> str:
+        """
+        Estado do arquivo de hash: ``"missing"``, ``"present"`` ou ``"unreadable"``.
+
+        ``Path.exists()`` só engole ENOENT: se o diretório pai existe mas o
+        processo não pode atravessá-lo (``/etc/ek-protection`` root 0750 e
+        ``ekp`` rodando sem root), o ``stat()`` levanta PermissionError. Antes
+        isso derrubava o boot do daemon (``_init_auth``) e qualquer comando de
+        auth com traceback.
+        """
+        try:
+            st = self._hash_file.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            return "missing"
+        except OSError:
+            return "unreadable"
+        return "present" if st.st_size > 0 else "missing"
+
+    @property
     def is_configured(self) -> bool:
-        """Retorna True se a senha já foi configurada (hash existe)."""
-        return self._hash_file.exists() and self._hash_file.stat().st_size > 0
+        """
+        True se a senha já foi configurada (hash existe).
+
+        Ilegível conta como configurado (fail-closed): não dá pra provar que
+        não existe senha, então ``setup()`` não tenta gravar por cima e o
+        ``authenticate()`` falha com erro de leitura em vez de "não configurada".
+        """
+        return self.hash_state != "missing"
 
     # ------------------------------------------------------------------
     # Configuração inicial (primeira execução)
@@ -413,6 +438,7 @@ class AuthManager:
         """Retorna dicionário com o estado atual da autenticação."""
         return {
             "configured": self.is_configured,
+            "hash_state": self.hash_state,
             "session_active": self._session is not None and self._session.is_valid(),
             "session_remaining_seconds": round(self.session_remaining()),
             "failed_attempts": self._failed_attempts,

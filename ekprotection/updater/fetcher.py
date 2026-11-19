@@ -39,10 +39,12 @@ import urllib.request
 from pathlib import Path
 from typing  import Optional
 
+from ekprotection import __version__
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT  = 30   # segundos
-DEFAULT_USER_AGENT = "EK-Protection/0.9.0 (https://github.com/Eviry-Studios/ek-protection)"
+DEFAULT_USER_AGENT = f"EK-Protection/{__version__} (https://github.com/Eviry-Studios/ek-protection)"
 
 
 class UpdateError(Exception):

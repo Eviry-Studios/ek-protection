@@ -494,3 +494,44 @@ class TestConfigExposure:
         monkeypatch.setattr(daemon.asyncio, "run", stop)
         daemon.run_daemon(str(exposed_config))
         assert any("Config exposta" in m and "canary_paths" in m for m in seen)
+
+
+# ---------------------------------------------------------------------------
+# Dir da config ilegível (2026-11-19): com /etc/ek-protection root 0750 (VPS
+# desde 18/11), Path.exists() levanta PermissionError e todo `ekp` sem root
+# morria com traceback em vez de cair nos defaults.
+# ---------------------------------------------------------------------------
+
+import os as _os
+import subprocess as _sp
+import sys as _sys
+
+
+@pytest.mark.skipif(_os.geteuid() == 0, reason="root atravessa dir 0000")
+class TestUnreadableConfigDir:
+
+    @pytest.fixture
+    def locked_cfg(self, tmp_path: Path):
+        d = tmp_path / "etc"
+        d.mkdir()
+        f = d / "config.yaml"
+        f.write_text("monitor:\n  enabled: false\n")
+        _os.chmod(f, 0o600)
+        _os.chmod(d, 0)
+        try:
+            yield f
+        finally:
+            _os.chmod(d, 0o700)
+
+    def test_load_falls_back_to_defaults(self, locked_cfg: Path) -> None:
+        m = ConfigManager(locked_cfg).load()
+        assert m.get("monitor.enabled") == DEFAULT_CONFIG["monitor"]["enabled"]
+
+    def test_cli_no_traceback(self, locked_cfg: Path, tmp_path: Path) -> None:
+        ekp = str(Path(_sys.executable).parent / "ekp")
+        env = dict(_os.environ, EKP_DATA_DIR=str(tmp_path),
+                   EKP_AUTH_FILE=str(tmp_path / "auth.hash"))
+        r = _sp.run([ekp, "auth", "status", "--config", str(locked_cfg)],
+                    env=env, capture_output=True, text=True, timeout=60)
+        assert "Traceback" not in r.stdout + r.stderr, r.stdout + r.stderr
+        assert r.returncode == 0

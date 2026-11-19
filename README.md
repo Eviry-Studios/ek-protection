@@ -89,18 +89,22 @@ See [docs/architecture.md](docs/architecture.md) for the full component diagram 
 
 ## Patch Status
 
+All 10 patches of the v1.0 roadmap are implemented (see [CHANGELOG.md](CHANGELOG.md)).
+Work after 1.0.0 (hardening and fixes from the daily lab rounds) is listed under
+`[Unreleased]` in the changelog.
+
 | Patch | Feature | Status |
 |-------|---------|--------|
 | 1 | Base structure + CLI + config | ✅ |
-| 2 | Authentication | 📋 |
-| 3 | Logging | 📋 |
-| 4 | Real-time monitor | 📋 |
-| 5 | Exceptions | 📋 |
-| 6 | Quarantine | 📋 |
-| 7 | Scanner | 📋 |
-| 8 | Heuristics | 📋 |
-| 9 | Daemon IPC + systemd | 📋 |
-| 10 | v1.0 stable | 📋 |
+| 2 | Authentication | ✅ |
+| 3 | Logging | ✅ |
+| 4 | Real-time monitor | ✅ |
+| 5 | Exceptions | ✅ |
+| 6 | Quarantine | ✅ |
+| 7 | Scanner | ✅ |
+| 8 | Heuristics | ✅ |
+| 9 | Daemon IPC + systemd | ✅ |
+| 10 | v1.0 stable | ✅ |
 
 ## License
 

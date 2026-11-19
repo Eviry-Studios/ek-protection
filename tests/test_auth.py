@@ -394,3 +394,121 @@ class TestDecorators:
         with pytest.raises(ValueError, match="erro interno"):
             with authenticated_operation(configured_auth, token, "teste"):
                 raise ValueError("erro interno")
+
+
+# ---------------------------------------------------------------------------
+# Testes: hash ilegível (diretório pai sem permissão, ex. /etc/ek-protection
+# root 0750 e `ekp` rodando sem root). Achado 2026-11-19: depois da instalação
+# na VPS, todo daemon/CLI não-root morria com PermissionError no boot.
+# ---------------------------------------------------------------------------
+
+import subprocess as _sp
+import sys as _sys
+import tempfile as _tempfile
+
+_needs_nonroot = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root atravessa diretório 0000; teste só faz sentido sem root",
+)
+
+
+@pytest.fixture
+def locked_dir(tmp_path: Path):
+    """Diretório com auth.hash dentro e modo 0000 (stat() levanta EACCES)."""
+    d = tmp_path / "etc-ekp"
+    d.mkdir()
+    (d / "auth.hash").write_bytes(b"$2b$14$" + b"x" * 53)
+    os.chmod(d, 0)
+    try:
+        yield d
+    finally:
+        os.chmod(d, 0o700)
+
+
+@_needs_nonroot
+class TestUnreadableHash:
+
+    def test_hash_state_missing_present(self, auth: AuthManager) -> None:
+        assert auth.hash_state == "missing"
+        auth.setup(STRONG_PASSWORD)
+        assert auth.hash_state == "present"
+
+    def test_hash_state_empty_file_is_missing(self, auth: AuthManager) -> None:
+        auth._hash_file.write_bytes(b"")
+        assert auth.hash_state == "missing"
+        assert auth.is_configured is False
+
+    def test_unreadable_does_not_raise(self, auth: AuthManager, locked_dir: Path) -> None:
+        auth._hash_file = locked_dir / "auth.hash"
+        assert auth.hash_state == "unreadable"
+        # fail-closed: não dá pra provar que não há senha
+        assert auth.is_configured is True
+
+    def test_setup_refuses_when_unreadable(self, auth: AuthManager, locked_dir: Path) -> None:
+        auth._hash_file = locked_dir / "auth.hash"
+        with pytest.raises(RuntimeError):
+            auth.setup(STRONG_PASSWORD)
+
+    def test_authenticate_raises_auth_error(self, auth: AuthManager, locked_dir: Path) -> None:
+        auth._hash_file = locked_dir / "auth.hash"
+        with pytest.raises(AuthError) as ei:
+            auth.authenticate(STRONG_PASSWORD)
+        assert not isinstance(ei.value, AuthNotConfiguredError)
+
+    def test_status_and_repr(self, auth: AuthManager, locked_dir: Path) -> None:
+        auth._hash_file = locked_dir / "auth.hash"
+        st = auth.status()
+        assert st["hash_state"] == "unreadable"
+        assert "configured=True" in repr(auth)
+
+    def _ekp(self) -> str:
+        return str(Path(_sys.executable).parent / "ekp")
+
+    def test_cli_auth_status_and_setup_no_traceback(self, tmp_path: Path, locked_dir: Path) -> None:
+        cfg = tmp_path / "c.yaml"
+        cfg.write_text("signatures:\n  auto_update: false\n")
+        os.chmod(cfg, 0o600)
+        env = dict(os.environ, EKP_DATA_DIR=str(tmp_path), EKP_AUTH_FILE=str(locked_dir / "auth.hash"))
+        r = _sp.run([self._ekp(), "auth", "status", "--config", str(cfg)],
+                    env=env, capture_output=True, text=True, timeout=60)
+        assert "Traceback" not in r.stdout + r.stderr, r.stdout + r.stderr
+        assert r.returncode == 0
+        r = _sp.run([self._ekp(), "auth", "setup", "--config", str(cfg)],
+                    env=env, capture_output=True, text=True, timeout=60, input="")
+        assert "Traceback" not in r.stdout + r.stderr, r.stdout + r.stderr
+        assert r.returncode == 1
+        assert "permiss" in (r.stdout + r.stderr).lower()
+
+    def test_daemon_boots_with_unreadable_auth(self, locked_dir: Path) -> None:
+        from ekprotection.daemon import IPCClient
+        # tmpdir curto: path de socket Unix tem limite de ~108 bytes
+        d = _tempfile.mkdtemp(prefix="ekpauth")
+        os.chmod(d, 0o700)
+        cfg = Path(d) / "config.yaml"
+        cfg.write_text("monitor:\n  enabled: false\nsignatures:\n  auto_update: false\n")
+        os.chmod(cfg, 0o600)
+        env = dict(os.environ, EKP_DATA_DIR=d, EKP_AUTH_FILE=str(locked_dir / "auth.hash"))
+        out = open(Path(d) / "daemon.out", "w")
+        p = _sp.Popen([self._ekp(), "start", "--config", str(cfg)], env=env,
+                      stdout=out, stderr=_sp.STDOUT)
+        try:
+            c = IPCClient(f"{d}/run/daemon.sock", timeout=5.0)
+            alive = False
+            for _ in range(150):
+                if p.poll() is not None:
+                    break
+                if c.is_alive():
+                    alive = True
+                    break
+                time.sleep(0.2)
+            out.flush()
+            log = (Path(d) / "daemon.out").read_text()
+            assert alive, f"daemon não subiu (rc={p.poll()}):\n{log[-2000:]}"
+            assert "PermissionError" not in log
+        finally:
+            p.terminate()
+            try:
+                p.wait(20)
+            except _sp.TimeoutExpired:
+                p.kill()
+            out.close()

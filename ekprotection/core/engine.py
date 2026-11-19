@@ -116,7 +116,7 @@ class EKEngine:
         await self._init_updater()     # Patch 9
 
         self.state = EngineState.RUNNING
-        self._log_sys("SYSTEM_START", f"EK-Protection v0.5.0 iniciado. PID={self._get_pid()}")
+        self._log_sys("SYSTEM_START", f"EK-Protection v{__version__} iniciado. PID={self._get_pid()}")
         logger.info("EK-Protection Engine em execução. PID=%d", self._get_pid())
 
     async def stop(self) -> None:
@@ -182,8 +182,19 @@ class EKEngine:
         auth = AuthManager(self.config)
         self.auth = auth
         self.register("auth", auth)
-        if not auth.is_configured:
+        try:
+            state = auth.hash_state
+        except Exception as exc:  # nunca derrubar o boot por causa da auth
+            state = "unreadable"
+            logger.warning("Erro ao verificar autenticação: %s", exc)
+        if state == "missing":
             logger.warning("Autenticação não configurada. Execute: ekp auth setup")
+        elif state == "unreadable":
+            logger.warning(
+                "Arquivo de autenticação ilegível para este usuário (%s). "
+                "Operações que pedem senha vão falhar; rode como root ou "
+                "aponte EKP_AUTH_FILE.", auth.status().get("hash_file"),
+            )
 
     async def _init_exceptions(self) -> None:
         from ekprotection.exceptions.manager import ExceptionManager

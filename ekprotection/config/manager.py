@@ -246,7 +246,14 @@ class ConfigManager:
                 self._loaded = True
                 return self
 
-        if self._config_path.exists():
+        try:
+            present = self._config_path.exists()
+        except PermissionError:
+            # Dir pai sem permissão (/etc/ek-protection root 0750 e ekp sem
+            # root): exists() levanta em vez de False e derrubava qualquer
+            # comando (2026-11-19). O open() abaixo cai no aviso de defaults.
+            present = True
+        if present:
             try:
                 with self._config_path.open("r", encoding="utf-8") as fh:
                     user_cfg = yaml.safe_load(fh) or {}
