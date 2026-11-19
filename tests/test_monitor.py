@@ -2090,3 +2090,64 @@ class TestOverflowRecovery:
             mon._running = False
             await asyncio.wait_for(task, 3)
         assert seen == [str(f)]
+
+
+# ---------------------------------------------------------------------------
+# Conexões por tick (2026-11-19): Process.net_connections() relia as tabelas
+# /proc/net/* do sistema inteiro pra cada processo, a cada 5s. Era a CPU do
+# daemon ocioso na VPS (~14% de 1 núcleo). Agora 1 leitura por tick.
+# ---------------------------------------------------------------------------
+
+class TestProcWatcherConnTable:
+
+    def _conns(self, pid: int, n: int):
+        from types import SimpleNamespace
+        return [SimpleNamespace(pid=pid) for _ in range(n)] + [SimpleNamespace(pid=None)] * 5
+
+    def _tick(self, queue, proc, table, pid=4242):
+        pw = ProcWatcher(queue, interval=1.0)
+        pw._snapshot = {pid: "x"}
+        with patch.object(ProcWatcher, "_current_pids", staticmethod(lambda: {pid: "x"})), \
+             patch("psutil.Process", return_value=proc), \
+             patch("psutil.net_connections", **table) as sysconn:
+            asyncio.run(pw._tick())
+        evs = []
+        while not queue.empty():
+            evs.append(queue.get_nowait())
+        return pw, evs, sysconn
+
+    def test_tick_uses_one_system_table(self, event_queue: asyncio.Queue) -> None:
+        proc = _mock_proc("worker", "/usr/bin/python3", ["worker"])
+        proc.net_connections.side_effect = AssertionError("caminho por processo no tick")
+        pw, evs, sysconn = self._tick(event_queue, proc,
+                                      {"return_value": self._conns(4242, 60)})
+        assert sysconn.call_count == 1
+        assert any("60 conexões" in (e.reason or "") for e in evs)
+        assert pw._conn_counts is None    # não vaza pra chamada fora do tick
+
+    def test_below_threshold_no_alert(self, event_queue: asyncio.Queue) -> None:
+        proc = _mock_proc("worker", "/usr/bin/python3", ["worker"])
+        _, evs, _ = self._tick(event_queue, proc, {"return_value": self._conns(4242, 10)})
+        assert not [e for e in evs if "conexões" in (e.reason or "")]
+
+    def test_table_failure_falls_back_per_process(self, event_queue: asyncio.Queue) -> None:
+        import psutil
+        proc = _mock_proc("worker", "/usr/bin/python3", ["worker"])
+        proc.net_connections.return_value = [object()] * 70
+        _, evs, _ = self._tick(event_queue, proc,
+                               {"side_effect": psutil.AccessDenied()})
+        assert any("70 conexões" in (e.reason or "") for e in evs)
+        assert proc.net_connections.called
+
+    def test_direct_check_still_per_process(self, event_queue: asyncio.Queue) -> None:
+        proc = _mock_proc("worker", "/usr/bin/python3", ["worker"])
+        proc.net_connections.return_value = [object()] * 55
+        pw = ProcWatcher(event_queue, interval=1.0)
+        with patch("psutil.Process", return_value=proc):
+            ev = asyncio.run(pw._check_suspicious(4242))
+        assert ev is not None and "55 conexões" in (ev.reason or "")
+
+    def test_net_conn_counts_real_host(self) -> None:
+        """Leitura real (só /proc): não estoura e devolve dict ou None."""
+        out = ProcWatcher._net_conn_counts()
+        assert out is None or all(isinstance(k, int) and v > 0 for k, v in out.items())

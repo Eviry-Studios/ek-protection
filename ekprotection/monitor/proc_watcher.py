@@ -215,6 +215,10 @@ class ProcWatcher:
         # pid → (create_time, tick da última leitura de maps, achado)
         self._maps_cache: dict[int, tuple[float, int, Optional[str]]] = {}
         self._tick_no = 0
+        # pid → nº de conexões inet, montado 1x por tick (ver _net_conn_counts).
+        # None fora do tick: _check_suspicious chamado direto usa o caminho
+        # por processo.
+        self._conn_counts: Optional[dict[int, int]] = None
 
     # ------------------------------------------------------------------
     # Loop principal
@@ -273,10 +277,14 @@ class ProcWatcher:
             self._maps_cache.pop(pid, None)
 
         # Verifica suspeitos nos processos em execução
-        for pid in current:
-            ev = await self._check_suspicious(pid)
-            if ev:
-                await self._queue.put(ev)
+        self._conn_counts = self._net_conn_counts()
+        try:
+            for pid in current:
+                ev = await self._check_suspicious(pid)
+                if ev:
+                    await self._queue.put(ev)
+        finally:
+            self._conn_counts = None
 
         self._snapshot = current
 
@@ -351,9 +359,11 @@ class ProcWatcher:
 
             # Muitas conexões de rede abertas
             try:
-                conns = proc.net_connections()
-                if len(conns) > _NET_CONN_ALERT:
-                    reasons.append(("net", f"{len(conns)} conexões de rede abertas"))
+                counts = self._conn_counts
+                n_conns = (counts.get(pid, 0) if counts is not None
+                           else len(proc.net_connections()))
+                if n_conns > _NET_CONN_ALERT:
+                    reasons.append(("net", f"{n_conns} conexões de rede abertas"))
             except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
                 pass
 
@@ -497,6 +507,28 @@ class ProcWatcher:
         signals = cmdline_miner_signals(self._safe_cmdline(proc))
         self._miner_cache[pid] = (ctime, signals)
         return signals
+
+    @staticmethod
+    def _net_conn_counts() -> Optional[dict[int, int]]:
+        """
+        {pid: nº de conexões inet} com UMA leitura das tabelas do sistema.
+
+        No Linux, ``Process.net_connections()`` relê ``/proc/net/tcp*`` e
+        ``udp*`` inteiros a cada chamada e filtra pelos inodes do processo.
+        Chamado pra cada processo a cada 5 s, era o grosso da CPU do daemon
+        ocioso (~14% de 1 núcleo como root na VPS, 2026-11-18). Sem root, os
+        sockets de outros usuários vêm sem pid, igual ao AccessDenied do
+        caminho por processo. None = indisponível, usa o caminho antigo.
+        """
+        try:
+            conns = psutil.net_connections(kind="inet")
+        except Exception:
+            return None
+        counts: dict[int, int] = {}
+        for c in conns:
+            if c.pid:
+                counts[c.pid] = counts.get(c.pid, 0) + 1
+        return counts
 
     @staticmethod
     def _current_pids() -> dict[int, str]:
