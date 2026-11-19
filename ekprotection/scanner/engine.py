@@ -32,6 +32,7 @@ import asyncio
 import logging
 import os
 import stat as stat_mod
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib            import Path
@@ -145,6 +146,46 @@ class ScanEngine:
         # prefixo configurado. O resto do caminho é do dono do arquivo e
         # continua tendo que ser real (2026-11-12).
         self._root_map    = _monitor_root_map(config.get("monitor.paths", []) or [])
+        # Mesma detecção repetida: escrever um arquivo gera CREATED (já com
+        # conteúdo) + CLOSED, e os dois escaneavam e gravavam threat.detected
+        # + scan.match, 4 linhas por arquivo (visto na VPS, 2026-11-18). Só é
+        # repetição se path, sha256, veredito, risco, nome e regras forem
+        # idênticos dentro da janela: mudou o conteúdo, grava de novo. O scan
+        # e a quarentena sempre rodam, só a gravação é pulada. 0 desliga.
+        try:
+            self._repeat_window = max(0.0, float(
+                config.get("scanner.repeat_suppress_seconds", 60) or 0))
+        except (TypeError, ValueError):
+            self._repeat_window = 60.0
+        self._recent_reports: dict[str, tuple[tuple, float]] = {}
+        self._recent_lock     = threading.Lock()
+        self.suppressed_repeats = 0
+
+    _RECENT_MAX = 4096
+
+    def _is_repeat(self, result: FileScanResult) -> bool:
+        """True se esta detecção já foi gravada há menos de `_repeat_window`."""
+        if self._repeat_window <= 0 or not result.sha256:
+            return False
+        h = result.heuristic
+        key = (
+            result.sha256, result.verdict, result.risk_level, result.threat_name,
+            tuple(h.rules_fired) if h is not None else (),
+        )
+        now = time.monotonic()
+        with self._recent_lock:
+            prev = self._recent_reports.get(result.path)
+            if prev is not None and prev[0] == key and now - prev[1] < self._repeat_window:
+                self.suppressed_repeats += 1
+                return True
+            self._recent_reports[result.path] = (key, now)
+            if len(self._recent_reports) > self._RECENT_MAX:
+                cutoff = now - self._repeat_window
+                for k in [k for k, (_, t) in self._recent_reports.items() if t < cutoff]:
+                    del self._recent_reports[k]
+                while len(self._recent_reports) > self._RECENT_MAX:
+                    self._recent_reports.pop(next(iter(self._recent_reports)))
+        return False
 
     # ------------------------------------------------------------------
     # Scan de arquivo único
@@ -177,9 +218,18 @@ class ScanEngine:
         if result.is_critical and self._auto_quar and self._quar:
             self._auto_quarantine(result)
 
-        # Log da detecção
-        if result.is_threat:
-            self._log_threat(result)
+        # Log da detecção (heurística + scanner), uma vez por detecção
+        h = result.heuristic
+        if result.is_threat and self._is_repeat(result):
+            logger.debug("Detecção repetida, não gravada de novo: %s", result.path)
+        else:
+            if h is not None and self._heuristics:
+                try:
+                    self._heuristics.log_result(h)
+                except Exception:
+                    pass
+            if result.is_threat:
+                self._log_threat(result)
 
         return result
 
@@ -291,7 +341,8 @@ class ScanEngine:
         h_result = None
         if self._heuristics:
             try:
-                h_result = self._heuristics.analyze(path, only_rules=heuristic_rules)
+                h_result = self._heuristics.analyze(
+                    path, only_rules=heuristic_rules, log=False)
                 # Heurística avançada pode elevar o risco
                 if h_result.is_suspicious:
                     if h_result.risk_level in ("crítico", "alto") or not risk:
@@ -320,6 +371,7 @@ class ScanEngine:
             is_elf=elf_file,
             is_script=script_file,
             scan_ms=int((time.monotonic() - t_hash) * 1000),
+            heuristic=h_result,
         )
 
     def _heuristic_check(

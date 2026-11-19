@@ -158,11 +158,14 @@ class HeuristicEngine:
 
     def analyze(
         self, path: str | Path, only_rules: Optional[frozenset[str]] = None,
+        log: bool = True,
     ) -> HeuristicResult:
         """
         Analisa um arquivo com todas as regras heurísticas (ou só as de
         `only_rules`, usado no auto-scan de configs).
         Nunca lança exceção — erros internos resultam em score 0.
+        `log=False`: quem chama loga (via `log_result`), usado pelo
+        ScanEngine pra não gravar de novo a mesma detecção repetida.
         """
         if not self._enabled:
             return self._empty_result(str(path))
@@ -191,10 +194,15 @@ class HeuristicEngine:
             context_summary = self._ctx_summary(ctx),
         )
 
-        if result.is_suspicious:
+        if log and result.is_suspicious:
             self._log_result(result)
 
         return result
+
+    def log_result(self, result: HeuristicResult) -> None:
+        """Grava a detecção heurística (o que `analyze(log=True)` faz)."""
+        if result.is_suspicious:
+            self._log_result(result)
 
     def analyze_bytes(self, path: str, content: bytes) -> HeuristicResult:
         """

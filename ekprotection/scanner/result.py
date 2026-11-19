@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime    import datetime
 from enum        import Enum
-from typing      import Optional
+from typing      import Any, Optional
 
 
 class ScanVerdict(str, Enum):
@@ -42,6 +42,9 @@ class FileScanResult:
     scanned_at:    datetime        = field(default_factory=datetime.utcnow)
     scan_ms:       Optional[int]   = None     # tempo de scan em ms
     error_msg:     Optional[str]   = None     # preenchido se verdict=ERROR
+    # HeuristicResult da heurística avançada (fora do to_dict). O ScanEngine
+    # loga ele depois de decidir se a detecção é repetição (2026-11-19).
+    heuristic:     Any             = field(default=None, repr=False, compare=False)
 
     @property
     def is_threat(self) -> bool:
