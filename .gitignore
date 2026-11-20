@@ -48,3 +48,4 @@ signatures/*.cvd
 # OS
 .DS_Store
 Thumbs.db
+pytest-tmp/

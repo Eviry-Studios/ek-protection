@@ -457,7 +457,7 @@ class TestAutoScanWiring:
 
     @pytest.mark.asyncio
     async def test_end_to_end_chmod_x_after_write_triggers_h021(
-        self, tmp_path: Path
+        self, staging_tmp_path: Path
     ) -> None:
         """Teste intenso 2026-10-27: script inofensivo escrito sem bit de
         exec em diretório oculto de área temporária (`.X25-unix/.rsync/c/tsm`,
@@ -465,6 +465,7 @@ class TestAutoScanWiring:
         `curl -o x && chmod +x x`. O scan do CLOSED via `is_executable=False`
         e o H021 nunca rodava com o bit. (Em /tmp o H002 já pega o script;
         fora de /tmp — `~/.cache/.sshd` — o H021 é a única regra.)"""
+        tmp_path = staging_tmp_path  # área temporária sem tocar o /tmp real
         watched = tmp_path / "watch"
         drop = watched / ".X25-unix" / ".rsync" / "c"
         drop.mkdir(parents=True)
