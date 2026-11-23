@@ -140,7 +140,7 @@ def cmd_status(
 @app.command("start")
 def cmd_start(
     config:     Optional[str] = typer.Option(None, "--config", "-c"),
-    foreground: bool          = typer.Option(True, "--foreground/-f", is_flag=True),
+    foreground: bool          = typer.Option(True, "--foreground/-f"),
 ) -> None:
     """Inicia o daemon EK-Protection (foreground)."""
     _require_root()
