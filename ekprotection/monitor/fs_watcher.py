@@ -22,6 +22,7 @@ import fnmatch
 import logging
 import os
 import stat as stat_mod
+import warnings
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -80,6 +81,16 @@ class _EKPEventHandler(FileSystemEventHandler):
         self._push(event.src_path, FileEventKind.CREATED, event.is_directory)
 
     def on_modified(self, event: FileSystemEvent) -> None:
+        self._push(event.src_path, FileEventKind.MODIFIED, event.is_directory)
+
+    def on_attrib(self, event: FileSystemEvent) -> None:
+        # watchdog >= 7 entrega IN_ATTRIB (chmod/chown/utime) como
+        # FileAttribEvent -> on_attrib. No 6.x o mesmo IN_ATTRIB chegava como
+        # FileModifiedEvent -> on_modified. Sem este handler, na VPS (7.1.0) um
+        # `chmod +x` depois da escrita (curl -o x && chmod +x x) não gerava
+        # re-scan e o H021 ficava cego (2026-11-23). Mantém a semântica do 6.x:
+        # vira MODIFIED, que já é o caminho do re-scan pós-chmod (2026-10-27).
+        # No watchdog 6 este método nunca é chamado.
         self._push(event.src_path, FileEventKind.MODIFIED, event.is_directory)
 
     def on_closed(self, event: FileSystemEvent) -> None:
@@ -176,6 +187,39 @@ class _EKPEventHandler(FileSystemEventHandler):
         return False
 
 
+# watchdog >= 7 (inotify): quando um diretório novo aparece numa raiz recursiva,
+# o InotifyWatchGroup registra a árvore inteira (os.walk) e depois registra de
+# novo cada subdiretório quando o IN_CREATE dele chega. O id do callback é o do
+# próprio grupo, então ele só é sobrescrito pelo mesmo callback (inofensivo),
+# mas o watchdog emite um RuntimeWarning cujo texto inclui o repr de TODOS os
+# watches do grupo: na VPS (~1500 watches em /tmp) cada aviso virava uma linha
+# de ~48 KB no journal (o limite de linha do journald), 110 vezes em 5 dias
+# (EKP-MON #441, semana 1). O filtro é estreito: só essa mensagem, só RuntimeWarning,
+# só vindo de módulo do watchdog. Qualquer outro aviso continua aparecendo.
+_DUP_CALLBACK_WARNING_RE = r"Callback with id .* already exists for watch"
+_WATCHDOG_MODULE_RE = r"watchdog(\..*)?$"
+
+
+def _install_watchdog_dup_callback_filter() -> None:
+    """Silencia o RuntimeWarning benigno de callback duplicado do watchdog 7.x.
+
+    Idempotente sem flag de módulo: confere se o filtro já está em
+    ``warnings.filters`` (um ``catch_warnings`` pode ter restaurado a lista
+    e apagado o filtro; ``filterwarnings`` empilharia duplicata a cada start).
+    """
+    for action, msg, cat, mod, _lineno in warnings.filters:
+        if (action == "ignore" and cat is RuntimeWarning
+                and msg is not None and msg.pattern == _DUP_CALLBACK_WARNING_RE
+                and mod is not None and mod.pattern == _WATCHDOG_MODULE_RE):
+            return
+    warnings.filterwarnings(
+        "ignore",
+        message=_DUP_CALLBACK_WARNING_RE,
+        category=RuntimeWarning,
+        module=_WATCHDOG_MODULE_RE,
+    )
+
+
 class FSWatcher:
     """
     Observador de filesystem para o EK-Protection.
@@ -210,6 +254,7 @@ class FSWatcher:
 
     def start(self) -> None:
         """Inicia o Observer e agenda todos os paths configurados."""
+        _install_watchdog_dup_callback_filter()
         self._observer = self._create_observer()
 
         # inotify (watchdog usa IN_DONT_FOLLOW por padrão) não segue symlink
