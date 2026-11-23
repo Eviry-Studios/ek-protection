@@ -106,9 +106,44 @@ Work after 1.0.0 (hardening and fixes from the daily lab rounds) is listed under
 | 9 | Daemon IPC + systemd | ✅ |
 | 10 | v1.0 stable | ✅ |
 
+## Open-core model
+
+EK-Protection is **open-core**. The engine is and stays MIT; what EviRyKorp
+sells is the service around it. Target platform: **Linux servers and VPS
+only**. There is no Windows or desktop port planned.
+
+**Free (MIT, this repository):**
+
+- the whole engine: daemon, real-time monitor, scanner, heuristics, quarantine,
+  auth, exceptions, logs, CLI, systemd unit, plugin API, ClamAV bridge;
+- the built-in heuristic rules shipped in `ekprotection/heuristics/`;
+- the public signature feed in [`signatures/`](signatures/) and the feed client
+  (`ekprotection/updater/`), so the free install keeps updating on its own;
+- local reports (`ekp report`).
+
+Anyone can use, fork, modify and redistribute all of this under the MIT terms,
+including commercially. That includes every version already published. A paid
+plan never removes or locks a feature from the engine.
+
+**Paid (planned, not available yet):**
+
+- a **curated signature and rule feed** with faster, more frequent updates than
+  the public one, delivered over an authenticated channel;
+- **support** (installation, false positives, incident follow-up);
+- a **hosted panel and reports** (multi-server view, history, alerts).
+
+The paid feed is the only part that checks a license. The license is a signed
+token (Ed25519) bound to one server. If the subscription ends, the engine keeps
+running with the public feed. Nothing is wiped, blocked or disabled on the
+machine. Feed format and license details: [docs/FEED.md](docs/FEED.md).
+
+There are no prices, plans or dates yet. This section describes the model,
+not an offer.
+
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE). The open-core model above does not change the
+license of this repository.
 
 ## Author
 
