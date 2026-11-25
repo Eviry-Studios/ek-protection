@@ -72,13 +72,20 @@ Only data is downloaded. No remote code is ever executed.
   `sha256` is in the manifest, which comes from the same server over the same
   HTTPS connection. Anyone who controls that server or the `update_url` config
   can serve a matching pair.
-- **The checksum is skipped when `sha256` is missing** (`if expected_sha:` in
-  `fetcher.py`). A manifest without it is accepted.
+- ~~The checksum is skipped when `sha256` is missing.~~ **Fixed (Task #578,
+  2026-11-25):** `sha256` is now mandatory. A manifest without it, with an
+  empty value, a non-string value or anything other than 64 hex digits is
+  refused with `ManifestError` *before* `signatures.jsonl` is downloaded.
+  A well-formed but wrong `sha256` raises `ChecksumError`. In both cases the
+  signature database is not touched and the previous feed stays in use; the
+  reason is logged by the update manager. Leading/trailing whitespace and
+  upper case are accepted. A manifest with the same `version` as the local
+  database is still a no-op (nothing is applied, so nothing is checked).
 - Heuristic rules are Python code in `ekprotection/heuristics/rules.py`. They
   ship with the engine, not with the feed. A data format for feed rules is
   not defined yet (see 2.3).
 
-Both checksum points are addressed by the feed signature in 2.2. That
+The remaining point (origin, not integrity) is addressed by the feed signature in 2.2. That
 signature is also useful for the free feed. It is a code change for a
 separate task, not part of this document.
 
