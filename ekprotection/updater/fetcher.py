@@ -12,7 +12,10 @@ Protocolo:
   6. Atualiza metadata de versão
 
 Segurança:
-  - Verificação de checksum obrigatória — arquivo corrompido é rejeitado
+  - Verificação de checksum obrigatória — manifest sem `sha256` (ou com
+    `sha256` que não seja 64 hex) é recusado ANTES do download, e arquivo
+    cujo hash não confere é rejeitado. Nos dois casos o banco não é tocado
+    (as assinaturas anteriores continuam valendo).
   - Timeout configurável em todas as requisições HTTP
   - Sem execução de código remoto — apenas dados JSON/JSONL
   - Suporte a proxy via variável de ambiente HTTP_PROXY
@@ -144,10 +147,13 @@ class SignatureFetcher:
 
         # 3. Baixa arquivo de assinaturas
         sig_url      = manifest.get("signatures_url", "")
-        expected_sha = manifest.get("sha256", "")
 
         if not sig_url:
             raise ManifestError("Manifest não contém 'signatures_url'.")
+
+        # Checksum é obrigatório: sem ele nada prova que o arquivo baixado é o
+        # que o manifest descreve. Recusa antes de baixar; o feed atual fica.
+        expected_sha = self._validate_manifest_sha(manifest.get("sha256"))
 
         logger.info("Baixando assinaturas v%s de %s...", remote_version, sig_url)
 
@@ -156,16 +162,15 @@ class SignatureFetcher:
         except Exception as exc:
             raise UpdateError(f"Falha ao baixar assinaturas: {exc}") from exc
 
-        # 4. Verifica checksum
-        if expected_sha:
-            actual_sha = self._sha256_file(sig_path)
-            if actual_sha != expected_sha.lower():
-                sig_path.unlink(missing_ok=True)
-                raise ChecksumError(
-                    f"Checksum inválido: esperado {expected_sha}, "
-                    f"obtido {actual_sha}"
-                )
-            logger.debug("Checksum verificado: %s", actual_sha[:16] + "...")
+        # 4. Verifica checksum (sempre; expected_sha já foi validado acima)
+        actual_sha = self._sha256_file(sig_path)
+        if actual_sha != expected_sha:
+            sig_path.unlink(missing_ok=True)
+            raise ChecksumError(
+                f"Checksum inválido: esperado {expected_sha}, "
+                f"obtido {actual_sha}"
+            )
+        logger.debug("Checksum verificado: %s", actual_sha[:16] + "...")
 
         # 5. Importa para o banco
         try:
@@ -264,6 +269,32 @@ class SignatureFetcher:
             return meta.get("version", "0.0.0")
         except Exception:
             return "0.0.0"
+
+    @staticmethod
+    def _validate_manifest_sha(value: Any) -> str:
+        """
+        Devolve o sha256 do manifest normalizado (minúsculo) ou levanta
+        ManifestError. Aceita só string com exatamente 64 dígitos hex
+        (espaço nas pontas é tolerado). Ausente, vazio, outro tipo ou
+        formato errado = manifest recusado.
+        """
+        if value is None or value == "":
+            raise ManifestError(
+                "Manifest sem 'sha256': atualização recusada "
+                "(checksum é obrigatório; assinaturas atuais mantidas)."
+            )
+        if not isinstance(value, str):
+            raise ManifestError(
+                f"Manifest com 'sha256' inválido (tipo {type(value).__name__}): "
+                "atualização recusada (assinaturas atuais mantidas)."
+            )
+        sha = value.strip().lower()
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+            raise ManifestError(
+                f"Manifest com 'sha256' inválido ({value[:80]!r}, esperado 64 hex): "
+                "atualização recusada (assinaturas atuais mantidas)."
+            )
+        return sha
 
     @staticmethod
     def _sha256_file(path: Path) -> str:

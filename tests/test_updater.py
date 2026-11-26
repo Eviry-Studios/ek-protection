@@ -201,7 +201,7 @@ class TestSignatureFetcherUpdate:
         manifest = {
             "version":        "2024.06.20",
             "signatures_url": "http://test.local/sigs.jsonl",
-            "sha256":         "wrong_checksum_000000000000000000000000000000000",
+            "sha256":         "0" * 64,   # formato válido, valor errado (malformado agora é ManifestError, ver test_updater_sha_required.py)
         }
         fetcher = self._make_fetcher(sig_db, tmp_dir)
 
