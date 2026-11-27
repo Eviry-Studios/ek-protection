@@ -70,6 +70,9 @@ ekp config set daemon.log_level DEBUG
 ## Development
 
 ```bash
+# Install test dependencies (inside a virtualenv; plain `pytest` is not enough)
+pip install -e ".[dev]"
+
 # Run tests
 pytest tests/ -v
 
@@ -82,6 +85,16 @@ ruff check ekprotection/
 # Type check
 mypy ekprotection/
 ```
+
+Running the test suite:
+
+- Clone outside `/tmp`, `/var/tmp` and `/dev/shm`. The suite writes malware-like
+  text to its temporary files (`<repo>/pytest-tmp`, or `$EKP_TEST_TMPDIR`), and a
+  daemon watching those directories would raise alerts. Inside them, the
+  isolation tests are skipped and pytest prints a warning.
+- It works as a regular user and as root; root is not required.
+- The daemon tests start a real `ekp` process with its own data and config
+  directory. They need Linux (inotify).
 
 ## Architecture
 

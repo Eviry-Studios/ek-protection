@@ -64,6 +64,14 @@ def pytest_configure(config: pytest.Config) -> None:
     tempfile.tempdir = None   # força o tempfile a reler TMPDIR
 
 
+def pytest_report_header(config: pytest.Config) -> str | None:
+    root = ekp_test_tmp_root()
+    if root is None or not str(root.resolve()).startswith(("/tmp/", "/var/tmp/", "/dev/shm/")):
+        return None
+    return (f"AVISO: temporários da suíte em {root} (área temporária do sistema); um "
+            "daemon EK-Protection nesta máquina pode alertar. Rode de fora de /tmp.")
+
+
 @pytest.fixture
 def staging_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """``tmp_path`` tratado como área temporária (/tmp, /var/tmp, /dev/shm).
