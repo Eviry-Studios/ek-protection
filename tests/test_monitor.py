@@ -1533,17 +1533,20 @@ class TestCanaryIssuesAndCli:
         assert canary_issues(self._file(tmp_path, mode=mode)) == []
 
     def test_other_owner_not_readable_flagged(self, tmp_path, monkeypatch):
-        """Simula isca de root 0600 em dir do usuário (sem precisar de root)."""
+        """Simula isca 0600 de outro dono em dir de usuário comum.
+
+        Os dois donos são simulados: rodando como root, o dono real do dir é o
+        uid 0, que lê qualquer arquivo e (corretamente) não gera aviso."""
         p = self._file(tmp_path)
         real = os.stat_result
-        me = os.getuid()
+        owners = {p: 54322, p.resolve().parent: 54321}   # arquivo, diretório
 
         orig_stat = Path.stat
         def fake_stat(self, *a, **k):
             st = orig_stat(self, *a, **k)
-            if self == p:
-                return real((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, me + 1, st.st_gid,
-                             st.st_size, 0, 0, 0))
+            if self in owners:
+                return real((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, owners[self],
+                             st.st_gid, st.st_size, 0, 0, 0))
             return st
         monkeypatch.setattr(Path, "stat", fake_stat)
         monkeypatch.setattr(_canary_mod.grp, "getgrgid", lambda gid: (_ for _ in ()).throw(KeyError()))

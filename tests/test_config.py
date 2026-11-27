@@ -399,7 +399,8 @@ _CANARY = "monitor:\n  canary_paths: [/root/.ssh/id_backup]\n"
 @pytest.fixture
 def exposed_config(tmp_path: Path):
     d = tmp_path / "etc"
-    d.mkdir(mode=0o755)
+    d.mkdir()
+    os.chmod(d, 0o755)   # mkdir(mode=) obedece o umask (077 deixava 0700)
     p = d / "config.yaml"
     p.write_text(_CANARY)
     os.chmod(p, 0o644)

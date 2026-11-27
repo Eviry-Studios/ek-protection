@@ -17,6 +17,8 @@ from ekprotection.monitor.fs_watcher import FSWatcher
 
 _MSG = "Callback with id '123' already exists for watch Watch(wd=1, ...). It will be Overwritten."
 WATCHDOG_MAJOR = watchdog.version.VERSION_MAJOR
+WATCHDOG_VERSION = (WATCHDOG_MAJOR, watchdog.version.VERSION_MINOR,
+                    watchdog.version.VERSION_BUILD)
 
 
 def _emit(msg: str, category=RuntimeWarning, module: str = "watchdog.observers.inotify") -> None:
@@ -91,7 +93,10 @@ def test_real_watchdog_dup_registration_is_silent(watcher, tmp_path):
     assert _matching(rec) == []
 
 
-@pytest.mark.skipif(WATCHDOG_MAJOR < 7, reason="aviso só existe no watchdog >= 7")
+@pytest.mark.skipif(
+    not (7, 0, 0) <= WATCHDOG_VERSION < (7, 1, 1),
+    reason="o gatilho só gera o aviso no watchdog 7.0.0 a 7.1.0 (o 7.1.1 ignora "
+           "o registro repetido)")
 def test_real_watchdog_dup_registration_warns_without_filter(tmp_path):
     """Controle: sem o filtro (Observer cru), o mesmo gatilho gera o aviso.
     Prova que o teste acima não passa por acaso."""

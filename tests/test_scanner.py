@@ -814,8 +814,20 @@ class TestAutoQuarantineSymlinkRoot:
         quar.close()
 
     def test_untrusted_link_owner_not_translated(self, cfg, sig_db, base, caplog) -> None:
-        # link do próprio usuário de teste, daemon "rodando" com outro euid
-        with patch("ekprotection.scanner.engine.os.geteuid", return_value=987654):
+        # link de um terceiro (nem root nem o euid do daemon). O dono é simulado:
+        # rodando a suíte como root, o link real seria do uid 0, que é confiável.
+        link = str(base / "bin")
+        real_lstat = os.lstat
+
+        def fake_lstat(path, *a, **k):
+            st = real_lstat(path, *a, **k)
+            if os.fspath(path) == link:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 987653,
+                                       st.st_gid, st.st_size, 0, 0, 0))
+            return st
+
+        with patch("ekprotection.scanner.engine.os.geteuid", return_value=987654), \
+                patch("ekprotection.scanner.engine.os.lstat", side_effect=fake_lstat):
             with caplog.at_level("WARNING", logger="ekprotection.scanner.engine"):
                 eng, quar = self._engine(cfg, sig_db, [base / "bin"])
         assert eng._root_map == []

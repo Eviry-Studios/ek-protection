@@ -48,6 +48,18 @@ def _run_cli(*args: str, env: dict) -> subprocess.CompletedProcess:
     )
 
 
+def _wait_for(condition, message: str, timeout: float = 15.0):
+    """Espera ``condition()`` devolver algo verdadeiro e devolve esse valor."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = condition()
+        if value:
+            return value
+        if time.monotonic() >= deadline:
+            pytest.fail(f"{message} ({timeout:.0f}s)")
+        time.sleep(0.2)
+
+
 @pytest.fixture
 def lab_env(tmp_path: Path) -> dict:
     """Ambiente isolado: EKP_DATA_DIR próprio + config.yaml próprio, nunca
@@ -489,10 +501,12 @@ class TestDaemonFloodCanary:
         os.chmod(cfg_path, 0o600)
         pid = int(Path(f"{env['EKP_DATA_DIR']}/run/daemon.pid").read_text().strip())
         os.kill(pid, signal.SIGHUP)
-        time.sleep(1.5)
 
         from ekprotection.daemon import IPCClient
         client = IPCClient(f"{env['EKP_DATA_DIR']}/run/daemon.sock", timeout=30.0)
+        _wait_for(
+            lambda: client.send("status")["data"]["monitor"]["canary"]["canaries"]
+            == [str(bait)], "daemon não aplicou a isca nova")
         watch = tmp_path / "watch"
         stop = time.monotonic() + 3.0
 
@@ -501,17 +515,32 @@ class TestDaemonFloodCanary:
             while time.monotonic() < stop:
                 (watch / f"s{i % 500}.sh").write_text("#!/bin/sh\necho oi\n")
                 i += 1
-        for i in range(3000):
-            (watch / f"s{i % 500}.sh").write_text("#!/bin/sh\necho oi\n")
+        # Rajada com o daemon parado: os eventos se acumulam no inotify e chegam
+        # de uma vez, enchendo a fila em qualquer máquina. Com ele rodando, numa
+        # máquina rápida nada era descartado e `dropped > 0` falhava às vezes.
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            for i in range(3000):
+                (watch / f"s{i % 500}.sh").write_text("#!/bin/sh\necho oi\n")
+        finally:
+            os.kill(pid, signal.SIGCONT)
         th = threading.Thread(target=flood); th.start()
         time.sleep(1.0)
         bait.read_text(); opened = time.time()
         th.join()
-        time.sleep(1.0)
-        res = client.send("log_search", event="file.canary_accessed", limit=5)["data"]
+
+        def canary_log() -> dict | None:
+            data = client.send("log_search", event="file.canary_accessed", limit=5)["data"]
+            return data if data["total"] else None
+        # A espera é folgada; o atraso cobrado abaixo é o do registro no log.
+        res = _wait_for(canary_log, "alerta da isca não foi registrado")
         assert res["total"] == 1
         entries = res.get("entries") or res.get("results")
         ts = datetime.fromisoformat(entries[0]["timestamp"]).replace(tzinfo=timezone.utc).timestamp()
         assert ts - opened < 3.0, f"alerta da isca atrasou {ts - opened:.1f}s atrás do flood"
-        assert client.send("status")["data"]["monitor"]["counters"]["dropped"] > 0
-        assert client.send("log_search", event="monitor.overflow", limit=5)["data"]["total"] >= 1
+        _wait_for(
+            lambda: client.send("status")["data"]["monitor"]["counters"]["dropped"] > 0,
+            "nenhum evento contado como descartado")
+        _wait_for(
+            lambda: client.send("log_search", event="monitor.overflow", limit=5)["data"]["total"],
+            "overflow não foi registrado")
