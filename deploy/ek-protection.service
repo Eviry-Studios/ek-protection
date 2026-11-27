@@ -24,7 +24,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 # Restart automático em caso de falha
 Restart=on-failure
 RestartSec=10s
-TimeoutStartSec=30s
+TimeoutStartSec=90s
 TimeoutStopSec=30s
 
 # Watchdog systemd (daemon deve enviar sd_notify keepalive)
