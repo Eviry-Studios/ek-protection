@@ -554,6 +554,10 @@ def _setup_logging(level: str, log_dir: str) -> None:
     )
 
 
+# Prazo extra pedido ao systemd durante o start (Type=notify). 120 s.
+STARTUP_EXTEND_TIMEOUT_USEC = 120_000_000
+
+
 def _notify_systemd(message: str) -> None:
     """Envia notificação para systemd sd_notify se disponível."""
     notify_socket = os.environ.get("NOTIFY_SOCKET")
@@ -591,6 +595,12 @@ async def _daemon_loop(config: ConfigManager) -> None:
     _write_pid(pid_file)
 
     ipc = IPCServer(socket_path, engine)
+
+    # O start real (watches recursivos + IPC) passou de 30 s na VPS em
+    # 26/11 (CPUQuota 25%, ~13 mil diretórios em /tmp): o systemd matou o
+    # daemon por timeout 13x seguidas antes do READY=1. Pede mais prazo
+    # logo no início; o próprio READY=1 encerra a espera.
+    _notify_systemd(f"EXTEND_TIMEOUT_USEC={STARTUP_EXTEND_TIMEOUT_USEC}\nSTATUS=EK-Protection iniciando\n")
 
     try:
         await engine.start()

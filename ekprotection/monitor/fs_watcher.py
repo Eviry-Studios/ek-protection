@@ -36,6 +36,7 @@ from watchdog.events import (
     FileSystemEventHandler,
 )
 from watchdog.observers import Observer
+import watchdog.events as _wd_events
 
 from .events import FileEvent, FileEventKind
 
@@ -220,6 +221,149 @@ def _install_watchdog_dup_callback_filter() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Loop de overflow do watchdog 7.x (rotina 03:00, 2026-11-27)
+# ---------------------------------------------------------------------------
+# No watchdog 7.x, ``InotifyWatchGroup.on_queue_overflow`` reconcilia uma raiz
+# recursiva tirando TODOS os watches dela (``inotify_rm_watch`` → 1 IN_IGNORED
+# por watch, na mesma fila do kernel, ``max_queued_events`` = 16384) e criando
+# tudo de novo. Com alguns milhares de diretórios vigiados, esses IN_IGNORED
+# (mais o que mais chegar enquanto o reader está ocupado) estouram a fila de
+# novo → outro overflow → outra reconciliação, pra sempre, sem nenhuma
+# atividade em disco. Na VPS: desde 23/11 23:44, ~1 300–1 900 overflows/h,
+# sobreviveu ao restart de 26/11 (o loop volta 1 s depois do start), e o
+# processo levou OOM-kill em 26/11 11:05. No lab: 3 000 dirs vivos → 0
+# overflow depois do flood; 9 000 → 42 em 40 s parado.
+#
+# A troca abaixo reconcilia por DIFERENÇA: anda a árvore, garante 1 watch por
+# diretório (``inotify_add_watch`` num path já vigiado devolve o mesmo wd e
+# não gera evento) e só remove os wds que não apareceram mais (diretório
+# apagado/movido pra fora). Em regime normal a reconciliação não põe nada na
+# fila e o ciclo para. Watches perdidos no overflow (diretório recriado com
+# inode novo) continuam sendo corrigidos: o add_watch devolve wd novo.
+
+_OVERFLOW_PATCH_MARK = "_ekp_diff_reconcile"
+
+
+def _fs_event_filter() -> list:
+    """Classes de evento que o ``_EKPEventHandler`` trata.
+
+    Sem ``event_filter`` o watchdog 7.x pede ao kernel ``WATCHDOG_ALL_EVENTS``,
+    que inclui IN_OPEN e IN_CLOSE_NOWRITE. O handler não usa nenhum dos dois,
+    mas o ``os.walk`` da reconciliação pós-overflow abre CADA diretório
+    vigiado → ~2–4 eventos por diretório na fila. Acima de ~4 000 diretórios
+    isso sozinho passa dos 16 384 de ``max_queued_events`` → overflow →
+    reconciliação → walk → overflow... (o loop da VPS desde 23/11). Também
+    corta o ruído de qualquer ``ls``/``find``/``cat`` em /tmp.
+
+    O canário (``canary.py``) tem watch próprio, filtrado só pra IN_OPEN, e
+    não depende disto. ``FileAttribEvent``/``DirAttribEvent`` só existem no
+    watchdog 7.x (o IN_ATTRIB entra na máscara via ``FileModifiedEvent``).
+    """
+    names = (
+        "FileCreatedEvent", "DirCreatedEvent",
+        "FileModifiedEvent",
+        "FileAttribEvent", "DirAttribEvent",
+        "FileClosedEvent",
+        "FileDeletedEvent", "DirDeletedEvent",
+        "FileMovedEvent", "DirMovedEvent",
+    )
+    return [getattr(_wd_events, n) for n in names if hasattr(_wd_events, n)]
+
+
+def _ekp_diff_reconcile(group) -> int:
+    """Reconcilia os watches de ``group`` (InotifyWatchGroup) por diferença.
+
+    Chamado com ``group._lock`` já seguro. Devolve quantos wds foram
+    removidos por estarem velhos. OSError na raiz sobe (como no original).
+    """
+    fd = group._inotify_fd
+    by_path = group._active_callbacks_by_path
+    by_watch = group._active_callbacks_by_watch
+    seen: set = set()
+
+    def ensure(path: bytes) -> None:
+        with fd._lock:
+            watch = fd._get_or_create_watch(path, group.event_mask)
+            # Atribuição direta: sem o RuntimeWarning "already exists", cuja
+            # mensagem formata a árvore inteira (O(N) por diretório).
+            watch.callbacks[group._id] = group
+        by_path[path] = watch.wd
+        by_watch[watch.wd] = path
+        seen.add(watch.wd)
+
+    ensure(group.path)
+    for root, dirnames, _files in os.walk(group.path, followlinks=group.follow_symlink):
+        for dirname in dirnames:
+            full_path = os.path.join(root, dirname)
+            if not group.follow_symlink and os.path.islink(full_path):
+                continue
+            try:
+                ensure(full_path)
+            except OSError:
+                # sumiu/ficou inacessível no meio do caminho (igual ao original)
+                continue
+
+    stale = [wd for wd in list(by_watch) if wd not in seen]
+    if stale:
+        group._remove_callbacks(stale)
+    # path que mudou de wd (ou diretório movido dentro da árvore): limpa a
+    # entrada órfã do índice por path.
+    for path, wd in list(by_path.items()):
+        if by_watch.get(wd) != path:
+            del by_path[path]
+    return len(stale)
+
+
+def _ekp_on_queue_overflow(self) -> None:
+    """Substituto de ``InotifyWatchGroup.on_queue_overflow`` (watchdog 7.x)."""
+    with self._lock:
+        if not self.is_active:
+            return
+        self._move_event_grouper.discard_pending_events()
+        if not self.is_recursive:
+            return
+        try:
+            removed = _ekp_diff_reconcile(self)
+        except OSError:
+            logger.exception(
+                "Overflow do inotify: não foi possível reconciliar os watches abaixo de %r",
+                self.path,
+            )
+            return
+        logger.warning(
+            "Inotify queue overflowed; watches abaixo de %r reconciliados por diferença "
+            "(%d ativos, %d removidos)",
+            self.path, len(self._active_callbacks_by_watch), removed,
+        )
+
+
+def _install_watchdog_overflow_patch() -> bool:
+    """Troca a reconciliação pós-overflow do watchdog 7.x pela de diferença.
+
+    Idempotente. Não faz nada (devolve False) se o watchdog instalado não
+    tiver a estrutura esperada (ex.: 6.x, que não reconcilia nada).
+    """
+    try:
+        from watchdog.observers import inotify as wd_inotify
+        from watchdog.observers import inotify_c as wd_inotify_c
+    except ImportError:
+        return False
+    group_cls = getattr(wd_inotify, "InotifyWatchGroup", None)
+    fd_cls = getattr(wd_inotify_c, "InotifyFD", None)
+    if (group_cls is None or fd_cls is None
+            or not hasattr(group_cls, "on_queue_overflow")
+            or not hasattr(group_cls, "_remove_callbacks")
+            or not hasattr(fd_cls, "_get_or_create_watch")):
+        return False
+    if getattr(group_cls.on_queue_overflow, _OVERFLOW_PATCH_MARK, False):
+        return True
+    setattr(_ekp_on_queue_overflow, _OVERFLOW_PATCH_MARK, True)
+    group_cls.on_queue_overflow = _ekp_on_queue_overflow
+    logger.debug("watchdog: reconciliação pós-overflow trocada pela de diferença (EKP).")
+    return True
+
+
 class FSWatcher:
     """
     Observador de filesystem para o EK-Protection.
@@ -255,6 +399,7 @@ class FSWatcher:
     def start(self) -> None:
         """Inicia o Observer e agenda todos os paths configurados."""
         _install_watchdog_dup_callback_filter()
+        _install_watchdog_overflow_patch()
         self._observer = self._create_observer()
 
         # inotify (watchdog usa IN_DONT_FOLLOW por padrão) não segue symlink
@@ -291,7 +436,10 @@ class FSWatcher:
                     path, watch_path,
                 )
             try:
-                self._observer.schedule(handler, str(watch_path), recursive=self._recursive)
+                self._observer.schedule(
+                    handler, str(watch_path), recursive=self._recursive,
+                    event_filter=_fs_event_filter(),
+                )
                 self._active_paths.append(str(path))
                 logger.info("Monitorando: %s (recursivo=%s)", path, self._recursive)
             except (OSError, PermissionError) as exc:
