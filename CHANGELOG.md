@@ -27,6 +27,12 @@ needed `sudo` to open root-owned SQLite files directly.
   updater (previously pointed at a URL with no real payload).
 
 #### Fixed
+- Real-time auto-scan only looked at a short list of extensions (plus ELF):
+  an executable script named `kworker.1`, `x.cgi` or `x.js` was never scanned,
+  and `x.log`, `x.tmp`, `x.lock`, `x.pid` etc. produced no event at all.
+  Shebang and the execute bit now decide too, extension-based ignores no
+  longer apply to executable files, and shebang scripts named as media or
+  archives (`x.png`, `x.gz`) are no longer skipped by the scanner.
 - Heuristic engine: a rule's `severity` never influenced the aggregated
   `risk_level` — a single "critical" match (reverse shell, fork bomb,
   fileless malware) could still report "low" risk and skip auto-quarantine.

@@ -553,6 +553,13 @@ disco mesmo.
   `monitor.auto_scan_new_executables` (default `true`). Validado com EICAR
   real via inotify de verdade (não mock) em `tests/test_engine.py::
   TestAutoScanWiring::test_end_to_end_real_eicar_via_fs_watcher`.
+  **2026-11-27:** a extensão deixou de decidir sozinha. Escaneiam em tempo
+  real: extensão executável, ELF, shebang e qualquer arquivo regular com bit
+  de execução (config sem shebang segue só com H024). Ignorar por extensão
+  (`*.log`, `*.tmp`, `.lock`...) não vale para arquivo executável; padrão de
+  caminho/nome (`*/cache/*`, `build-*`) continua valendo sempre. Fica de fora:
+  arquivo sem bit e sem shebang (`sh nota.txt`), e script com extensão
+  ignorada e sem bit (`sh x.log`).
 - ✅ **Symlink `/opt` → `/var/opt` em sistemas atômicos** — feito (2026-09-02).
   Investigado como suspeita de item cosmético, virou achado real de falha
   silenciosa: `Path(__file__)` não é usado em nenhum lugar sensível a isso

@@ -47,6 +47,8 @@ class FileEvent:
     uid:        Optional[int]     = None     # dono do arquivo
     mode:       Optional[int]     = None     # permissões (stat.st_mode)
     detail:     Optional[str]     = None     # para ACCESSED: quem abriu
+    # Extensão estava na lista de ignorados; só passou por ter bit de execução.
+    unignored_by_exec: bool       = False
 
     @property
     def extension(self) -> str:

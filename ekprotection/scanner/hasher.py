@@ -108,6 +108,17 @@ def is_script(path: str | Path) -> bool:
         return False
 
 
+def is_runnable_content(path: str | Path) -> bool:
+    """ELF ou shebang (``#!``), com uma abertura só. Usado pelo auto-scan pra
+    decidir pelo conteúdo, não pela extensão."""
+    try:
+        with open_regular(path) as fh:
+            head = fh.read(4)
+    except (OSError, PermissionError):
+        return False
+    return head == b"\x7fELF" or head[:2] == b"#!"
+
+
 # H001: a implementação antiga sempre lia só os primeiros `sample_bytes`
 # (64KB) a partir do início do arquivo — qualquer payload de alta entropia
 # posicionado depois do byte 65536 nunca era visto, mesmo em arquivos

@@ -1197,6 +1197,8 @@ class TestAutoScanConcurrent:
         engine, sc = self._engine(cfg)
         # config.json: só H024. Durante o scan vira ELF? Não precisa: um evento
         # de rescan "completo" (None) ganha de um parcial.
+        # Sem shebang: com `#!` o arquivo passa a rodar todas as regras.
+        (tmp_path / "c.json").write_text("{}")
         cfg_ev = self._ev(tmp_path, "c.json")
         await engine._on_monitor_event_auto_scan_bg(cfg_ev)
         await _until(lambda: len(sc.calls) == 1)
