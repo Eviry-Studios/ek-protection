@@ -269,9 +269,10 @@ class ScanEngine:
             # Verifica blacklist mesmo para extensões ignoradas
             if self._exc and self._exc.is_blacklisted(path=path):
                 pass   # continua o scan
-            elif is_elf(path):
+            elif is_elf(path) or is_script(path):
                 pass   # ELF disfarçado (`update.png`): era pulado aqui e o
-                       # H022 nunca via, nem sob demanda (2026-10-26)
+                       # H022 nunca via, nem sob demanda (2026-10-26). Idem
+                       # script com shebang (`x.png`, `x.gz`) (2026-11-27)
             else:
                 return FileScanResult(path=path, verdict=ScanVerdict.SKIPPED,
                                       file_size=file_size,

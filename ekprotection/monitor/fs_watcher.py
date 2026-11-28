@@ -21,6 +21,7 @@ import asyncio
 import fnmatch
 import logging
 import os
+import re
 import stat as stat_mod
 import warnings
 from pathlib import Path
@@ -48,6 +49,21 @@ _BORING_EXTENSIONS = {
     ".lock", ".pid", ".sock",
     ".log",   # logs são monitorados via LogManager, não via filesystem
 }
+
+
+_IGNORE_EXT = "extensão"
+_IGNORE_PATTERN = "padrão"
+# ``*.log``, ``*.tar.gz``: glob que só olha o final do nome.
+_EXTENSION_PATTERN_RE = re.compile(r"\*(\.[^*?\[\]/]+)+")
+
+
+def _is_executable_file(path: str) -> bool:
+    """Arquivo regular (sem seguir symlink) com algum bit de execução."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return False
+    return stat_mod.S_ISREG(mode) and bool(mode & 0o111)
 
 
 class _EKPEventHandler(FileSystemEventHandler):
@@ -147,7 +163,9 @@ class _EKPEventHandler(FileSystemEventHandler):
         if src_path is not None:
             src_path = self._unresolve(src_path)
 
-        if self._should_ignore(path):
+        reason = self._ignore_reason(path)
+        unignored = reason == _IGNORE_EXT and _is_executable_file(path)
+        if reason is not None and not unignored:
             return
 
         size: Optional[int] = None
@@ -171,21 +189,36 @@ class _EKPEventHandler(FileSystemEventHandler):
             size     = size,
             uid      = uid,
             mode     = mode,
+            unignored_by_exec = unignored,
         )
         self._loop.call_soon_threadsafe(self._queue.put_nowait, ev)
 
     def _should_ignore(self, path: str) -> bool:
+        """True se o arquivo não gera evento.
+
+        Ignorar por extensão (``*.log``, ``*.tmp``, ``.lock``...) é filtro de
+        ruído e não vale pra arquivo com bit de execução: bastava chamar o
+        payload de ``x.log`` pra ele nunca chegar ao scan (2026-11-27).
+        Padrão que não é só extensão (``.git/*``, ``/dir/*``) vale sempre.
+        """
+        reason = self._ignore_reason(path)
+        if reason == _IGNORE_EXT:
+            return not _is_executable_file(path)
+        return reason is not None
+
+    def _ignore_reason(self, path: str) -> Optional[str]:
+        """``None``, ``_IGNORE_EXT`` (só pela extensão) ou ``_IGNORE_PATTERN``."""
         name = Path(path).name
         ext  = Path(path).suffix.lower()
-
-        if ext in _BORING_EXTENSIONS:
-            return True
+        reason = _IGNORE_EXT if ext in _BORING_EXTENSIONS else None
 
         for pattern in self._ignores:
             if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(name, pattern):
-                return True
+                if not _EXTENSION_PATTERN_RE.fullmatch(pattern):
+                    return _IGNORE_PATTERN
+                reason = _IGNORE_EXT
 
-        return False
+        return reason
 
 
 # watchdog >= 7 (inotify): quando um diretório novo aparece numa raiz recursiva,

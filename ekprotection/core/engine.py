@@ -63,6 +63,10 @@ class EKEngine:
         # reconhecer o `chmod +x` que vem depois da escrita (ver
         # _is_new_exec_bit). Limitado a _EXEC_SEEN_MAX entradas (LRU).
         self._exec_seen: OrderedDict[str, tuple[int, bool]] = OrderedDict()
+        # Mesma coisa pros arquivos que NÃO foram escaneados (sem bit, sem
+        # shebang, extensão comum), pra pegar o chmod +x posterior. Separado:
+        # arquivo comum não empurra script pra fora do LRU acima.
+        self._exec_seen_other: OrderedDict[str, tuple[int, bool]] = OrderedDict()
         # Auto-scan concorrente (2026-11-18). Antes o dispatch do monitor
         # esperava cada scan em série (~25-50 arq/s); sob flood a fila enchia
         # e a isca/arquivo malicioso esperava atrás de milhares de scans.
@@ -301,7 +305,7 @@ class EKEngine:
 
     async def _on_monitor_event_auto_scan(self, event: Any, wait: bool = True) -> None:
         from ekprotection.monitor.events import FileEvent, FileEventKind
-        from ekprotection.scanner.hasher import is_elf
+        from ekprotection.scanner.hasher import is_runnable_content
 
         if not isinstance(event, FileEvent) or event.is_dir:
             return
@@ -313,7 +317,11 @@ class EKEngine:
         # do CLOSED via `is_executable=False` e o H021 nunca disparava
         # (2026-10-27).
         if event.kind == FileEventKind.MODIFIED:
-            if not self._is_new_exec_bit(event.path):
+            # Executável de extensão ignorada (`x.log`) escaneia sempre: o
+            # que foi escrito enquanto estava sem o bit nem chegou aqui
+            # (chmod -x, troca o conteúdo, chmod +x). Raro em sistema são.
+            if (not event.unignored_by_exec
+                    and not self._is_new_exec_bit(event.path)):
                 return
         elif event.kind not in (
             FileEventKind.CREATED,
@@ -328,22 +336,29 @@ class EKEngine:
         if event.kind == FileEventKind.CREATED and event.size == 0:
             return
         loop = asyncio.get_running_loop()
+        # A extensão é escolha do atacante: ELF, shebang e bit de execução
+        # decidem também (2026-11-27: `kworker.1`, `x.cgi`, `x.js` com +x
+        # nunca eram escaneados em tempo real).
+        rules = None
         if event.is_executable_extension:
-            rules = None
+            pass
         # No executor, não no loop: I/O aqui parava IPC/iscas/dispatch inteiros
         # (FIFO `x.png` travou o daemon, 2026-11-14). Só 4 bytes lidos.
-        elif await loop.run_in_executor(None, is_elf, event.path):
+        elif await loop.run_in_executor(None, is_runnable_content, event.path):
             # ELF com extensão de imagem/texto/config (`/tmp/update.png`,
             # `x.json`): pela extensão nunca era escaneado, ou só com H024,
             # e o H022 (disfarce) nunca rodava em tempo real (2026-10-26).
-            rules = None
+            pass
         elif (event.is_config_extension
                 and self.config.get("monitor.auto_scan_configs", True)):
             # Só H024: as 23 regras em config davam 3,5% de suspeito nos
             # configs reais da VPS (ver _RE_MINER_HINT em heuristics/rules.py).
             from ekprotection.heuristics.rules import CONFIG_AUTOSCAN_RULES
             rules = CONFIG_AUTOSCAN_RULES
-        else:
+        elif not self._has_exec_bit(event.path):
+            # Sem bit: sem shebang o shell só roda com `sh arquivo`. Guarda o
+            # estado pra escanear se vier um chmod +x.
+            self._remember_exec_state(event.path, self._exec_seen_other)
             return
 
         self._remember_exec_state(event.path)
@@ -420,21 +435,34 @@ class EKEngine:
     _EXEC_SEEN_MAX = 4096
     _EXEC_BITS = stat_mod.S_IXUSR | stat_mod.S_IXGRP | stat_mod.S_IXOTH
 
-    def _remember_exec_state(self, path: str) -> None:
+    def _has_exec_bit(self, path: str) -> bool:
+        try:
+            mode = os.stat(path).st_mode
+        except OSError:
+            return False
+        return stat_mod.S_ISREG(mode) and bool(mode & self._EXEC_BITS)
+
+    def _remember_exec_state(
+        self, path: str, cache: OrderedDict[str, tuple[int, bool]] | None = None,
+    ) -> None:
         try:
             st = os.stat(path)
         except OSError:
             return
-        self._exec_seen[path] = (st.st_ino, bool(st.st_mode & self._EXEC_BITS))
-        self._exec_seen.move_to_end(path)
-        if len(self._exec_seen) > self._EXEC_SEEN_MAX:
-            self._exec_seen.popitem(last=False)
+        if cache is None:
+            cache = self._exec_seen
+        # Um path vive num cache só (vale o estado mais recente).
+        self._exec_seen.pop(path, None)
+        self._exec_seen_other.pop(path, None)
+        cache[path] = (st.st_ino, bool(st.st_mode & self._EXEC_BITS))
+        if len(cache) > self._EXEC_SEEN_MAX:
+            cache.popitem(last=False)
 
     def _is_new_exec_bit(self, path: str) -> bool:
-        """True só se o arquivo já foi auto-escaneado sem bit de exec e agora
-        tem. MODIFIED de escrita (bit não mudou) e arquivo nunca escaneado
-        continuam ignorados: medido em 2026-10-27, ver EK-Protection.md."""
-        prev = self._exec_seen.get(path)
+        """True só se o arquivo já foi visto sem bit de exec e agora tem.
+        MODIFIED de escrita (bit não mudou) e arquivo nunca visto continuam
+        ignorados: medido em 2026-10-27, ver EK-Protection.md."""
+        prev = self._exec_seen.get(path) or self._exec_seen_other.get(path)
         if prev is None or prev[1]:
             return False
         try:
